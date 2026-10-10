@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token: nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Don't leave a token in .git; nothing here pushes.
+          persist-credentials: false
+
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root); the Rust build's and the
+          # VM test's closures need the room. || true so a path missing on one image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+
+      # Both packages and every check, in the Nix sandbox: lint (rustfmt, clippy), the Rust suite (in the
+      # backend's build), the SDK's unit tests and the NixOS module in a VM. The same as `make check` locally.
+      - name: Build and test
+        run: make check
