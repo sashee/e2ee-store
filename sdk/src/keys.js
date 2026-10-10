@@ -38,9 +38,16 @@ export async function unwrap(labels, kind, secret, slot) {
 
 export const emptyKeys = (labels) => ({ format: labels.keysFormat, version: VERSION, recovery: null, passkeys: {} });
 
-/** Returns the document, or throws if it isn't one. `writable` is false for newer versions. */
+const plainObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const isSlot = (slot) => plainObject(slot) && typeof slot.nonce === "string" && typeof slot.wrapped_key === "string";
+
+/**
+ * Returns the document, or throws if it isn't one, so a damaged slot isn't taken for a wrong key later. `writable`
+ * is false for newer versions.
+ */
 export function readKeys(labels, doc) {
-  if (doc?.format !== labels.keysFormat || !Number.isInteger(doc.version) || typeof doc.passkeys !== "object" || doc.passkeys === null) {
+  const slotsValid = plainObject(doc?.passkeys) && Object.values(doc.passkeys).every(isSlot) && (doc.recovery === null || isSlot(doc.recovery));
+  if (doc?.format !== labels.keysFormat || !Number.isInteger(doc.version) || doc.version < 1 || !slotsValid) {
     throw new Error("Not a keys document");
   }
   return { doc, writable: doc.version <= VERSION };

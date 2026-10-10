@@ -12,9 +12,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use http_body_util::LengthLimitError;
 use rusqlite::Connection;
@@ -136,9 +136,14 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
-/// Every API response: never cached, never sniffed.
+/// Every API response: never cached, never sniffed, and errors in the API's JSON format, axum's own included.
 async fn api_headers(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
+    let response = next.run(request).await;
+    let mut response = if is_plain_error(&response) {
+        as_json_error(response).await
+    } else {
+        response
+    };
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -146,6 +151,48 @@ async fn api_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+/// An error axum answered by itself, in plain text: a query string or path that doesn't parse, a method the route
+/// doesn't have. The handlers' errors are `ApiError`s, which are JSON already.
+fn is_plain_error(response: &Response) -> bool {
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    (response.status().is_client_error() || response.status().is_server_error()) && !json
+}
+
+/// The same error as `{"error", "message"}` (SPEC §8), with axum's text as the message and its headers (e.g.
+/// `Allow` on a 405) kept.
+async fn as_json_error(response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .unwrap_or_default();
+    let code = match parts.status {
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        status if status.is_server_error() => "internal",
+        _ => "bad_request",
+    };
+    let message = if text.is_empty() {
+        parts
+            .status
+            .canonical_reason()
+            .unwrap_or("Error")
+            .to_owned()
+    } else {
+        text
+    };
+    let mut json = ApiError::new(parts.status, code, message).into_response();
+    for (name, value) in &parts.headers {
+        if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
+            json.headers_mut().insert(name, value.clone());
+        }
+    }
+    json
 }
 
 /// Reads a body of at most `limit` bytes, answering 413 above it.

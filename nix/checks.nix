@@ -2,12 +2,13 @@
 #
 # - lint: rustfmt and clippy (warnings are errors), with the same toolchain the package is built with, so a
 #   new lint can only appear with a reviewed bump of nix/pkgs.nix.
-# - sdk-unit: the SDK's Node unit tests.
+# - sdk-unit: the SDK's Node tests: the pure modules, the flows against a fake backend and authenticator, and the
+#   format vectors.
+# - browser: the flows in Chromium with PRF-capable virtual authenticators, against the backend package behind
+#   socat, through the browser-test harness, with a stand-in app (sdk/test/browser). A sandboxed build, not a VM:
+#   nothing needs the network.
 # - vm: the NixOS module (./module.nix) in a VM (./tests/lib.nix), with a stand-in app on a minimal machine.
 #   An app runs the same test against its own instance.
-#
-# The SDK's flows and the browser-test harness have no app here to drive them; the apps' browser tests cover
-# them (pw-mgr's run every flow).
 {
   pkgs,
   backend,
@@ -20,6 +21,15 @@ let
     fileset = lib.fileset.unions [
       ../sdk/src
       ../sdk/test
+    ];
+  };
+
+  browserSrc = lib.fileset.toSource {
+    root = ../sdk;
+    fileset = lib.fileset.unions [
+      ../sdk/src
+      ../sdk/testing
+      ../sdk/test/browser
     ];
   };
 
@@ -48,6 +58,25 @@ in
     node --test "test/**/*.test.js"
     touch "$out"
   '';
+
+  browser =
+    pkgs.runCommand "e2ee-store-browser"
+      {
+        nativeBuildInputs = [
+          (pkgs.python3.withPackages (p: [ p.playwright ]))
+          pkgs.chromium
+          pkgs.socat
+        ];
+        BACKEND_BIN = lib.getExe backend;
+        PYTHONDONTWRITEBYTECODE = "1";
+        # Chromium looks for fonts even headless; without a config it warns on every start.
+        FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+      }
+      ''
+        export HOME="$TMPDIR"
+        python ${browserSrc}/test/browser/test_flows.py
+        touch "$out"
+      '';
 
   vm = import ./tests/lib.nix {
     inherit pkgs;

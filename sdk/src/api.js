@@ -116,11 +116,14 @@ export async function getBlob(id) {
 export const deletePasskey = (id) => call("DELETE", `/me/passkeys/${encodeURIComponent(id)}`).then(json);
 export const createSetupToken = () => call("POST", "/me/setup-tokens", { json: {} }).then(json);
 
-/** One page of blobs, plus the server's clock from the `Date` header (for the cleanup grace period). */
+/**
+ * One page of blobs, plus the server's clock from the `Date` header (for the cleanup grace period); null without
+ * one. Never this device's clock: blobs' times are the server's, and the two clocks can be days apart.
+ */
 export async function listBlobs(after = null) {
   const response = await call("GET", `/blobs${after ? `?after=${checkBlobId(after)}` : ""}`);
   const date = Date.parse(response.headers.get("date") ?? "");
-  return { ...(await response.json()), serverNow: Number.isNaN(date) ? Date.now() : date };
+  return { ...(await response.json()), serverNow: Number.isNaN(date) ? null : date };
 }
 
 /** Deletes a blob; one that is already gone counts as deleted. */

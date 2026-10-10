@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
-use crate::domain::parse_size;
+use crate::domain::{parse_size, public_host_problem};
 
 pub const DEFAULT_STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
@@ -62,24 +62,26 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
         humantime::parse_duration(&value).map_err(|e| anyhow!("{key}: {e}"))
     };
 
-    let public_hosts = match env.get("BACKEND_PUBLIC_HOSTS") {
+    let public_hosts: Vec<String> = match env.get("BACKEND_PUBLIC_HOSTS") {
         Some(list) => list
             .split(',')
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
+            .filter(|h| !h.trim().is_empty())
             .map(str::to_owned)
             .collect(),
         None => raw.public_hosts.unwrap_or_default(),
-    };
+    }
+    .iter()
+    .map(|h| h.trim().to_ascii_lowercase())
+    .collect();
+    if let Some((host, problem)) = public_hosts
+        .iter()
+        .find_map(|h| public_host_problem(h).map(|problem| (h, problem)))
+    {
+        bail!("public_hosts: {host:?} is {problem}");
+    }
     let max_blob_size = get("max_blob_size", raw.max_blob_size).unwrap_or_else(|| "16MiB".into());
     let static_dir =
         get("static_dir", raw.static_dir).ok_or_else(|| anyhow!("static_dir is required"))?;
-    if public_hosts
-        .iter()
-        .any(|h| h.contains('/') || h.contains("://"))
-    {
-        bail!("public_hosts are host names (optionally with a port), not URLs");
-    }
 
     Ok(Config {
         socket: get("socket", raw.socket)
@@ -90,10 +92,7 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
             .into(),
         static_dir: static_dir.into(),
         static_csp: get("static_csp", raw.static_csp).unwrap_or_else(|| DEFAULT_STATIC_CSP.into()),
-        public_hosts: public_hosts
-            .into_iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect(),
+        public_hosts,
         rp_name: get("rp_name", raw.rp_name).unwrap_or_else(|| "Backend".into()),
         session_ttl: duration("session_ttl", raw.session_ttl, "4h")?,
         reauth_window: duration("reauth_window", raw.reauth_window, "5m")?,
@@ -154,5 +153,28 @@ mod tests {
             .is_err()
         );
         assert!(resolve("static_dir = \"w\"\nunknown = 1", &env(&[])).is_err());
+    }
+
+    #[test]
+    fn public_hosts_that_could_never_match_are_refused() {
+        let hosts = |list: &str| {
+            resolve(
+                &format!("static_dir = \"w\"\npublic_hosts = {list}"),
+                &env(&[]),
+            )
+        };
+        assert_eq!(
+            hosts("[\" App.Example.com \"]").unwrap().public_hosts,
+            vec!["app.example.com"]
+        );
+        for bad in ["[\"\"]", "[\"app.localhost\"]", "[\"app.example.com:443\"]"] {
+            let error = format!("{:#}", hosts(bad).unwrap_err());
+            assert!(error.contains("public_hosts"), "{bad}: {error}");
+        }
+        let from_env = resolve(
+            "static_dir = \"w\"",
+            &env(&[("BACKEND_PUBLIC_HOSTS", "a.example.com,,localhost")]),
+        );
+        assert!(from_env.is_err(), "the environment is checked too");
     }
 }

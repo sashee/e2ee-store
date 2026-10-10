@@ -11,7 +11,7 @@ RUN := nix-shell --pure shell.nix --run
 endif
 NIX_BUILD := nix-build --max-jobs auto
 
-.PHONY: all check package test test-backend test-sdk lint fmt build clean
+.PHONY: all check package test test-backend test-sdk test-browser lint fmt build clean
 
 # Everything, hermetic: both packages, lint, the Rust suite, the SDK's unit tests and the VM test, in the Nix
 # sandbox. This is what CI runs.
@@ -33,6 +33,10 @@ test-backend:
 
 test-sdk:
 	$(RUN) 'node --test "sdk/test/**/*.test.js"'
+
+# The flows in Chromium against the backend. Hermetic: Chromium and Playwright come with the check, not the shell.
+test-browser:
+	$(NIX_BUILD) --no-out-link -A checks.browser
 
 lint:
 	$(RUN) 'cd backend && cargo fmt --check && cargo clippy --all-targets -- -D warnings'

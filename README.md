@@ -9,8 +9,6 @@ Building blocks for web apps that keep each user's data end-to-end encrypted, un
   compare-and-swap saves and rollback detection, setup links, and cleanup. See `sdk/SPEC.md`.
 - `nix/module.nix` runs one backend per app on NixOS; `nix/tests/lib.nix` is its VM test.
 
-The first app is pw-mgr, a password manager.
-
 ## Building an app on it
 
 An app supplies its namespace, its vault document and its UI:
@@ -51,7 +49,7 @@ in
   exposes it (`iroh-uds-listen`, a reverse proxy) joins that group. The data is in `/var/lib/notes`. Admin
   commands: `sudo notes user create alice`.
 - **Several apps on one host:** each instance has its own users, passkeys and data. On the iroh path, give each
-  app its own loopback name (`http://notes.localhost:PORT`, `http://pw.localhost:PORT`): cookies ignore the
+  app its own loopback name (`http://notes.localhost:PORT`, `http://todo.localhost:PORT`): cookies ignore the
   port, so two apps on plain `localhost` would log each other out, and each would offer the other's passkeys.
 - **VM test:** `import (e2eeStore + "/nix/tests/lib.nix") { inherit pkgs; instance = "notes"; machineModules = [ … ]; }`.
 - **Browser tests:** `${sdk}/share/e2ee-store/testing` goes on `PYTHONPATH`; `e2ee_store_harness.harness(run,
@@ -66,9 +64,11 @@ nixpkgs is pinned in `nix/pkgs.nix`, for this repository's own builds and checks
 make check               # both packages and every check in the Nix sandbox (what CI runs)
 make package             # result/ = the backend, result-2/ = the SDK
 make test                # the Rust suite and the SDK's unit tests, incremental
+make test-browser        # the SDK's flows in Chromium against the backend (hermetic)
 make lint                # rustfmt and clippy
 make build               # backend/target/debug/backend
 ```
 
-`nix-build -A checks.<name>` runs one check: `lint`, `sdk-unit`, `vm`. The Rust suite runs as part of building
-the backend. The SDK's flows have no app here to drive them, so the apps' browser tests cover them.
+`nix-build -A checks.<name>` runs one check: `lint`, `sdk-unit`, `browser`, `vm`. The Rust suite runs as part of
+building the backend. The SDK's flows run against a fake backend and authenticator (`sdk-unit`), and in Chromium
+against the real backend with a stand-in app (`browser`, `sdk/test/browser`).

@@ -138,15 +138,20 @@ def harness(run, static_dir: str, extra_env: dict | None = None) -> int:
     work = tempfile.mkdtemp()
     backend = Backend(work, static_dir)
     backend.env.update(extra_env or {})
+    socket_path = backend.env["BACKEND_SOCKET"]
     port = free_port()
     log_path = os.path.join(work, "server.log")
-    with open(log_path, "w") as log:
-        backend.cli("user", "list")  # creates and migrates the database
-        server = subprocess.Popen([backend.binary, *backend.config, "serve"], env=backend.env, stdout=log, stderr=log)
-        wait_for(lambda: os.path.exists(backend.env["BACKEND_SOCKET"]), "the socket to appear")
-        shim = subprocess.Popen(["socat", f"TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr", f"UNIX-CONNECT:{backend.env['BACKEND_SOCKET']}"], stderr=subprocess.DEVNULL)
+    processes = []  # stopped in reverse order, whatever happens
     failed = False
     try:
+        with open(log_path, "w") as log:
+            backend.cli("user", "list")  # creates and migrates the database
+            server = subprocess.Popen([backend.binary, *backend.config, "serve"], env=backend.env, stdout=log, stderr=log)
+        processes.append(server)
+        wait_for(lambda: os.path.exists(socket_path) or server.poll() is not None, "the socket to appear")
+        if server.poll() is not None:
+            raise RuntimeError(f"the backend exited with {server.returncode}")
+        processes.append(subprocess.Popen(["socat", f"TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr", f"UNIX-CONNECT:{socket_path}"], stderr=subprocess.DEVNULL))
         wait_for(lambda: healthy(port), "the backend answering through socat")
         with sync_playwright() as playwright:
             # No sandbox: Chromium's needs user namespaces, which the Nix build sandbox doesn't offer.
@@ -155,15 +160,17 @@ def harness(run, static_dir: str, extra_env: dict | None = None) -> int:
                 run(browser, backend, port)
             finally:
                 browser.close()
-    except Exception:
+    except BaseException:
         failed = True
         raise
     finally:
-        shim.terminate()
-        server.terminate()
-        server.wait(timeout=10)
+        for process in reversed(processes):
+            process.terminate()
+            process.wait(timeout=10)
         if failed:
             print("--- backend log ---\n" + open(log_path).read(), flush=True)
-    assert not os.path.exists(backend.env["BACKEND_SOCKET"]), "the socket is removed on shutdown"
+        socket_left = os.path.exists(socket_path)
+        shutil.rmtree(work, ignore_errors=True)
+    assert not socket_left, "the socket is removed on shutdown"
     print("passed")
     return 0

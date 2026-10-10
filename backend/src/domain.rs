@@ -140,6 +140,22 @@ pub fn classify_host(host: &str, public_hosts: &[String]) -> Option<Site> {
     })
 }
 
+/// Why a `public_hosts` entry (lowercase, trimmed) could never match a request, if it couldn't (SPEC §10).
+pub fn public_host_problem(entry: &str) -> Option<&'static str> {
+    match classify_host(entry, &[entry.to_owned()]) {
+        None => Some(
+            "not a host name with an optional port, e.g. app.example.com or app.example.com:8443",
+        ),
+        Some(site) if !site.secure => {
+            Some("a loopback name: those are always served, over http, without being listed")
+        }
+        Some(site) if site.port == Some(443) => Some(
+            "on port 443, which browsers leave out of Host for https: list it without the port",
+        ),
+        Some(_) => None,
+    }
+}
+
 /// Dot-separated labels of `[a-z0-9-]`, not starting or ending with `-`, and not all digits (no IPs).
 fn valid_dns_name(name: &str) -> bool {
     let labels_ok = name.split('.').all(|label| {
@@ -399,12 +415,12 @@ mod tests {
     #[test]
     fn public_hosts_are_https_and_exact() {
         let public = vec![
-            "pw.example.com".to_owned(),
+            "app.example.com".to_owned(),
             "other.example.com:8443".to_owned(),
         ];
-        let site = classify_host("pw.example.com", &public).unwrap();
-        assert_eq!(site.origin(), "https://pw.example.com");
-        assert_eq!(site.rp_id, "pw.example.com");
+        let site = classify_host("app.example.com", &public).unwrap();
+        assert_eq!(site.origin(), "https://app.example.com");
+        assert_eq!(site.rp_id, "app.example.com");
         assert!(site.secure);
         assert_eq!(
             classify_host("other.example.com:8443", &public)
@@ -412,7 +428,7 @@ mod tests {
                 .rp_id,
             "other.example.com"
         );
-        assert_eq!(classify_host("pw.example.com:444", &public), None);
+        assert_eq!(classify_host("app.example.com:444", &public), None);
         assert_eq!(classify_host("evil.example.com", &public), None);
     }
 
@@ -430,6 +446,27 @@ mod tests {
             "-a.localhost",
         ] {
             assert_eq!(classify_host(refused, &[]), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn public_hosts_must_be_able_to_match() {
+        for ok in ["app.example.com", "app.example.com:8443", "example"] {
+            assert_eq!(public_host_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "",
+            "https://app.example.com",
+            "app.example.com/",
+            "127.0.0.1",
+            "[::1]:8443",
+            "a b.example.com",
+            "localhost",
+            "app.localhost:8080",
+            "app.example.com:443",
+            "app.example.com:99999",
+        ] {
+            assert!(public_host_problem(bad).is_some(), "{bad:?}");
         }
     }
 

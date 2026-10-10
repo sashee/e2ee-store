@@ -72,6 +72,12 @@ test("it gives up after five conflicts", async () => {
   await assert.rejects(saveWithRetry(store.io, options(store, (doc) => doc)), TooManyConflictsError);
 });
 
+test("a ref that disappears during a save is an error, not something to create again", async () => {
+  const store = fakeStore({ items: [] });
+  store.io.putRef = async () => ({ ok: false, current: null });
+  await assert.rejects(saveWithRetry(store.io, options(store, (doc) => doc)), /ref disappeared/);
+});
+
 import { RollbackError } from "../src/save.js";
 
 test("a conflict pointing at an older document is a rollback, not something to save over", async () => {

@@ -65,9 +65,12 @@ mod tests {
     fn links_are_built_for_public_hosts_only() {
         assert_eq!(setup_links(&[], "t"), Vec::<String>::new());
         assert_eq!(
-            setup_links(&["pw.example.com".into(), "b.example.com:8443".into()], "t"),
+            setup_links(
+                &["app.example.com".into(), "b.example.com:8443".into()],
+                "t"
+            ),
             vec![
-                "https://pw.example.com/#setup=t",
+                "https://app.example.com/#setup=t",
                 "https://b.example.com:8443/#setup=t"
             ]
         );

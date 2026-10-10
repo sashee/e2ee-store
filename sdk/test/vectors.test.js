@@ -1,0 +1,57 @@
+// Data of format version 1, made by make-vectors.mjs from the SPEC without the SDK, must open forever (SPEC §2).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import { hexDecode } from "../src/crypto.js";
+import { makeFlows } from "../src/flows.js";
+import { decodeKeys } from "../src/keys.js";
+import { labels } from "../src/labels.js";
+import { parseRecoveryKey } from "../src/recovery-key.js";
+import { install } from "./fakes.js";
+
+const v = JSON.parse(readFileSync(new URL("./vectors.json", import.meta.url), "utf8"));
+const L = labels(v.namespace);
+const flows = makeFlows({
+  labels: L,
+  document: { empty: () => assert.fail("a vault exists"), read: (doc) => ({ doc, writable: true }), commit: () => assert.fail("not saved"), revision: (doc) => doc.revision, keep: () => [] },
+});
+
+/** The fake backend with the vectors' blobs, and an authenticator holding the vectors' passkey. */
+function stored() {
+  const { server, authenticator } = install();
+  const ids = [server.put(Buffer.from(v.keysBlob, "base64")), server.put(Buffer.from(v.vaultBlob, "base64"))];
+  assert.deepEqual(ids, [v.keysBlobId, v.vaultBlobId], "the vectors are intact");
+  server.refs.set("keys", v.keysBlobId);
+  server.refs.set("vault", v.vaultBlobId);
+  server.passkeys.set(v.credentialId, { name: "Vectors" });
+  authenticator.add(v.credentialId, (input) => {
+    assert.equal(new TextDecoder().decode(input), v.prfInput, "the PRF input");
+    return hexDecode(v.prfOutput);
+  });
+  return server;
+}
+
+const opened = (session) => {
+  assert.deepEqual(session.masterKey, hexDecode(v.masterKey));
+  assert.deepEqual(session.vault.doc, v.vaultDocument);
+  assert.equal(session.stateId, v.stateId, "what the device remembers is filed under the same ID");
+  assert.equal(session.keys.writable, true);
+};
+
+test("the passkey opens version 1 data", async () => {
+  stored();
+  const result = await flows.unlockWithPasskey();
+  assert.equal(result.kind, "unlocked");
+  opened(result.session);
+});
+
+test("the recovery key opens version 1 data, and rewriting the keys keeps fields from later versions", async () => {
+  const server = stored();
+  server.session = { passkey: null, fresh: true };
+  const session = await flows.unlockWithRecoveryKey(await flows.loadKeys(), parseRecoveryKey(v.recoveryKey));
+  opened(session);
+  await flows.replaceRecoveryKey(session, flows.newSecrets().recoveryKey);
+  assert.equal(decodeKeys(L, server.read("keys")).doc.added_by_a_later_version, true);
+});

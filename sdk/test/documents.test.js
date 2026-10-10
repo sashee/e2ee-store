@@ -46,6 +46,14 @@ test("pasted setup links, fragments and bare tokens", () => {
   assert.equal(parseSetupInput("https://example.com/#other=1"), null);
 });
 
+test("keys documents need a version from 1 up and well-formed slots", () => {
+  const damaged = [{ nonce: "n" }, { nonce: 1, wrapped_key: "w" }, "slot", null];
+  const docs = [{ version: 0 }, { version: -1 }, { version: 1.5 }, { passkeys: [] }, { passkeys: null }, { recovery: undefined }, ...damaged.flatMap((slot) => [{ recovery: slot ?? 1 }, { passkeys: { a: slot } }])];
+  for (const doc of docs) {
+    assert.throws(() => decodeKeys(L, encodeKeys({ ...emptyKeys(L), ...doc })), /Not a keys document/, JSON.stringify(doc));
+  }
+});
+
 test("a keys document of another app is refused", () => {
   assert.throws(() => decodeKeys(labels("other-app"), encodeKeys(emptyKeys(L))), /Not a keys document/);
 });

@@ -9,7 +9,7 @@ This is a generic backend that does not know about any particular application. I
 - **Users** who sign in with **passkeys** (WebAuthn). Accounts are bootstrapped with short-lived **setup tokens**.
 - **Git-like storage** for each user: immutable, content-addressed **blobs** and mutable **refs** that point at blobs.
 
-Apps keep all of their logic (data format, encryption, sync) in the browser, on top of the SDK (`../sdk/SPEC.md`). The backend stores only opaque bytes. It must not contain any concepts of a particular app, so every app can use it as it is. The first app is a password manager (pw-mgr).
+Apps keep all of their logic (data format, encryption, sync) in the browser, on top of the SDK (`../sdk/SPEC.md`). The backend stores only opaque bytes. It must not contain any concepts of a particular app, so every app can use it as it is.
 
 Non-goals for v1:
 
@@ -27,7 +27,7 @@ Non-goals for v1:
 | D3  | Expect / CAS       | Sent as HTTP preconditions: `If-Match: "<id>"` (the ref points to that blob), `If-None-Match: *` (the ref does not exist), `If-Match: *` (the ref exists). |
 | D4  | Provisioning       | Users can only be created with the admin CLI. Setup tokens can be created by the CLI, or by a logged-in user for their own account. |
 | D5  | Setup token        | Single-use, expires 15 minutes after creation, gives a normal session. |
-| D6  | Storage            | SQLite only (metadata and blob bytes), behind a trait. Maximum blob size 16 MiB. No quotas. |
+| D6  | Storage            | SQLite only (metadata and blob bytes). Maximum blob size 16 MiB. No quotas. |
 | D7  | Sessions           | `HttpOnly` cookie, expires 4 hours after login, `Secure` only when served over HTTPS. |
 | D8  | Network            | The server listens on a Unix domain socket. Browsers reach it through an iroh tunnel (plain HTTP on a loopback name) or through an HTTPS reverse proxy. The backend serves the frontend on both paths. |
 | D9  | Hosts              | Only loopback names and the configured public hosts are accepted. The WebAuthn RP ID is the request's host, so each passkey belongs to one host. |
@@ -41,14 +41,18 @@ Non-goals for v1:
   - `axum` + `tokio` for HTTP.
   - `webauthn_rp` with the features `serde_relaxed` and `serializable_server_state`, for WebAuthn. It is pure Rust on RustCrypto; `webauthn-rs` would bring in OpenSSL.
   - `rusqlite` for SQLite in WAL mode.
-  - `sha2`, `rand`, `serde`, `time`, `clap`, `tracing`.
+  - `sha2`, `getrandom`, `base64`, `serde` + `serde_json`, `toml`, `humantime`, `clap`, `tracing`.
 - One crate, with a module for each responsibility:
   - `domain`: pure types and rules. This covers validating IDs, names and hosts, parsing ranges, evaluating preconditions and computing expiry times. It does no I/O, and the current time is always passed in as an argument.
-  - `store`: the `Store` trait, the SQLite implementation and migrations.
-  - `auth`: WebAuthn ceremonies, sessions and setup tokens.
-  - `fs`: blob and ref operations built on `store`.
+  - `store`: plain functions over a SQLite connection, one per query or transaction; the caller passes the time.
+  - `db`: opening the database (WAL, foreign keys) and its migrations.
+  - `accounts`: what the HTTP API and the admin commands share: creating users, setup tokens and their links.
+  - `passkey`: WebAuthn ceremonies on top of `webauthn_rp`.
+  - `secret`: session and setup tokens, of which only hashes are stored.
   - `http`: routes, extractors, the host/origin checks and the mapping from errors to responses.
-  - `cli`: admin commands.
+  - `server`: the Unix socket and the background cleanup.
+  - `config`: the configuration file and the environment.
+  - `main.rs`: the binary's subcommands, the admin commands among them.
 
 ### 3.1 How browsers reach the server
 
@@ -59,7 +63,7 @@ iroh (main):  browser → http://localhost:PORT or http://<label>.localhost:PORT
                 → local shim (socat on a laptop, iroh-webview-app on Android)
                 → iroh-uds-connect ══ iroh QUIC ══> iroh-uds-listen → backend.sock
 
-direct:       browser → https://pw.example.com → reverse proxy (TLS) → backend.sock
+direct:       browser → https://app.example.com → reverse proxy (TLS) → backend.sock
 ```
 
 - **Everything goes to the socket:** on both paths, all requests (API, frontend, `/healthz`) are forwarded to the socket. The backend serves the frontend from `static_dir`, so both paths behave the same.
@@ -319,7 +323,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 ## 8. HTTP API
 
 - **Base path:** `/api/v1`. Requests and responses are JSON unless noted.
-- **Errors:** `{"error": "<code>", "message": "<human readable>"}`.
+- **Errors:** `{"error": "<code>", "message": "<human readable>"}`, for every API error, including a query string that doesn't parse or a method a route doesn't have.
 - **Response headers:** every API response has `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 - **Request limits:** JSON request bodies are limited to 64 KiB.
 - **Authentication:** session-authenticated endpoints return 401 `unauthenticated` when there is no valid session.
@@ -362,7 +366,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 ```json
 { "credential": { "...": "PublicKeyCredential.toJSON(), without prf results" } }
 ```
-- **200** `{"user": {"id": "…", "username": "alice"}}`, plus `Set-Cookie`.
+- **200** `{"user": {"id": "…", "username": "alice", "created_at": "…"}}` (as `GET /me`), plus `Set-Cookie`.
 - **401** `authentication_failed`. Causes: unknown credential, a passkey registered on another host, a bad signature, or a ceremony that has expired or doesn't exist.
 
 `POST /auth/setup-token`, body `{"token": "…"}`:
@@ -381,7 +385,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 
 `POST /me/setup-tokens`, body `{}`, returns **201**:
 ```json
-{ "token": "…", "expires_at": "…", "links": [ "https://pw.example.com/#setup=…" ] }
+{ "token": "…", "expires_at": "…", "links": [ "https://app.example.com/#setup=…" ] }
 ```
 `links` has one entry per configured public host and is empty when there are none.
 - **403** `reauth_required`: the session is older than the step-up window.
@@ -495,7 +499,8 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 | 403  | `forbidden`              | The Origin check failed |
 | 403  | `reauth_required`        | Step-up is needed |
 | 403  | `passkey_session_required` | Creating a setup token needs a session created with a passkey |
-| 404  | `not_found`              | The blob, ref or passkey doesn't exist |
+| 404  | `not_found`              | The blob, ref, passkey or API route doesn't exist |
+| 405  | `method_not_allowed`     | The route doesn't have this method; `Allow` lists the ones it has |
 | 409  | `blob_referenced`        | A ref still points to the blob |
 | 409  | `blob_not_found`         | The ref target doesn't exist |
 | 409  | `last_passkey`           | The user tried to delete their only passkey |
@@ -504,6 +509,7 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 | 413  | `blob_too_large`         | The blob is larger than `max_blob_size`, or a JSON body is over 64 KiB |
 | 415  | `unsupported_media_type` | Wrong `Content-Type` |
 | 416  | `range_not_satisfiable`  | The range is outside the blob |
+| 500  | `internal`               | Anything else; the details are only logged |
 
 ## 9. Admin CLI
 
@@ -530,7 +536,7 @@ Settings come from a TOML file. Any key can be overridden with an environment va
 | `database`      | `./data/backend.sqlite3` | Path of the SQLite file |
 | `static_dir`    | (required)               | Frontend files, served for every path outside `/api/` and `/healthz` |
 | `static_csp`    | see §8.6                 | `Content-Security-Policy` header sent with static files |
-| `public_hosts`  | `[]`                     | Hosts reached over HTTPS, e.g. `["pw.example.com"]`. Empty means the iroh path only. |
+| `public_hosts`  | `[]`                     | Hosts reached over HTTPS, e.g. `["app.example.com", "other.example.com:8443"]`. Empty means the iroh path only. An entry that could never match a request is refused at startup: anything but a DNS name with an optional port, a loopback name, or port 443 (browsers leave the default port out of `Host`). |
 | `rp_name`       | `"Backend"`              | WebAuthn RP display name |
 | `session_ttl`   | `4h`                     | How long a session lasts after login |
 | `reauth_window` | `5m`                     | Step-up window |
@@ -582,4 +588,3 @@ The setup-token lifetime (15 min) and the ceremony lifetime (5 min) are fixed.
 - Atomic transactions across several refs.
 - A pluggable store for blob content (filesystem or S3) to support large blobs.
 - Fetching several blobs in one request.
-- Moving `backend/` into its own repository.

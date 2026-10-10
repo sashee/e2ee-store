@@ -107,5 +107,6 @@ test("labels are derived from the namespace, which must be a plain name", () => 
     vault: "notes/vault/v1",
     stateId: "notes/device-state-id/v1",
   });
-  for (const bad of ["", "Notes", "a/b", "-x", "x".repeat(65), undefined]) assert.throws(() => labels(bad), /namespace/, String(bad));
+  for (const ok of ["1", "my-app", "a.b_c-d", "x".repeat(64)]) assert.equal(labels(ok).vault, `${ok}/vault/v1`);
+  for (const bad of ["", "Notes", "a/b", "-x", ".x", "x".repeat(65), undefined]) assert.throws(() => labels(bad), /namespace/, String(bad));
 });

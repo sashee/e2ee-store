@@ -105,3 +105,33 @@ pub fn open_and_migrate(path: &Path) -> anyhow::Result<Connection> {
     }
     Ok(conn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrations_apply_once_and_a_newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data/backend.sqlite3");
+        open_and_migrate(&path).unwrap();
+        let conn = open_and_migrate(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(usize::try_from(version).unwrap(), MIGRATIONS.len());
+        let journal: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+
+        conn.pragma_update(None, "user_version", version + 1)
+            .unwrap();
+        let error = open_and_migrate(&path).unwrap_err().to_string();
+        assert!(error.contains("newer than this binary"), "{error}");
+    }
+}

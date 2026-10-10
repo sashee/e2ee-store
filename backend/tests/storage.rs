@@ -431,3 +431,124 @@ async fn static_files_are_served_with_security_headers() {
     assert_eq!(api_missing.status, StatusCode::NOT_FOUND);
     assert_eq!(api_missing.json()["error"], "not_found");
 }
+
+#[tokio::test]
+async fn a_ref_deletes_with_if_match_star_only_if_it_exists() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let delete = || common::Call {
+        cookie: Some(&cookie),
+        headers: vec![("if-match", "*".into())],
+        ..h.call(Method::DELETE, PHONE, "/api/v1/refs/vault")
+    };
+    let missing = h.send(delete()).await;
+    assert_eq!(missing.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(missing.json()["current"], serde_json::Value::Null);
+    put_blob(&h, &cookie, b"a").await;
+    put_ref(&h, &cookie, "vault", &BlobId::of(b"a"), None).await;
+    assert_eq!(h.send(delete()).await.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn blobs_larger_than_the_frameworks_default_limit_are_accepted() {
+    // 16 MiB is the default; axum's own body limit for extractors that buffer is 2 MiB.
+    let h = Harness::with(|config| config.max_blob_size = 16 << 20);
+    let cookie = h.signed_up("alice", PHONE).await;
+    let content: Vec<u8> = (0..3 << 20).map(|i: u32| (i % 251) as u8).collect();
+    assert_eq!(
+        put_blob(&h, &cookie, &content).await.status,
+        StatusCode::CREATED
+    );
+    let read = h
+        .get(
+            PHONE,
+            &format!("/api/v1/blobs/{}", BlobId::of(&content)),
+            &cookie,
+        )
+        .await;
+    assert_eq!(read.body, content);
+}
+
+#[tokio::test]
+async fn deleting_a_user_deletes_everything_they_own_and_nothing_else() {
+    let h = Harness::new();
+    let alice = h.signed_up("alice", PHONE).await;
+    h.register(PHONE, &alice, &Authenticator::new(1), "Phone")
+        .await;
+    put_blob(&h, &alice, b"a").await;
+    put_ref(&h, &alice, "vault", &BlobId::of(b"a"), None).await;
+    // A pending registration and an unused setup token.
+    h.post_json(
+        PHONE,
+        "/api/v1/me/passkeys/register/start",
+        Some(&alice),
+        json!({}),
+    )
+    .await;
+    h.setup_token_for("alice");
+    let bob = h.signed_up("bob", PHONE).await;
+    put_blob(&h, &bob, b"bob's").await;
+
+    let conn = h.conn();
+    let summaries: Vec<_> = backend::store::list_users(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.user.username, s.passkeys, s.stored_bytes))
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            ("alice".into(), vec![("6c4b9e.localhost".into(), 1)], 1),
+            ("bob".into(), vec![], 5)
+        ]
+    );
+
+    let user = backend::store::user_by_username(&conn, "alice")
+        .unwrap()
+        .unwrap();
+    assert!(backend::store::delete_user(&conn, &user.id).unwrap());
+    for table in [
+        "passkeys",
+        "sessions",
+        "setup_tokens",
+        "ceremonies",
+        "blobs",
+        "refs",
+    ] {
+        let left: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE user_id = ?1"),
+                [user.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "{table}");
+    }
+    assert_eq!(
+        h.get(PHONE, "/api/v1/me", &alice).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let bobs = h.get(PHONE, "/api/v1/blobs", &bob).await.json();
+    assert_eq!(bobs["blobs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_frameworks_own_errors_are_json_too() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    for uri in ["/api/v1/blobs?limit=-1", "/api/v1/refs?limit=lots"] {
+        let reply = h.get(PHONE, uri, &cookie).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(reply.json()["error"], "bad_request", "{uri}");
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+    }
+    let wrong_method = h
+        .send(common::Call {
+            cookie: Some(&cookie),
+            ..h.call(Method::POST, PHONE, "/api/v1/blobs")
+        })
+        .await;
+    assert_eq!(wrong_method.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(wrong_method.json()["error"], "method_not_allowed");
+    assert!(wrong_method.header("allow").unwrap().contains("GET"));
+}

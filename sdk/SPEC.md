@@ -99,7 +99,8 @@ The keys blob is plaintext JSON. Its secret parts are the wrapped keys.
 - **Versioning:**
   - `version` covers both this document and the vault blob format.
   - Unknown fields are preserved when the document is rewritten.
-  - A `version` greater than 1 makes the SDK refuse to write anything and ask to update the app.
+  - A `version` greater than 1 makes the SDK refuse to write anything and ask to update the app. The vault opens read-only (`session.vault.writable` is false), and an interrupted creation isn't completed (§6.1, step 5).
+  - A session reads the keys' version when it unlocks. Afterwards it checks again only where it finds the keys changed anyway: when a save runs into a conflict, and before cleanup. A save without a conflict doesn't read the keys, so a newer version that changes the vault's format must still read vaults written in the old one until every device has updated.
 
 ### 3.4 Recovery key
 
@@ -126,7 +127,7 @@ The app defines its vault document and hands it to `makeFlows({ labels, document
 | Function | Contract |
 |----------|----------|
 | `empty(now) → doc` | The vault of a new account, at revision 1. |
-| `read(doc) → { doc, writable }` | Validates a decrypted document; throws if it isn't one. `writable` is false for a newer format version: the vault then opens read-only. |
+| `read(doc) → { doc, writable }` | Validates a decrypted document; throws if it isn't one. `writable` is false for a newer format version: the vault then opens read-only, as it does with newer keys (§3.3). |
 | `commit(doc, operation, now, loadedBlobId) → doc` | Applies an operation (a function `(doc, now) → doc`) as the next revision: the revision grows by exactly 1. May be async, e.g. to upload blobs the new version refers to. |
 | `revision(doc) → integer` | The revision, for rollback detection (§6.5). |
 | `keep(doc) → [blob id]` | Every blob besides the vault blob itself that the vault still needs: earlier versions it keeps, and anything it refers to. May be async, e.g. to walk a tree of blobs. Cleanup deletes the rest (§6.11). |
@@ -144,9 +145,10 @@ The app defines its vault document and hands it to `makeFlows({ labels, document
 2. It reads the PRF output from `getClientExtensionResults().prf.results.first`. If there is none, it stops: "This passkey can't unlock the vault (no PRF support)".
 3. It deletes `clientExtensionResults.prf` from the credential JSON and calls `POST /auth/login/finish`, which creates the session.
 4. It loads the keys blob (`GET /refs/keys`, then the blob) and unwraps the MK from `passkeys[credential.id]`.
+   - If there is no `keys` ref, the result is `no-vault`, or `keys-missing` if a `vault` ref exists (§6.2, step 3).
    - If there is no such slot, the result is `no-slot`. The app offers to unlock with the recovery key, which then sets the passkey up (§6.9).
 5. It loads the vault blob, verifies and decrypts it. The app checks for rollback (§6.5).
-   - If `keys` exists but `vault` doesn't, a vault creation was interrupted. The client creates an empty vault with `If-None-Match: *`.
+   - If `keys` exists but `vault` doesn't, a vault creation was interrupted. The client creates an empty vault with `If-None-Match: *`, unless the keys are from a newer version: then it asks to update the app.
 
 When the app starts, it calls `GET /me`.
 - **401:** it shows the unlock screen.
@@ -162,7 +164,7 @@ When the app starts with a fragment:
 2. `POST /auth/setup-token`. A 401 means "This link has expired or was already used".
 3. `GET /refs/keys`:
    - **No `keys` ref and no `vault` ref:** create the vault (§6.3).
-   - **No `keys` ref but a `vault` ref:** stop and tell the user to restore the server's data. A new vault would come with new keys, and the existing vault could never be opened again.
+   - **No `keys` ref but a `vault` ref:** stop and tell the user to restore the server's data. A new vault would come with new keys, and the existing vault could never be opened again. `unlockWithPasskey` and `createVault` report this as `keys-missing`.
    - **`keys` exists:** ask for the recovery key and unwrap the MK from `recovery`.
 4. With the MK in memory, it registers a passkey on this host and sets it up (§6.6, steps 2–6). The setup-token session is fresh, so no step-up is needed. The user can skip this step, but then the next unlock on this host needs the recovery key again.
 
@@ -171,10 +173,11 @@ When the app starts with a fragment:
 1. Register a passkey on this host and get its PRF output (§6.6, steps 2–5).
 2. Generate the MK and the recovery key.
 3. Show the recovery key. The user has to confirm they saved it before continuing. Nothing has been stored yet, so closing the tab here leaves no trace.
-4. Build the keys document (with the recovery slot and this passkey's slot) and the first vault (`document.empty`). Upload both blobs.
-5. `PUT keys` with `If-None-Match: *`. This is the commit.
+4. Check that there is a `keys` ref or no `vault` ref. A `vault` ref without a `keys` ref stops the creation before anything is written (`keys-missing`, §6.2).
+5. Build the keys document (with the recovery slot and this passkey's slot) and the first vault (`document.empty`). Upload both blobs.
+6. `PUT keys` with `If-None-Match: *`. This is the commit.
    - A 412 means another device created a vault in the meantime. The client discards its own and switches to unlocking. Maintenance removes the orphaned blobs.
-6. `PUT vault` with `If-None-Match: *`. If the client is interrupted before this step, the next unlock creates the empty vault (§6.1, step 5).
+7. `PUT vault` with `If-None-Match: *`. If the client is interrupted before this step, the next unlock creates the empty vault (§6.1, step 5).
 
 ### 6.4 Saving changes
 
@@ -202,7 +205,7 @@ A save applies an operation:
 
 ### 6.6 Adding a passkey on this host
 
-1. `POST /me/passkeys/register/start`. On 403 `reauth_required`, unlock again with a passkey (§6.1) and retry.
+1. `POST /me/passkeys/register/start`. On 403 `reauth_required`, log in again with a passkey (`reauthenticate(session)`) and retry. The passkey must belong to the session's user: another account's passkey on this host would switch the session to that account while this one's MK is in memory, so the SDK logs that login out again and the app has to unlock.
 2. Add `extensions.prf.eval.first = UTF-8(labels.prf)` to the options, then call `navigator.credentials.create()`.
 3. The passkey can be used only if `prf.enabled === true` or PRF results came back. Otherwise the client doesn't call `finish` and tells the user that this authenticator can't unlock the vault.
 4. Remove `clientExtensionResults.prf` and call `POST /me/passkeys/register/finish`.
@@ -262,14 +265,14 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 0. **Check before deleting anything.** Stop, deleting nothing, if:
    - either ref is missing
-   - the vault or keys document is from a newer version
+   - the server's current vault or keys document is from a newer version
    - the server's vault is older than this session's (the app also doesn't run it while a rollback warning is shown)
    - any listed blob ID isn't 64 hex characters (IDs go into URLs)
 1. **Prune the keys document:** remove passkey slots whose credential ID is not in `GET /me/passkeys`. Nothing is saved if nothing changed. Only the slots found stale are removed, also when the save is re-applied after a conflict, so a slot another device just added is never pruned.
 2. **Build the keep set:** the current `keys` blob, the current `vault` blob, and `document.keep(vault)`.
 3. **Delete old blobs:**
    - List all blobs.
-   - Delete every blob that is not in the keep set and whose `created_at` is more than 24 hours before the server's time (taken from the `Date` header of the list response).
+   - Delete every blob that is not in the keep set and whose `created_at` is more than 24 hours before the server's time (taken from the `Date` header of the list response). Without that header, nothing is deleted: this device's clock is no substitute, as it can be days off.
    - The grace period protects blobs that another device has uploaded but not yet referenced. It also applies to manual runs.
    - Blobs uploaded by saves that lost a compare-and-swap race (§6.4) were never committed, so they are deleted too.
 
@@ -338,7 +341,9 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - **Keys documents:** validation; every operation; `version > 1` is read-only; another app's keys document is refused.
   - **Saving:** retries on conflict, gives up after 5, sync and async operations, rollback.
   - **Recovery key, setup links, maintenance:** parsing, the plan with its grace period, the report, the schedule.
-- **Browser tests:** the flows need an app with a UI, so each app runs them with `testing/e2ee_store_harness.py`:
+- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, conflicts and rollback, newer versions, step-up, cleanup, and a server that misbehaves.
+- **Format vectors:** `test/vectors.json` holds a keys blob and a vault blob of version 1, made from this spec by `test/make-vectors.mjs` with `node:crypto` alone. The SDK must keep opening them (§2).
+- **Browser tests:** real WebAuthn against the real backend. This repository runs the flows with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
   - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.
   - `Backend` runs admin commands (`setup_token(...)`) and reads the stored blobs.

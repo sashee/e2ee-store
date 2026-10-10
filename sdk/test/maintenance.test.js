@@ -15,6 +15,11 @@ test("cleanup keeps referenced and history blobs, and young blobs", () => {
   assert.deepEqual(plan.tooRecent.map((b) => b.id), ["young"]);
 });
 
+test("without a usable time, nothing counts as old enough to delete", () => {
+  assert.deepEqual(planBlobs({ keep: [], blobs: [blob("orphan", "2020-01-01T00:00:00Z")], now: NaN }).toDelete, []);
+  assert.deepEqual(planBlobs({ keep: [], blobs: [blob("odd", "yesterday")], now: NOW }).toDelete, []);
+});
+
 test("stale passkey slots are found", () => {
   assert.deepEqual(prunableSlots({ passkeys: { a: {}, b: {} } }, ["b", "c"]), ["a"]);
 });
@@ -36,6 +41,7 @@ test("the automatic run is due after 24 hours or a failed run", () => {
   assert.equal(isDue(ok, NOW + 23 * 3600 * 1000), false);
   assert.equal(isDue(ok, NOW + 24 * 3600 * 1000), true);
   assert.equal(isDue({ ...ok, error: "offline" }, NOW + 1), true);
+  assert.equal(isDue({ ...ok, finished_at: "garbage" }, NOW), true, "an unreadable report doesn't stop the runs for good");
 });
 
 test("rollback is a revision lower than the highest seen", () => {

@@ -15,7 +15,9 @@ use tower::ServiceExt as _;
 
 pub const PHONE: &str = "6c4b9e.localhost:24038";
 pub const LAPTOP: &str = "localhost:8080";
-pub const PUBLIC: &str = "pw.example.com";
+pub const PUBLIC: &str = "app.example.com";
+/// A public host behind a non-default port: its origin includes the port.
+pub const PUBLIC_PORT: &str = "other.example.com:8443";
 pub const START: i64 = 1_791_579_420_000;
 
 pub struct Harness {
@@ -70,6 +72,11 @@ pub struct Call<'a> {
 
 impl Harness {
     pub fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    /// A harness whose configuration `adjust` changes first.
+    pub fn with(adjust: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let static_dir = dir.path().join("static");
         std::fs::create_dir_all(static_dir.join("js")).unwrap();
@@ -79,17 +86,18 @@ impl Harness {
         )
         .unwrap();
         std::fs::write(static_dir.join("js/main.js"), "console.log(1)").unwrap();
-        let config = Config {
+        let mut config = Config {
             socket: dir.path().join("backend.sock"),
             database: dir.path().join("backend.sqlite3"),
             static_dir,
             static_csp: DEFAULT_STATIC_CSP.into(),
-            public_hosts: vec![PUBLIC.into()],
+            public_hosts: vec![PUBLIC.into(), PUBLIC_PORT.into()],
             rp_name: "Test".into(),
             session_ttl: std::time::Duration::from_secs(4 * 3600),
             reauth_window: std::time::Duration::from_secs(300),
             max_blob_size: 1024,
         };
+        adjust(&mut config);
         db::open_and_migrate(&config.database).unwrap();
         let clock = Arc::new(AtomicI64::new(START));
         let read = clock.clone();
@@ -115,9 +123,8 @@ impl Harness {
     }
 
     pub fn call<'a>(&self, method: Method, host: &'a str, uri: impl Into<String>) -> Call<'a> {
-        let scheme = if host == PUBLIC { "https" } else { "http" };
         Call {
-            origin: Some(format!("{scheme}://{host}")),
+            origin: Some(origin_of(host)),
             method,
             host,
             uri: uri.into(),
@@ -319,7 +326,7 @@ impl Harness {
 }
 
 pub fn origin_of(host: &str) -> String {
-    if host == PUBLIC {
+    if host == PUBLIC || host == PUBLIC_PORT {
         format!("https://{host}")
     } else {
         format!("http://{host}")

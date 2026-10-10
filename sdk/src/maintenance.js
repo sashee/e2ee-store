@@ -36,8 +36,8 @@ export function makeReport({ trigger, startedAt, finishedAt, slotsRemoved = 0, p
   };
 }
 
-/** Whether the automatic run is due: never ran, last run failed, or 24 hours passed. */
-export const isDue = (lastReport, now) => !lastReport || lastReport.error !== null || now - Date.parse(lastReport.finished_at) >= RUN_EVERY_MS;
+/** Whether the automatic run is due: never ran, last run failed or can't be read, or 24 hours passed. */
+export const isDue = (lastReport, now) => !lastReport || lastReport.error !== null || !(now - Date.parse(lastReport.finished_at) < RUN_EVERY_MS);
 
 export function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;

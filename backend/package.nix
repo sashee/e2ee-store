@@ -1,6 +1,6 @@
 # The backend as a Nix package: `pkgs.callPackage ./backend/package.nix { }`.
 #
-# Generic (no password-manager code), so this file moves with backend/ when it becomes its own repository.
+# Generic: no app-specific code.
 # Takes everything from the caller's package set, so the nixpkgs pin decides every version.
 {
   lib,

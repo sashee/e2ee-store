@@ -62,13 +62,20 @@ export function makeFlows({ labels, document }) {
    */
   const deriveStateId = async (masterKey) => hexEncode(await hkdfBytes(masterKey, labels.stateId, 16));
 
-  /** Opens the vault with the master key; creates the empty vault if a creation was interrupted. */
+  /**
+   * Opens the vault with the master key; creates the empty vault if a creation was interrupted. The keys' version
+   * covers the vault's format too (SPEC §3.3), so keys from a newer version make the vault read-only.
+   */
   async function open(masterKey, keys) {
     const contentKey = await deriveContentKey(labels, masterKey);
     const stateId = await deriveStateId(masterKey);
     const user = await api.me();
     const blobId = await api.getRef("vault");
-    if (blobId) return { masterKey, contentKey, stateId, keys, user, vault: await loadVault(contentKey, blobId) };
+    if (blobId) {
+      const vault = await loadVault(contentKey, blobId);
+      return { masterKey, contentKey, stateId, keys, user, vault: { ...vault, writable: vault.writable && keys.writable } };
+    }
+    if (!keys.writable) throw new UserFacingError("This vault was created by a newer version of the app; update this one to open it.");
     const doc = document.empty(now());
     const created = await api.putBlob(await sealDocument(contentKey, labels.vault, doc));
     const write = await api.putRef("vault", created, null);
@@ -76,16 +83,37 @@ export function makeFlows({ labels, document }) {
     return { masterKey, contentKey, stateId, keys, user, vault: { doc, blobId: created, writable: true } };
   }
 
-  /** Step-up (backend/SPEC.md §6.5): a passkey login creates a fresh session. Its PRF output isn't used. */
-  async function reauthenticate() {
+  /**
+   * Whether the keys blob `blobId` is from this version, read only if it isn't the session's: another device may
+   * have moved the keys, and with them the vault's format, to a newer version since the unlock (SPEC §3.3).
+   */
+  const keysWritable = async (session, blobId) =>
+    blobId === session.keys.blobId ? session.keys.writable : decodeKeys(labels, await api.getBlob(blobId)).writable;
+
+  /**
+   * Step-up (backend/SPEC.md §6.5): a passkey login creates a fresh session. Its PRF output isn't used. The passkey
+   * must be the session user's: one of another account on this host would switch the session to that account while
+   * this one's master key is in memory, so that login is logged out again, and the app has to unlock again.
+   */
+  async function reauthenticate(session) {
     const { options } = await api.loginStart();
     const { credential } = await passkeys.get(options, labels.prf);
-    await api.loginFinish(credential);
+    const { user } = await api.loginFinish(credential);
+    if (user.id !== session.user.id) {
+      await api.logout();
+      throw new UserFacingError("That passkey belongs to another account. Unlock again with one of yours.");
+    }
   }
 
   /**
+   * Without a `keys` ref, there is no vault yet, unless the `vault` ref exists: then its keys are missing, and a new
+   * vault would come with new keys and leave the existing one unopenable (SPEC §6.2).
+   */
+  const keysMissing = async () => (await api.getRef("vault")) !== null;
+
+  /**
    * Logs in with a passkey and unlocks with its PRF output.
-   * → { kind: "unlocked", session } | { kind: "no-vault" } | { kind: "no-slot", credentialId, prfOutput, keys }
+   * → { kind: "unlocked", session } | { kind: "no-vault" } | { kind: "keys-missing" } | { kind: "no-slot", credentialId, prfOutput, keys }
    */
   async function unlockWithPasskey() {
     const { options } = await api.loginStart();
@@ -93,8 +121,8 @@ export function makeFlows({ labels, document }) {
     if (!prfOutput) throw new UserFacingError("This passkey can't unlock the vault: it doesn't support the PRF extension.");
     await api.loginFinish(credential);
     const keys = await loadKeys();
-    if (!keys) return { kind: "no-vault" };
-    const slot = keys.doc.passkeys[credentialId];
+    if (!keys) return { kind: (await keysMissing()) ? "keys-missing" : "no-vault" };
+    const slot = Object.hasOwn(keys.doc.passkeys, credentialId) ? keys.doc.passkeys[credentialId] : null;
     if (!slot) return { kind: "no-slot", credentialId, prfOutput, keys };
     return { kind: "unlocked", session: await open(await unwrap(labels, "passkey", prfOutput, slot), keys) };
   }
@@ -132,7 +160,11 @@ export function makeFlows({ labels, document }) {
       loaded: session.keys,
       apply: (doc) => operation(doc, now()),
       encode: async (doc) => encodeKeys(doc),
-      decode: async (data) => decodeKeys(labels, data).doc,
+      decode: async (data) => {
+        const conflict = decodeKeys(labels, data);
+        if (!conflict.writable) throw new UserFacingError("Another device saved the keys with a newer version of the app; update this one first.");
+        return conflict.doc;
+      },
     });
     return { ...session, keys: { doc: saved.doc, blobId: saved.blobId, writable: true } };
   };
@@ -165,7 +197,7 @@ export function makeFlows({ labels, document }) {
       const vaultId = await api.getRef("vault");
       if (!keysId || !vaultId) throw new Error("The keys or the vault are missing on the server, so nothing was deleted.");
       const vault = vaultId === current.vault.blobId ? current.vault : await loadVault(current.contentKey, vaultId);
-      if (!current.keys.writable || !vault.writable) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
+      if (!(await keysWritable(current, keysId)) || !vault.writable) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
       if (document.revision(vault.doc) < document.revision(current.vault.doc)) throw new Error("The server returned an older vault than this session's, so nothing was deleted.");
 
       onProgress("Checking passkeys");
@@ -180,6 +212,7 @@ export function makeFlows({ labels, document }) {
 
       onProgress("Listing blobs");
       const { blobs, serverNow } = await listAllBlobs();
+      if (serverNow === null) throw new Error("The server didn't say what time it is, so nothing was deleted.");
       blobs.forEach((b) => api.checkBlobId(b.id));
       const keep = [stale.length > 0 ? current.keys.blobId : keysId, vaultId, ...((await document.keep(vault.doc)) ?? [])];
       plan = planBlobs({ keep, blobs, now: serverNow });
@@ -218,9 +251,11 @@ export function makeFlows({ labels, document }) {
 
   /**
    * Creates the vault (SPEC §6.3): writing `keys` is the commit.
-   * → { kind: "created", session } | { kind: "exists" } when another device got there first.
+   * → { kind: "created", session } | { kind: "exists" } when another device got there first
+   *   | { kind: "keys-missing" } when a vault exists without keys; nothing is written then.
    */
   async function createVault({ masterKey, recoveryKey, credentialId, prfOutput }) {
+    if ((await api.getRef("keys")) === null && (await keysMissing())) return { kind: "keys-missing" };
     const t = now();
     const keysDoc = setRecovery(await wrap(labels, "recovery", recoveryKey, masterKey, t))(
       setPasskey(credentialId, await wrap(labels, "passkey", prfOutput, masterKey, t))(emptyKeys(labels)),
@@ -252,7 +287,10 @@ export function makeFlows({ labels, document }) {
       encode: (doc) => sealDocument(session.contentKey, labels.vault, doc),
       decode: async (data) => {
         const conflict = await decryptVault(session.contentKey, data);
-        if (!conflict.writable) throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
+        const keysId = await api.getRef("keys");
+        if (!conflict.writable || (keysId && !(await keysWritable(session, keysId)))) {
+          throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
+        }
         return conflict.doc;
       },
       // Another device's save is always a later revision; anything else is the server rolling the vault back.

@@ -293,7 +293,10 @@ async fn users_create_setup_tokens_for_themselves() {
     let token = body["token"].as_str().unwrap();
     assert_eq!(
         body["links"],
-        json!([format!("https://{PUBLIC}/#setup={token}")])
+        json!([
+            format!("https://{PUBLIC}/#setup={token}"),
+            format!("https://{PUBLIC_PORT}/#setup={token}")
+        ])
     );
 
     // Used on the public host: the cookie is Secure there.
@@ -455,4 +458,263 @@ async fn only_passkey_sessions_create_setup_tokens() {
         .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(reply.json()["error"], "passkey_session_required");
+}
+
+#[tokio::test]
+async fn another_users_passkeys_and_ceremonies_are_out_of_reach() {
+    let h = Harness::new();
+    let alice = h.signed_up("alice", PHONE).await;
+    let (a1, a2) = (Authenticator::new(1), Authenticator::new(2));
+    h.register(PHONE, &alice, &a1, "A1").await;
+    h.register(PHONE, &alice, &a2, "A2").await;
+    let bob = h.signed_up("bob", PHONE).await;
+    h.register(PHONE, &bob, &Authenticator::new(3), "B").await;
+
+    let delete = h
+        .delete(PHONE, &format!("/api/v1/me/passkeys/{}", a1.id()), &bob)
+        .await;
+    assert_eq!(delete.status, StatusCode::NOT_FOUND, "not Bob's passkey");
+    let alices = h.get(PHONE, "/api/v1/me/passkeys", &alice).await.json();
+    assert_eq!(alices["passkeys"].as_array().unwrap().len(), 2);
+
+    // Bob can't finish a registration Alice started: the passkey would be Alice's.
+    let start = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/start",
+            Some(&alice),
+            json!({}),
+        )
+        .await
+        .json();
+    let credential =
+        Authenticator::new(4).register(&start["options"], &origin_of(PHONE), rp_id_of(PHONE));
+    let finish = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/finish",
+            Some(&bob),
+            json!({ "name": "Stolen", "credential": credential }),
+        )
+        .await;
+    assert_eq!(finish.status, StatusCode::BAD_REQUEST);
+    assert_eq!(finish.json()["error"], "registration_failed");
+    let bobs = h.get(PHONE, "/api/v1/me/passkeys", &bob).await.json();
+    assert_eq!(bobs["passkeys"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_ceremony_finishes_only_the_kind_it_was_started_for() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let phone = Authenticator::new(1);
+    h.register(PHONE, &cookie, &phone, "Phone").await;
+
+    let login = h
+        .post_json(PHONE, "/api/v1/auth/login/start", None, json!({}))
+        .await
+        .json();
+    let credential =
+        Authenticator::new(2).register(&login["options"], &origin_of(PHONE), rp_id_of(PHONE));
+    let registered = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/finish",
+            Some(&cookie),
+            json!({ "name": "Key", "credential": credential }),
+        )
+        .await;
+    assert_eq!(registered.status, StatusCode::BAD_REQUEST);
+
+    let register = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/start",
+            Some(&cookie),
+            json!({}),
+        )
+        .await
+        .json();
+    let assertion = phone.sign(
+        &register["options"],
+        &origin_of(PHONE),
+        rp_id_of(PHONE),
+        &h.user_handle("alice"),
+    );
+    let logged_in = h
+        .post_json(
+            PHONE,
+            "/api/v1/auth/login/finish",
+            None,
+            json!({ "credential": assertion }),
+        )
+        .await;
+    assert_eq!(logged_in.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn ceremonies_expire_after_5_minutes() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let phone = Authenticator::new(1);
+    h.register(PHONE, &cookie, &phone, "Phone").await;
+
+    let login = h
+        .post_json(PHONE, "/api/v1/auth/login/start", None, json!({}))
+        .await
+        .json();
+    let register = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/start",
+            Some(&cookie),
+            json!({}),
+        )
+        .await
+        .json();
+    h.advance(5 * MINUTE);
+
+    let assertion = phone.sign(
+        &login["options"],
+        &origin_of(PHONE),
+        rp_id_of(PHONE),
+        &h.user_handle("alice"),
+    );
+    let late_login = h
+        .post_json(
+            PHONE,
+            "/api/v1/auth/login/finish",
+            None,
+            json!({ "credential": assertion }),
+        )
+        .await;
+    assert_eq!(late_login.status, StatusCode::UNAUTHORIZED);
+    let credential =
+        Authenticator::new(2).register(&register["options"], &origin_of(PHONE), rp_id_of(PHONE));
+    let late_registration = h
+        .post_json(
+            PHONE,
+            "/api/v1/me/passkeys/register/finish",
+            Some(&cookie),
+            json!({ "name": "Key", "credential": credential }),
+        )
+        .await;
+    assert_eq!(late_registration.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deleting_a_passkey_needs_step_up() {
+    let h = Harness::new();
+    let setup_cookie = h.signed_up("alice", PHONE).await;
+    let (a, b) = (Authenticator::new(1), Authenticator::new(2));
+    h.register(PHONE, &setup_cookie, &a, "A").await;
+    h.register(PHONE, &setup_cookie, &b, "B").await;
+    let cookie = h
+        .login(PHONE, &b, &h.user_handle("alice"), None)
+        .await
+        .cookie();
+    h.advance(5 * MINUTE);
+    let reply = h
+        .delete(PHONE, &format!("/api/v1/me/passkeys/{}", a.id()), &cookie)
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.json()["error"], "reauth_required");
+    let list = h.get(PHONE, "/api/v1/me/passkeys", &cookie).await.json();
+    assert_eq!(list["passkeys"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deleting_the_passkey_of_the_current_session_ends_it() {
+    let h = Harness::new();
+    let setup_cookie = h.signed_up("alice", PHONE).await;
+    let (a, b) = (Authenticator::new(1), Authenticator::new(2));
+    h.register(PHONE, &setup_cookie, &a, "A").await;
+    h.register(PHONE, &setup_cookie, &b, "B").await;
+    let cookie = h
+        .login(PHONE, &a, &h.user_handle("alice"), None)
+        .await
+        .cookie();
+    let deleted = h
+        .delete(PHONE, &format!("/api/v1/me/passkeys/{}", a.id()), &cookie)
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.get(PHONE, "/api/v1/me", &cookie).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn a_registration_finishes_only_on_its_host_and_port() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    for host in ["6c4b9e.localhost:9999", LAPTOP] {
+        let start = h
+            .post_json(
+                PHONE,
+                "/api/v1/me/passkeys/register/start",
+                Some(&cookie),
+                json!({}),
+            )
+            .await
+            .json();
+        // Signed for the phone's origin, where the ceremony started, but sent to another one.
+        let credential =
+            Authenticator::new(1).register(&start["options"], &origin_of(PHONE), rp_id_of(PHONE));
+        let reply = h
+            .post_json(
+                host,
+                "/api/v1/me/passkeys/register/finish",
+                Some(&cookie),
+                json!({ "name": "Phone", "credential": credential }),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{host}");
+    }
+    let list = h.get(PHONE, "/api/v1/me/passkeys", &cookie).await.json();
+    assert_eq!(list["passkeys"], json!([]));
+}
+
+#[tokio::test]
+async fn passkeys_work_on_public_hosts_with_and_without_a_port() {
+    let h = Harness::new();
+    for (seed, host) in [(1, PUBLIC), (2, PUBLIC_PORT)] {
+        let username = format!("user{seed}");
+        let cookie = h.signed_up(&username, host).await;
+        let key = Authenticator::new(seed);
+        let registered = h.register(host, &cookie, &key, "Key").await;
+        assert_eq!(
+            registered.status,
+            StatusCode::CREATED,
+            "{host}: {}",
+            String::from_utf8_lossy(&registered.body)
+        );
+        assert_eq!(registered.json()["passkey"]["rp_id"], rp_id_of(host));
+        let login = h.login(host, &key, &h.user_handle(&username), None).await;
+        assert_eq!(login.status, StatusCode::OK, "{host}");
+        assert!(login.header("set-cookie").unwrap().ends_with("; Secure"));
+    }
+}
+
+#[tokio::test]
+async fn a_setup_token_replaces_the_current_session() {
+    let h = Harness::new();
+    let first = h.signed_up("alice", PHONE).await;
+    let second = h
+        .post_json(
+            PHONE,
+            "/api/v1/auth/setup-token",
+            Some(&first),
+            json!({ "token": h.setup_token_for("alice") }),
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(
+        h.get(PHONE, "/api/v1/me", &first).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        h.get(PHONE, "/api/v1/me", &second.cookie()).await.status,
+        StatusCode::OK
+    );
 }
