@@ -12,6 +12,7 @@ import { labels } from "../src/labels.js";
 import { UserFacingError } from "../src/passkeys.js";
 import { RollbackError } from "../src/save.js";
 import * as stream from "../src/stream.js";
+import { TreeError } from "../src/tree.js";
 import { BOB, fakeAuthenticator, install, useAuthenticator } from "./fakes.js";
 
 const L = labels("test-app");
@@ -310,6 +311,35 @@ test("a save reports its uploads, and an abort before the ref moves changes noth
   assert.equal(server.refs.get("vault"), vault);
   await assert.rejects(flows.save(saved, [(tx) => tx.put(["d"], null)]), /nothing to put/);
   await assert.rejects(flows.save(saved, [() => "not a tx"]), TypeError);
+  assert.equal(server.refs.get("vault"), vault);
+});
+
+test("a file over the backend's limit fails the whole save, naming it, and moves nothing", async () => {
+  const { server, session } = await newAccount();
+  server.maxBlobSize = 10_000;
+  const vault = server.refs.get("vault");
+  const steps = [(tx) => tx.put(["small.txt"], tx.upload(encode("fits"))), (tx) => tx.put(["Big", "film.bin"], tx.upload(new Uint8Array(20_000)))];
+  await assert.rejects(flows.save(session, steps), (e) => e instanceof TreeError && e.code === "too_large" && e.path.join("/") === "Big/film.bin");
+  assert.equal(server.refs.get("vault"), vault);
+  assert.deepEqual(await flows.list(session, []), []);
+});
+
+test("a Blob is read only when it's uploaded, and counts in the progress by its size", async () => {
+  const { session } = await newAccount();
+  const content = Uint8Array.from({ length: 70_000 }, (_, i) => i % 13);
+  const blob = new Blob([content]);
+  const progress = [];
+  const { session: saved } = await flows.save(session, [(tx) => tx.put(["blob.bin"], tx.upload(blob))], { onProgress: (p) => progress.push(p) });
+  assert.deepEqual(progress.at(-1), { files: 1, bytes: 70_000, totalFiles: 1, totalBytes: 70_000 });
+  const [entry] = await flows.list(saved, []);
+  assert.equal(entry.size, 70_000);
+  assert.deepEqual(await collect(flows.read(saved, entry)), content);
+});
+
+test("a save takes an array of step functions", async () => {
+  const { server, session } = await newAccount();
+  const vault = server.refs.get("vault");
+  for (const steps of [(tx) => tx, [add("x"), "not a step"], undefined]) await assert.rejects(flows.save(session, steps), TypeError, String(steps));
   assert.equal(server.refs.get("vault"), vault);
 });
 

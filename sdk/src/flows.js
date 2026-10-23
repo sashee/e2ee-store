@@ -384,12 +384,6 @@ export function makeFlows({ labels }) {
     };
   }
 
-  /** The root that `steps` lead to from `root`: each step takes a tx and returns the next (SPEC §6.4). */
-  async function committed(root, steps, io) {
-    const final = await steps.reduce(async (tx, step) => step(await tx), Promise.resolve(tree.begin(root, io, now())));
-    return { final, root: () => tree.commit(final, io) };
-  }
-
   const checkSteps = (steps) => {
     if (!Array.isArray(steps) || !steps.every((step) => typeof step === "function")) throw new TypeError("A save takes an array of steps, each (tx) => tx");
   };
@@ -420,10 +414,11 @@ export function makeFlows({ labels }) {
         ref: "vault",
         loaded: { doc: rootDoc(session.root), blobId: session.root.blobId },
         apply: async (root) => {
-          const { final, root: commit } = await committed(root, steps, treeIo);
+          // Each step takes a tx and returns the next (SPEC §6.4).
+          const final = await steps.reduce(async (tx, step) => step(await tx), Promise.resolve(tree.begin(root, treeIo, now())));
           sources = await tree.uploads(final);
           report();
-          const doc = await commit();
+          const doc = await tree.commit(final, treeIo);
           signal?.throwIfAborted();
           return doc;
         },

@@ -37,6 +37,8 @@ export function fakeServer() {
     pieceSize: 16 * 1024,
     /** Answers a `Range` request with the whole blob, as a server without range support would. */
     ignoresRanges: false,
+    /** The backend's `max_blob_size`: a larger upload is refused with 413 `blob_too_large`. */
+    maxBlobSize: Infinity,
     /** Runs just before a ref write is checked: another device can write first. */
     beforeRefWrite: (_name) => {},
     /** Blob IDs whose deletion fails with a 500. */
@@ -212,6 +214,7 @@ export function fakeServer() {
       "PUT",
       /^\/blobs\/([0-9a-f]{64})$/,
       authed(({ match, body }) => {
+        if (body.length > server.maxBlobSize) return error(413, "blob_too_large");
         if (sha256Hex(body) !== match[1]) return error(400, "hash_mismatch");
         const created = !server.blobs.has(match[1]);
         server.put(body);

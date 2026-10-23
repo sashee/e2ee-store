@@ -103,7 +103,7 @@ class Device:
     sent: list
     cdp: object
     authenticator: str
-    committed: list  # vault blob IDs this device committed (successful writes of the `vault` ref)
+    committed: list  # root directory blob IDs this device committed (successful writes of the `vault` ref)
 
     def replace_authenticator(self) -> None:
         """Swaps in a new, empty authenticator: like losing the old security key and using a new one."""
