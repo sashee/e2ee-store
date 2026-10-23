@@ -97,10 +97,16 @@ export function makeFlows({ labels }) {
   };
 
   function remember(contentKey, id, doc) {
-    const { dirs, known } = cacheOf(contentKey);
+    const { dirs } = cacheOf(contentKey);
     dirs.delete(id);
     dirs.set(id, doc);
     if (dirs.size > CACHED_DIRS) dirs.delete(dirs.keys().next().value);
+    return learn(contentKey, doc);
+  }
+
+  /** Makes a directory's entries ones that `put` accepts back (tree.js). */
+  function learn(contentKey, doc) {
+    const { known } = cacheOf(contentKey);
     doc.entries.forEach((entry) => known.set(entry.id, entry));
     return doc;
   }
@@ -448,7 +454,8 @@ export function makeFlows({ labels }) {
           if (!tree.writable(conflict) || (keysId && !(await keysWritable(session, keysId)))) {
             throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
           }
-          return conflict;
+          // The steps run again on this root, and may put its entries back.
+          return learn(session.contentKey, conflict);
         },
         // Another device's save is always a later revision; anything else is the server rolling the vault back.
         accept: (conflict, base) => conflict.revision > base.revision,

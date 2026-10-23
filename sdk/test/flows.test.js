@@ -259,6 +259,22 @@ test("a save that conflicts with another device's runs its steps again on top of
   assert.equal(session.root.revision, 3);
 });
 
+test("after a conflict, the steps can put back entries of the newer root", async () => {
+  const { session: laptop } = await newAccount();
+  const { session: phone } = await flows.unlockWithPasskey();
+  await flows.save(laptop, [add("from the laptop")]);
+  // Keeps a copy of the notes before changing them, as an app keeping versions does: the copy is of the newer root's.
+  const backup = async (tx) => {
+    const current = await tx.entry(NOTES);
+    return current ? tx.put([`notes@${tx.revision}`], current) : tx;
+  };
+  const { session } = await flows.save(phone, [backup, add("from the phone")]);
+  assert.deepEqual((await flows.list(session, [])).map((e) => e.name), ["notes.json", "notes@2"]);
+  const copy = (await flows.list(session, [])).find((e) => e.name === "notes@2");
+  assert.deepEqual(decode(await collect(flows.read(session, copy))), ["from the laptop"]);
+  assert.deepEqual(await notesOf(session), ["from the laptop", "from the phone"]);
+});
+
 test("after a conflict the steps run again, but what they upload is uploaded once", async () => {
   const { server, session: laptop } = await newAccount();
   const { session: phone } = await flows.unlockWithPasskey();
