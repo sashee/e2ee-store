@@ -65,6 +65,9 @@ in
   app its own loopback name (`http://notes.localhost:PORT`, `http://todo.localhost:PORT`): cookies ignore the
   port, so two apps on plain `localhost` would log each other out, and each would offer the other's passkeys.
 - **VM test:** `import (e2eeStore + "/nix/tests/lib.nix") { inherit pkgs; instance = "notes"; machineModules = [ … ]; }`.
+- **Rerunning this repository's checks** with the app's nixpkgs (and a host's machine for the VM test):
+  `import (e2eeStore + "/nix/tests") { inherit pkgs; machineModules = [ … ]; }` gives the SDK's unit tests, the
+  browser test and the S3 VM test. Add them to the app's checks, so a host running those runs them too.
 - **Browser tests:** `${sdk}/share/e2ee-store/testing` goes on `PYTHONPATH`; `e2ee_store_harness.harness(run,
   static_dir)` starts the backend (`BACKEND_BIN`) behind socat and Chromium with PRF-capable virtual
   authenticators (`sdk/SPEC.md` §9).

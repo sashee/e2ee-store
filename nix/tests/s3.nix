@@ -2,9 +2,12 @@
 # to Garage on the same machine, behind nginx for TLS with a test CA in the system's bundle. On top of the checks of
 # ./lib.nix: offloadable blobs go to S3, read back through the API, and move back and forth when the target changes;
 # the credentials stay the service's; and against a real S3, the sweep, an outage and a lost object.
+#
+# `machineModules` are the machine's own configuration, as for ./lib.nix: a host repository passes its real one.
 {
   pkgs,
   staticDir,
+  machineModules,
 }:
 let
   inherit (pkgs) lib;
@@ -41,12 +44,11 @@ in
 import ./lib.nix {
   inherit pkgs;
   instance = "demo";
-  machineModules = [
+  machineModules = machineModules ++ [
     {
-      system.stateVersion = lib.trivial.release;
-      virtualisation.memorySize = 2048;
+      virtualisation.memorySize = lib.mkDefault 2048;
       # Garage wants at least 1 GiB free.
-      virtualisation.diskSize = 2048;
+      virtualisation.diskSize = lib.mkDefault 2048;
       security.pki.certificateFiles = [ "${certs}/ca.crt" ];
       environment.systemPackages = [ pkgs.minio-client ];
 
