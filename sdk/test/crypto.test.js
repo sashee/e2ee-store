@@ -104,7 +104,6 @@ test("labels are derived from the namespace, which must be a plain name", () => 
     slot: { passkey: "notes/keys/v1/passkey", recovery: "notes/keys/v1/recovery" },
     stream: "notes/stream/v1",
     vault: "notes/vault/v1",
-    content: "notes/content/v1",
     stateId: "notes/device-state-id/v1",
   });
   for (const ok of ["1", "my-app", "a.b_c-d", "x".repeat(64)]) assert.equal(labels(ok).vault, `${ok}/vault/v1`);

@@ -5,14 +5,13 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 
 import * as api from "../src/api.js";
-import { contentKey, openDocument } from "../src/envelope.js";
+import { contentKey } from "../src/envelope.js";
 import { makeFlows } from "../src/flows.js";
 import { decodeKeys, encodeKeys, WrongKeyError } from "../src/keys.js";
 import { labels } from "../src/labels.js";
 import { UserFacingError } from "../src/passkeys.js";
 import { RollbackError } from "../src/save.js";
 import { BOB, fakeAuthenticator, install, useAuthenticator } from "./fakes.js";
-import { legacyDocument } from "./reference.mjs";
 
 const L = labels("test-app");
 const HOUR = 3600 * 1000;
@@ -384,72 +383,7 @@ test("putBlob and readBlob use the session's key", async () => {
   await assert.rejects(read({}, stranger), api.IntegrityError, "another master key");
 });
 
-/** A vault written before the stream format (SPEC §3.5), with its two earlier versions in its history. */
-async function legacyAccount() {
-  const account = await newAccount();
-  const { server, secrets } = account;
-  const legacy = (doc) => server.put(legacyDocument({ masterKey: secrets.masterKey, namespace: "test-app", label: L.vault, nonce: randomBytes(12), doc }));
-  const first = { format: "test-app/notes", version: 1, revision: 5, notes: ["a"], history: [] };
-  const second = { ...first, revision: 6, notes: ["a", "b"], history: [legacy(first)] };
-  const current = { ...first, revision: 7, notes: ["a", "b", "c"], history: [legacy(second), second.history[0]] };
-  server.refs.set("vault", legacy(current));
-  lock(server);
-  const { session } = await flows.unlockWithPasskey();
-  return { ...account, session, current, second };
-}
-
-/** Rewrites the history the notes document keeps after the next commit: the newest earlier version. */
-const resealHistory = async (doc, reseal) => ({ ...doc, history: await Promise.all(doc.history.slice(0, 1).map((id) => reseal(id))) });
-
-test("a vault from before the stream format opens, and upgrading rewrites it and its history", async () => {
-  const { server, session, current, second } = await legacyAccount();
-  assert.equal(session.vault.legacy, true);
-  assert.deepEqual(session.vault.doc, current);
-
-  const upgraded = await flows.upgradeVault(session, resealHistory);
-  assert.equal(upgraded.vault.legacy, false);
-  assert.equal(server.refs.get("vault"), upgraded.vault.blobId);
-  assert.deepEqual(upgraded.vault.doc.notes, current.notes);
-  assert.equal(upgraded.vault.doc.revision, current.revision + 1);
-  // The history: the loaded vault, then its newest earlier version, both rewritten in the stream format.
-  const opened = await Promise.all(upgraded.vault.doc.history.map((id) => openDocument(session.contentKey, L.vault, server.blobs.get(id).bytes)));
-  assert.deepEqual(opened, [current, second]);
-
-  lock(server);
-  const unlocked = await flows.unlockWithPasskey();
-  assert.equal(unlocked.session.vault.legacy, false);
-  assert.deepEqual(unlocked.session.vault.doc, upgraded.vault.doc);
-  server.requests = [];
-  assert.equal(await flows.upgradeVault(unlocked.session, resealHistory), unlocked.session, "nothing left to upgrade");
-  assert.deepEqual(server.requests, []);
-});
-
-test("an upgrade that runs into another device's save changes nothing", async () => {
-  const { server, session } = await legacyAccount();
-  const other = server.put(new Uint8Array([1]));
-  server.refs.set("vault", other);
-  assert.equal(await flows.upgradeVault(session, resealHistory), session);
-  assert.equal(server.refs.get("vault"), other);
-});
-
-test("a vault from before the stream format is saved in the stream format", async () => {
-  const { server, session } = await legacyAccount();
-  const { session: saved } = await flows.saveVault(session, add("d"));
-  assert.equal(saved.vault.legacy, false);
-  assert.deepEqual((await openDocument(session.contentKey, L.vault, server.read("vault"))).notes, ["a", "b", "c", "d"]);
-});
-
-test("a read-only vault from before the stream format isn't upgraded", async () => {
-  const { server } = await legacyAccount();
-  writeKeys(server, { ...keysOf(server), version: 2 });
-  const vault = server.refs.get("vault");
-  const { session } = await flows.unlockWithPasskey();
-  assert.equal(session.vault.writable, false);
-  assert.equal(await flows.upgradeVault(session, resealHistory), session);
-  assert.equal(server.refs.get("vault"), vault);
-});
-
-test("a vault that opens in neither format, or isn't JSON, is an integrity error, and nothing is written", async () => {
+test("a vault that doesn't decrypt, or isn't JSON, is an integrity error, and nothing is written", async () => {
   const { server, session } = await newAccount();
   const notJson = (await flows.putBlob(session, L.vault, new TextEncoder().encode("not JSON"))).id;
   for (const vault of [server.put(randomBytes(4152)), notJson]) {
@@ -459,25 +393,4 @@ test("a vault that opens in neither format, or isn't JSON, is an integrity error
     await assert.rejects(flows.unlockWithPasskey(), api.IntegrityError);
     assert.deepEqual(server.refs, before);
   }
-});
-
-test("an upgrade that can't read a blob it rewrites stops, changing nothing", async () => {
-  const { server, session, current } = await legacyAccount();
-  server.blobs.delete(current.history[0]);
-  const vault = server.refs.get("vault");
-  await assert.rejects(flows.upgradeVault(session, resealHistory), api.ApiError);
-  assert.equal(server.refs.get("vault"), vault);
-});
-
-test("after the upgrade, cleanup deletes the blobs of the old format", async () => {
-  const { server, session, current } = await legacyAccount();
-  const old = [session.vault.blobId, ...current.history];
-  const upgraded = await flows.upgradeVault(session, resealHistory);
-  server.now += 25 * HOUR;
-  const { report } = await flows.maintain(upgraded, "manual");
-  assert.equal(report.error, null);
-  assert.deepEqual(old.filter((id) => server.blobs.has(id)), [], "the old-format blobs are gone");
-  assert.ok([upgraded.vault.blobId, ...upgraded.vault.doc.history].every((id) => server.blobs.has(id)), "the upgraded ones stay");
-  lock(server);
-  assert.deepEqual((await flows.unlockWithPasskey()).session.vault.doc, upgraded.vault.doc);
 });

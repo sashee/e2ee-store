@@ -11,8 +11,6 @@ export function labels(namespace) {
     slot: { passkey: `${namespace}/keys/v1/passkey`, recovery: `${namespace}/keys/v1/recovery` },
     stream: `${namespace}/stream/v1`,
     vault: `${namespace}/vault/v1`,
-    /** Transitional: the content key of the format before streams (SPEC §3.5). */
-    content: `${namespace}/content/v1`,
     stateId: `${namespace}/device-state-id/v1`,
   };
 }

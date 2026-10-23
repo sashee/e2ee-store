@@ -1,4 +1,4 @@
-// The blob formats as SPEC §3.2 and §3.5 describe them, written with node:crypto alone, not with the SDK: for the
+// The blob format as SPEC §3.2 describes it, written with node:crypto alone, not with the SDK: for the
 // vectors (make-vectors.mjs), and for tests that need blobs the SDK would never write.
 
 import { createCipheriv, createHash, hkdfSync } from "node:crypto";
@@ -35,11 +35,4 @@ export function streamBlob({ masterKey, namespace, label, salt, plaintext, padde
   lengthField.writeBigUInt64BE(BigInt(length));
   const chunks = Array.from({ length: count }, (_, i) => seal(key, nonce(i, i === count - 1 ? 1 : 0), body.subarray(i * 65536, (i + 1) * 65536)));
   return Buffer.concat([salt, seal(key, nonce(0, 2), lengthField), ...chunks]);
-}
-
-/** §3.5, the format before streams: nonce ‖ AES-256-GCM(HKDF(MK, "<ns>/content/v1"), JSON padded with spaces to a multiple of 4096), with the label as AAD. */
-export function legacyDocument({ masterKey, namespace, label, nonce: iv, doc }) {
-  const json = Buffer.from(JSON.stringify(doc));
-  const padded = Buffer.concat([json, Buffer.alloc(Math.ceil(json.length / 4096) * 4096 - json.length, 0x20)]);
-  return Buffer.concat([iv, seal(hkdf(masterKey, `${namespace}/content/v1`, 32), iv, padded, label)]);
 }
