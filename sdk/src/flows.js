@@ -1,30 +1,64 @@
 // The flows of SPEC §6, on top of the API, WebAuthn and the pure modules. No DOM here.
 //
-// `makeFlows({ labels, document })` configures them for one app: `labels` come from labels.js, `document` is
-// the app's vault document (SPEC §5):
+// `makeFlows({ labels })` configures them for one app, whose data is a tree of files (SPEC §5): `labels` come from
+// labels.js.
 //
-//   empty(now) → doc                                   the vault of a new account
-//   read(doc) → { doc, writable }                      validates; throws if it isn't one
-//   commit(doc, operation, now, loadedBlobId) → doc    applies an operation as the next revision (may be async)
-//   revision(doc) → integer                            grows by one with every save
-//   keep(vault, open) → [blob id]                      blobs besides the current one that cleanup keeps (may be async);
-//                                                      open(id, label) → bytes reads one whole, to walk a tree of blobs
-//
-// A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, vault: { doc, blobId, writable } }.
+// A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, root }, where `root` is the
+// loaded root directory: { version, revision, entries, blobId, writable }. Transitional: a vault of the layout before
+// the tree opens with `root: null` and `legacy: { doc, blobId }`, for `upgradeVault` (SPEC §6.13).
 
 import * as api from "./api.js";
 import * as encrypted from "./blobs.js";
 import * as passkeys from "./passkeys.js";
 import { UserFacingError } from "./passkeys.js";
-import { hexEncode, hkdfBytes, randomBytes } from "./crypto.js";
-import { contentKey as deriveContentKey, openDocument, sealDocument } from "./envelope.js";
+import { DecryptError, hexEncode, hkdfBytes, randomBytes, td, te } from "./crypto.js";
+import { contentKey as deriveContentKey, openDocument } from "./envelope.js";
 import { decodeKeys, emptyKeys, encodeKeys, removePasskey, setPasskey, setRecovery, unwrap, WrongKeyError, wrap } from "./keys.js";
 import { makeReport, planBlobs, prunableSlots } from "./maintenance.js";
 import { generateRecoveryKey } from "./recovery-key.js";
 import { saveWithRetry } from "./save.js";
+import * as stream from "./stream.js";
+import * as tree from "./tree.js";
 
 const io = { putBlob: api.putBlob, putRef: api.putRef, getBlob: api.getBlob };
 const now = () => Date.now();
+/** Directories kept in memory per content key; the oldest go first. */
+const CACHED_DIRS = 4096;
+/** Uploads running at once in a save. */
+const PARALLEL_UPLOADS = 3;
+
+/** Runs at most `max` of the tasks given to it at a time. */
+function limiter(max) {
+  let running = 0;
+  const waiting = [];
+  const next = () => {
+    if (running >= max || waiting.length === 0) return;
+    running += 1;
+    waiting.shift()();
+  };
+  return (task) =>
+    new Promise((resolve, reject) => {
+      waiting.push(() =>
+        task()
+          .then(resolve, reject)
+          .finally(() => {
+            running -= 1;
+            next();
+          }),
+      );
+      next();
+    });
+}
+
+/** A save's progress: what is uploaded of `sources`, in files and bytes. */
+function progressOf(sources, finished) {
+  const size = (source) => (source instanceof Uint8Array ? source.length : source.size);
+  const done = sources.filter((source) => finished.has(source));
+  const sum = (list) => list.reduce((total, source) => total + size(source), 0);
+  return { files: done.length, bytes: sum(done), totalFiles: sources.length, totalBytes: sum(sources) };
+}
+
+const rootDoc = ({ blobId: _blobId, writable: _writable, ...doc }) => doc;
 
 /** All blob metadata, page by page, with the server's clock from the last page. */
 async function listAllBlobs() {
@@ -41,22 +75,97 @@ async function listAllBlobs() {
 /** The secrets of a new vault. Nothing is stored until `createVault`. */
 export const newSecrets = () => ({ masterKey: randomBytes(32), recoveryKey: generateRecoveryKey() });
 
-export function makeFlows({ labels, document }) {
+export function makeFlows({ labels }) {
   async function loadKeys() {
     const blobId = await api.getRef("keys");
     if (!blobId) return null;
     return { ...decodeKeys(labels, await api.getBlob(blobId)), blobId };
   }
 
-  async function decryptVault(contentKey, data) {
+  // ---------------------------------------------------------------- the tree's blobs (SPEC §5)
+
+  const sealDir = (contentKey, doc) => stream.seal(contentKey, labels.dir, te.encode(JSON.stringify(doc)));
+
+  /**
+   * Directories never change, so each is read and checked once per content key. The entries they list are the ones
+   * `put` accepts back (tree.js).
+   */
+  const caches = new WeakMap();
+  const cacheOf = (contentKey) => {
+    if (!caches.has(contentKey)) caches.set(contentKey, { dirs: new Map(), known: new Map() });
+    return caches.get(contentKey);
+  };
+
+  function remember(contentKey, id, doc) {
+    const { dirs, known } = cacheOf(contentKey);
+    dirs.delete(id);
+    dirs.set(id, doc);
+    if (dirs.size > CACHED_DIRS) dirs.delete(dirs.keys().next().value);
+    doc.entries.forEach((entry) => known.set(entry.id, entry));
+    return doc;
+  }
+
+  async function loadDir(contentKey, id) {
+    const cached = cacheOf(contentKey).dirs.get(id);
+    if (cached) return cached;
+    const data = await encrypted.openBlob(contentKey, labels.dir, id);
     try {
-      return document.read(await openDocument(contentKey, labels.vault, data));
+      return remember(contentKey, id, tree.parseDir(td.decode(data)));
+    } catch (error) {
+      throw new api.IntegrityError(`directory ${id} isn't one (${error.message})`);
+    }
+  }
+
+  /** What tree.js needs, for one session. `onUploaded(source)` follows a save's uploads, which `uploads` keeps across its attempts. */
+  function treeIO(session, { signal, uploads = new Map(), onUploaded = () => {} } = {}) {
+    const { contentKey } = session;
+    const limit = limiter(PARALLEL_UPLOADS);
+    const upload = async (source) => {
+      const plaintext = source instanceof Uint8Array ? source : new Uint8Array(await source.arrayBuffer());
+      const done = await encrypted.putBlob(contentKey, labels.file, plaintext, { signal });
+      onUploaded(source);
+      return done;
+    };
+    return {
+      loadDir: (id) => loadDir(contentKey, id),
+      readFile: (entry) => encrypted.openBlob(contentKey, labels.file, entry.id),
+      known: (id) => cacheOf(contentKey).known.get(id),
+      upload: (source) => {
+        if (!uploads.has(source)) uploads.set(source, limit(() => upload(source)));
+        return uploads.get(source);
+      },
+      writeDir: async (doc) => {
+        const sealed = await sealDir(contentKey, doc);
+        const id = await api.putBlob(sealed, { signal });
+        remember(contentKey, id, doc);
+        return { id, salt: hexEncode(sealed.subarray(0, stream.SALT)) };
+      },
+    };
+  }
+
+  /** The vault blob's root directory; transitional (SPEC §6.13): or a vault document of the layout before the tree. */
+  async function openVaultBlob(contentKey, data) {
+    try {
+      return { root: tree.parseDir(td.decode(await stream.open(contentKey, labels.dir, data)), { root: true }) };
+    } catch (error) {
+      if (!(error instanceof DecryptError)) throw new api.IntegrityError(`the vault isn't a directory (${error.message})`);
+    }
+    try {
+      return { legacy: await openDocument(contentKey, labels.vault, data) };
     } catch (error) {
       throw new api.IntegrityError(`the vault doesn't decrypt (${error.message})`);
     }
   }
 
-  const loadVault = async (contentKey, blobId) => ({ ...(await decryptVault(contentKey, await api.getBlob(blobId))), blobId });
+  async function openRoot(contentKey, data) {
+    const opened = await openVaultBlob(contentKey, data);
+    if (!opened.root) throw new api.IntegrityError("the vault is in the layout before the tree");
+    return opened.root;
+  }
+
+  const notLegacy = (session) => {
+    if (session.legacy) throw new UserFacingError("This vault has to be upgraded before it can be used.");
+  };
 
   /**
    * What this device remembers about the vault (the highest revision seen, the last cleanup) is filed under
@@ -65,24 +174,26 @@ export function makeFlows({ labels, document }) {
   const deriveStateId = async (masterKey) => hexEncode(await hkdfBytes(masterKey, labels.stateId, 16));
 
   /**
-   * Opens the vault with the master key; creates the empty vault if a creation was interrupted. The keys' version
-   * covers the vault's format too (SPEC §3.3), so keys from a newer version make the vault read-only.
+   * Opens the vault with the master key: loads its root directory, or creates an empty one if a creation was
+   * interrupted. The keys' version covers the tree's format too (SPEC §3.3), so keys from a newer version make it
+   * read-only.
    */
   async function open(masterKey, keys) {
     const contentKey = await deriveContentKey(labels, masterKey);
-    const stateId = await deriveStateId(masterKey);
-    const user = await api.me();
+    const opened = { masterKey, contentKey, stateId: await deriveStateId(masterKey), keys, user: await api.me() };
     const blobId = await api.getRef("vault");
     if (blobId) {
-      const vault = await loadVault(contentKey, blobId);
-      return { masterKey, contentKey, stateId, keys, user, vault: { ...vault, writable: vault.writable && keys.writable } };
+      const vault = await openVaultBlob(contentKey, await api.getBlob(blobId));
+      if (vault.legacy) return { ...opened, root: null, legacy: { doc: vault.legacy, blobId } };
+      remember(contentKey, blobId, vault.root);
+      return { ...opened, root: { ...vault.root, blobId, writable: tree.writable(vault.root) && keys.writable } };
     }
     if (!keys.writable) throw new UserFacingError("This vault was created by a newer version of the app; update this one to open it.");
-    const doc = document.empty(now());
-    const created = await api.putBlob(await sealDocument(contentKey, labels.vault, doc));
-    const write = await api.putRef("vault", created, null);
-    if (!write.ok) return open(masterKey, keys);
-    return { masterKey, contentKey, stateId, keys, user, vault: { doc, blobId: created, writable: true } };
+    const root = tree.emptyRoot(1);
+    const created = await api.putBlob(await sealDir(contentKey, root));
+    if (!(await api.putRef("vault", created, null)).ok) return open(masterKey, keys);
+    remember(contentKey, created, root);
+    return { ...opened, root: { ...root, blobId: created, writable: true } };
   }
 
   /**
@@ -180,8 +291,8 @@ export function makeFlows({ labels, document }) {
     saveKeys(session, setRecovery(await wrap(labels, "recovery", recoveryKey, session.masterKey, now())));
 
   /**
-   * Cleanup (SPEC §6.11): prunes slots of deleted passkeys, then deletes blobs that neither the current keys
-   * nor the current vault (with what `document.keep` lists) need. Never throws: failures end up in the report.
+   * Cleanup (SPEC §6.11): prunes slots of deleted passkeys, then deletes blobs that neither the current keys nor the
+   * current root reach. Never throws: failures end up in the report.
    * → { session, report }
    */
   async function maintain(session, trigger, onProgress = () => {}) {
@@ -198,9 +309,10 @@ export function makeFlows({ labels, document }) {
       const keysId = await api.getRef("keys");
       const vaultId = await api.getRef("vault");
       if (!keysId || !vaultId) throw new Error("The keys or the vault are missing on the server, so nothing was deleted.");
-      const vault = vaultId === current.vault.blobId ? current.vault : await loadVault(current.contentKey, vaultId);
-      if (!(await keysWritable(current, keysId)) || !vault.writable) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
-      if (document.revision(vault.doc) < document.revision(current.vault.doc)) throw new Error("The server returned an older vault than this session's, so nothing was deleted.");
+      if (current.legacy) throw new Error("The vault has to be upgraded first, so nothing was deleted.");
+      const vault = vaultId === current.root.blobId ? rootDoc(current.root) : await openRoot(current.contentKey, await api.getBlob(vaultId));
+      if (!(await keysWritable(current, keysId)) || !tree.writable(vault)) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
+      if (vault.revision < current.root.revision) throw new Error("The server returned an older vault than this session's, so nothing was deleted.");
 
       onProgress("Checking passkeys");
       const passkeyIds = (await api.passkeys()).passkeys.map((p) => p.id);
@@ -216,8 +328,9 @@ export function makeFlows({ labels, document }) {
       const { blobs, serverNow } = await listAllBlobs();
       if (serverNow === null) throw new Error("The server didn't say what time it is, so nothing was deleted.");
       blobs.forEach((b) => api.checkBlobId(b.id));
-      const open = (id, label) => encrypted.openBlob(current.contentKey, label, id);
-      const keep = [stale.length > 0 ? current.keys.blobId : keysId, vaultId, ...((await document.keep(vault.doc, open)) ?? [])];
+      onProgress("Walking the tree");
+      const reachable = await tree.reachable(vault, (id) => loadDir(current.contentKey, id));
+      const keep = [stale.length > 0 ? current.keys.blobId : keysId, vaultId, ...reachable];
       plan = planBlobs({ keep, blobs, now: serverNow });
       for (const [index, blob] of plan.toDelete.entries()) {
         onProgress(`Deleting ${index + 1} of ${plan.toDelete.length}`);
@@ -264,9 +377,9 @@ export function makeFlows({ labels, document }) {
       setPasskey(credentialId, await wrap(labels, "passkey", prfOutput, masterKey, t))(emptyKeys(labels)),
     );
     const contentKey = await deriveContentKey(labels, masterKey);
-    const vaultDoc = document.empty(t);
+    const root = tree.emptyRoot(1);
     const keysId = await api.putBlob(encodeKeys(keysDoc));
-    const vaultId = await api.putBlob(await sealDocument(contentKey, labels.vault, vaultDoc));
+    const vaultId = await api.putBlob(await sealDir(contentKey, root));
     if (!(await api.putRef("keys", keysId, null)).ok) return { kind: "exists" };
     const vaultWrite = await api.putRef("vault", vaultId, null);
     const keys = { doc: keysDoc, blobId: keysId, writable: true };
@@ -279,34 +392,108 @@ export function makeFlows({ labels, document }) {
         stateId: await deriveStateId(masterKey),
         keys,
         user: await api.me(),
-        vault: { doc: vaultDoc, blobId: vaultId, writable: true },
+        root: { ...root, blobId: vaultId, writable: true },
       },
     };
   }
 
+  /** The root that `steps` lead to from `root`: each step takes a tx and returns the next (SPEC §6.4). */
+  async function committed(root, steps, io) {
+    const final = await steps.reduce(async (tx, step) => step(await tx), Promise.resolve(tree.begin(root, io, now())));
+    return { final, root: () => tree.commit(final, io) };
+  }
+
+  const checkSteps = (steps) => {
+    if (!Array.isArray(steps) || !steps.every((step) => typeof step === "function")) throw new TypeError("A save takes an array of steps, each (tx) => tx");
+  };
+
   /**
-   * Saves a vault operation (SPEC §6.4); re-applied on top of other devices' changes.
-   * → { session, base } where `base` is the vault document the operation was finally applied to.
+   * Saves changes to the tree (SPEC §6.4): `steps` take a tx and return the next one. Their new files are uploaded,
+   * the changed directories written, and the `vault` ref moved by compare-and-swap; after a conflict the steps run
+   * again on the newer root, reusing the uploads. `onProgress({ files, bytes, totalFiles, totalBytes })` follows the
+   * uploads; `signal` aborts them, and the save, until the ref moves. → { session }
    */
-  async function saveVault(session, operation) {
-    if (!session.vault.writable) throw new UserFacingError("This vault was written by a newer version of the app; it's read-only here.");
-    const saved = await saveWithRetry(io, {
-      ref: "vault",
-      loaded: session.vault,
-      apply: (doc, blobId) => document.commit(doc, operation, now(), blobId),
-      encode: (doc) => sealDocument(session.contentKey, labels.vault, doc),
-      decode: async (data) => {
-        const conflict = await decryptVault(session.contentKey, data);
-        const keysId = await api.getRef("keys");
-        if (!conflict.writable || (keysId && !(await keysWritable(session, keysId)))) {
-          throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
-        }
-        return conflict.doc;
+  async function save(session, steps, { signal, onProgress = () => {} } = {}) {
+    notLegacy(session);
+    checkSteps(steps);
+    if (!session.root.writable) throw new UserFacingError("This vault was written by a newer version of the app; it's read-only here.");
+    signal?.throwIfAborted();
+    const finished = new Set();
+    let sources = [];
+    const report = () => onProgress(progressOf(sources, finished));
+    const treeIo = treeIO(session, {
+      signal,
+      onUploaded: (source) => {
+        finished.add(source);
+        report();
       },
-      // Another device's save is always a later revision; anything else is the server rolling the vault back.
-      accept: (conflict, base) => document.revision(conflict) > document.revision(base),
     });
-    return { session: { ...session, vault: { doc: saved.doc, blobId: saved.blobId, writable: true } }, base: saved.previous.doc };
+    const saved = await saveWithRetry(
+      { ...io, putBlob: (bytes) => api.putBlob(bytes, { signal }) },
+      {
+        ref: "vault",
+        loaded: { doc: rootDoc(session.root), blobId: session.root.blobId },
+        apply: async (root) => {
+          const { final, root: commit } = await committed(root, steps, treeIo);
+          sources = await tree.uploads(final);
+          report();
+          const doc = await commit();
+          signal?.throwIfAborted();
+          return doc;
+        },
+        encode: (doc) => sealDir(session.contentKey, doc),
+        decode: async (data) => {
+          const conflict = await openRoot(session.contentKey, data);
+          const keysId = await api.getRef("keys");
+          if (!tree.writable(conflict) || (keysId && !(await keysWritable(session, keysId)))) {
+            throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
+          }
+          return conflict;
+        },
+        // Another device's save is always a later revision; anything else is the server rolling the vault back.
+        accept: (conflict, base) => conflict.revision > base.revision,
+      },
+    );
+    remember(session.contentKey, saved.blobId, saved.doc);
+    return { session: { ...session, root: { ...saved.doc, blobId: saved.blobId, writable: true } } };
+  }
+
+  /** The entries of the directory at `path` ([] is the root), sorted by name (SPEC §6.12). */
+  function list(session, path) {
+    notLegacy(session);
+    return tree.begin(rootDoc(session.root), treeIO(session), now()).list(path);
+  }
+
+  /** A file's content, all of it or a range, as a stream; `ref` is an entry or any saved { id, salt } (SPEC §6.12). */
+  function read(session, ref, options = {}) {
+    if (typeof ref?.id !== "string" || typeof ref?.salt !== "string") throw new TypeError("A file's ref has an id and a salt: an entry from list, or one saved earlier");
+    return encrypted.readBlob(session.contentKey, labels.file, ref.id, { ...options, salt: ref.salt });
+  }
+
+  /**
+   * Transitional (SPEC §6.13): rewrites a vault of the layout before the tree as a tree, as one save. `convert(doc,
+   * openOld)` gets the old vault document, and `openOld(blobId)` opens other documents of that layout (e.g. its
+   * history). It returns { revision, steps }: the new root's revision, and the steps that build the tree from an empty
+   * one. The new root must open as written before the ref moves. No retry: after a conflict nothing has changed, and
+   * the next unlock tries again. A vault already a tree, or with keys from a newer version, stays as it is. → session
+   */
+  async function upgradeVault(session, convert) {
+    if (!session.legacy || !session.keys.writable) return session;
+    const openOld = async (blobId) => openDocument(session.contentKey, labels.vault, await api.getBlob(api.checkBlobId(blobId)));
+    const { revision, steps } = await convert(session.legacy.doc, openOld);
+    if (!Number.isInteger(revision) || revision < 1) throw new TypeError("The upgraded root's revision is an integer from 1 up");
+    checkSteps(steps);
+    const treeIo = treeIO(session);
+    const root = await (await committed(tree.emptyRoot(revision - 1), steps, treeIo)).root();
+    const sealed = await sealDir(session.contentKey, root);
+    if (JSON.stringify(await openRoot(session.contentKey, sealed)) !== JSON.stringify(root)) {
+      throw new Error("The upgraded vault doesn't open as it was written; nothing was changed.");
+    }
+    const blobId = await api.putBlob(sealed);
+    if (!(await api.putRef("vault", blobId, session.legacy.blobId)).ok) return session;
+    remember(session.contentKey, blobId, root);
+    const { legacy: _legacy, ...upgraded } = session;
+    return { ...upgraded, root: { ...root, blobId, writable: true } };
   }
 
   return {
@@ -324,10 +511,9 @@ export function makeFlows({ labels, document }) {
     testRecoveryKey,
     newSecrets,
     createVault,
-    saveVault,
-    /** Seals `data` as a blob of kind `label` and uploads it (SPEC §6.12). → { id, salt } */
-    putBlob: (session, label, data, options) => encrypted.putBlob(session.contentKey, label, data, options),
-    /** Reads all of a blob or a range of it (SPEC §6.12). → { size, stream } */
-    readBlob: (session, label, id, options) => encrypted.readBlob(session.contentKey, label, id, options),
+    save,
+    list,
+    read,
+    upgradeVault,
   };
 }

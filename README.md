@@ -5,25 +5,28 @@ Building blocks for web apps that keep each user's data end-to-end encrypted, un
 - `backend/` is a Rust backend: passkey users and git-like per-user storage (blobs + refs). It stores only
   opaque bytes and has no app-specific code. See `backend/SPEC.md`.
 - `sdk/` is the browser side, in plain JavaScript with no dependencies and no build step: the backend client,
-  WebAuthn with PRF, the key hierarchy (master key, passkey slots, recovery key), the encrypted vault with
-  compare-and-swap saves and rollback detection, encrypted blobs read whole or in ranges as streams, setup
-  links, and cleanup. See `sdk/SPEC.md`.
+  WebAuthn with PRF, the key hierarchy (master key, passkey slots, recovery key), the vault as an encrypted
+  tree of directories and files with compare-and-swap saves and rollback detection, files read whole or in
+  ranges as streams, setup links, and cleanup. See `sdk/SPEC.md`.
 - `nix/module.nix` runs one backend per app on NixOS; `nix/tests/lib.nix` is its VM test.
 
 ## Building an app on it
 
-An app supplies its namespace, its vault document and its UI:
+An app supplies its namespace, its files and its UI:
 
 ```js
 import { makeFlows } from "../sdk/flows.js";
 import { labels } from "../sdk/labels.js";
 
 // Fixed forever: every key and blob of the app's data is bound to it.
-export const flows = makeFlows({ labels: labels("notes"), document: notesDocument });
+export const flows = makeFlows({ labels: labels("notes") });
+
+// A save: steps that each take a transaction and return the next (`sdk/SPEC.md` §5, §6.4).
+const { session: saved } = await flows.save(session, [(tx) => tx.put(["notes.txt"], tx.upload(bytes))]);
 ```
 
-`notesDocument` is `{ empty, read, commit, revision, keep }` (`sdk/SPEC.md` §5). Everything is Nix, without
-flakes: pin this repository (e.g. with `fetchTarball` of a commit) and use its files with the app's own `pkgs`.
+Everything is Nix, without flakes: pin this repository (e.g. with `fetchTarball` of a commit) and use its files
+with the app's own `pkgs`.
 
 ```nix
 let

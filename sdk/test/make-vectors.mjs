@@ -1,5 +1,6 @@
-// Writes vectors.json: a keys blob, a vault blob, and the recipe and ID of a file blob that spans two chunks, built
-// from SPEC.md §2–§3 with node:crypto alone (reference.mjs), not with the SDK, from fixed keys, nonces and salts.
+// Writes vectors.json: a keys blob, a root directory listing a file blob of two chunks (only its recipe and ID are
+// stored), and a vault document of the layout before the tree, built from SPEC.md §2–§5 with node:crypto alone
+// (reference.mjs), not with the SDK, from fixed keys, nonces and salts.
 // vectors.test.js checks that the SDK opens them, so a change to a format (labels, HKDF, padding, layout) can't go
 // unnoticed: data written today must open forever (SPEC §2). The output never changes; rerunning this is only for
 // reading how the vectors were made.
@@ -33,13 +34,22 @@ const keys = {
 const keysBlob = Buffer.from(JSON.stringify(keys));
 
 const vaultDocument = { format: "test-vectors/notes", revision: 7, notes: ["plain", "ü", "📝"] };
-// §3.2: the vault document in an encrypted blob.
+// §6.13, transitional: the vault document of the layout before the tree.
 const vaultBlob = streamBlob({ masterKey, namespace, label: `${namespace}/vault/v1`, salt: filled(16, 0x05), plaintext: Buffer.from(JSON.stringify(vaultDocument)) });
 
 // §3.2: a file of 70,000 bytes, byte i being i mod 251: a full chunk and one of 8192 padded bytes. Only its ID is
 // stored; the test makes it again with reference.mjs.
 const file = { label: `${namespace}/file/v1`, salt: filled(16, 0x06).toString("hex"), length: 70000 };
-const fileBlob = streamBlob({ masterKey, namespace, label: file.label, salt: Buffer.from(file.salt, "hex"), plaintext: Buffer.from(Array.from({ length: file.length }, (_, i) => i % 251)) });
+const filePlaintext = Buffer.from(Array.from({ length: file.length }, (_, i) => i % 251));
+const fileBlob = streamBlob({ masterKey, namespace, label: file.label, salt: Buffer.from(file.salt, "hex"), plaintext: filePlaintext });
+
+// §5: the root directory at revision 8, listing that file.
+const root = {
+  version: 1,
+  revision: 8,
+  entries: [{ name: "notes.bin", kind: "file", id: sha256(fileBlob), salt: file.salt, size: file.length, sha256: sha256(filePlaintext), modified: "2026-10-10T00:00:00.000Z" }],
+};
+const rootBlob = streamBlob({ masterKey, namespace, label: `${namespace}/dir/v1`, salt: filled(16, 0x07), plaintext: Buffer.from(JSON.stringify(root)) });
 
 const vectors = {
   namespace,
@@ -55,5 +65,8 @@ const vectors = {
   vaultBlob: vaultBlob.toString("base64"),
   vaultDocument,
   file: { ...file, blobId: sha256(fileBlob) },
+  root,
+  rootBlobId: sha256(rootBlob),
+  rootBlob: rootBlob.toString("base64"),
 };
 process.stdout.write(`${JSON.stringify(vectors, null, 2)}\n`);

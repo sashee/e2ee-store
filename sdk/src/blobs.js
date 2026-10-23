@@ -7,12 +7,13 @@ import * as stream from "./stream.js";
 
 export { CHUNK_SIZE } from "./stream.js";
 
-/** Seals `data` as a blob of kind `label` and uploads it. → { id, salt }, the salt in hex. */
+/** Seals `data` as a blob of kind `label` and uploads it. → { id, salt, size, sha256 }: the salt in hex, and the plaintext's length and SHA-256. */
 export async function putBlob(rootKey, label, data, { signal } = {}) {
   checkLabel(label);
-  const sealed = await stream.seal(rootKey, label, bytes(data));
+  const plaintext = bytes(data);
+  const sealed = await stream.seal(rootKey, label, plaintext);
   const id = await api.putBlob(sealed, { signal });
-  return { id, salt: hexEncode(sealed.subarray(0, stream.SALT)) };
+  return { id, salt: hexEncode(sealed.subarray(0, stream.SALT)), size: plaintext.length, sha256: await sha256Hex(plaintext) };
 }
 
 /**

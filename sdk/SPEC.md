@@ -1,6 +1,6 @@
 # SDK Specification: End-to-End Encrypted Vaults
 
-Status: **Draft v0.2** (2026-10-23)
+Status: **Draft v0.3** (2026-10-23)
 
 ## 1. Purpose & scope
 
@@ -10,15 +10,14 @@ The SDK provides:
 
 - the backend client, WebAuthn ceremonies with PRF, and the cryptography
 - a master key per user, wrapped once per passkey and once for a recovery key
-- the **vault**: one encrypted root document per user, saved by compare-and-swap, with rollback detection
-- **encrypted blobs** of any size up to the backend's limit, read whole or in ranges, as streams (§6.12)
+- the **vault**: one encrypted tree of directories and files per user (§5), saved by compare-and-swap, with rollback detection. Files can be as large as the backend allows, and are read whole or in ranges, as streams (§6.12).
 - setup links, adding devices, recovery, and cleanup of unneeded blobs
 - a browser-test harness for apps (§9)
 
 The app provides:
 
 - its **namespace** (§2), which separates its keys from every other app's
-- its **vault document** (§5): the format, the operations on it, and which other blobs it needs
+- its **files**: their formats, and where in the tree they go (§5)
 - the UI. The SDK has no DOM code.
 
 Non-goals for v1:
@@ -39,7 +38,9 @@ Every HKDF info, AAD, the PRF input and the keys format start with the app's nam
 | `slot.passkey`   | `<ns>/keys/v1/passkey` |
 | `slot.recovery`  | `<ns>/keys/v1/recovery` |
 | `stream`         | `<ns>/stream/v1` |
-| `vault`          | `<ns>/vault/v1` |
+| `dir`            | `<ns>/dir/v1` |
+| `file`           | `<ns>/file/v1` |
+| `vault`          | `<ns>/vault/v1`: transitional, the vault document of the layout before the tree (§6.13) |
 | `stateId`        | `<ns>/device-state-id/v1` |
 
 - **Fixed forever:** every key and blob of an existing vault is bound to the labels. An app must never change its namespace; a test should pin it against data written by an earlier version.
@@ -73,16 +74,16 @@ Every encrypted blob, the vault included, has this format (`stream.js`). It is a
 salt (16 bytes) ‖ length block (8 + 16-byte tag) ‖ chunk_0 ‖ … ‖ chunk_n-1
 ```
 
-- **Blob key:** `HKDF(ikm = content key, salt = the blob's salt, info = UTF-8(label))`, an AES-256-GCM key. The salt is 16 random bytes, so no two blobs share a key. The label names the kind of blob (`labels.vault`, or an app's own, e.g. `<ns>/track/v1`), so a blob of one kind can't be passed off as another.
+- **Blob key:** `HKDF(ikm = content key, salt = the blob's salt, info = UTF-8(label))`, an AES-256-GCM key. The salt is 16 random bytes, so no two blobs share a key. The label names the kind of blob (`labels.dir` for directories, `labels.file` for files), so a blob of one kind can't be passed off as another.
 - **Length block:** the plaintext's length as 8 bytes, big-endian, encrypted with the nonce `0 (11 bytes) ‖ 0x02`.
 - **Chunks:** the padded plaintext in chunks of 64 KiB (`CHUNK_SIZE`); the last one may be shorter. Chunk `i` is encrypted with the nonce `i (11 bytes, big-endian) ‖ 0x01` if it is the last, `‖ 0x00` otherwise, so chunks can't be reordered, dropped or cut off. There is no AAD.
 - **Padding:** zeros, to a multiple of 4096 bytes (at least 4096). This is the writer's choice: readers take any padding, as the length block says where the plaintext ends. Padding can change (e.g. to Padmé) without a new format.
 - **Shape:** every chunk but the last is full, the last holds at least one byte, and the length is at most the padded length. Anything else is an integrity error.
 - **Nothing in plaintext** apart from the salt, not even the format version. A new format gets new labels, and readers try the formats they know; every format is authenticated, so a blob can't be read as the wrong one.
-- **Documents:** the vault (§5), and an app's other JSON documents, are the document's UTF-8 JSON in such a blob (`sealDocument` / `openDocument`). The padding hides small changes in their size.
+- **Directories and files** (§5) are both blobs of this format. A directory's plaintext is its UTF-8 JSON, a file's its bytes. The padding hides small changes in their size.
 - **Integrity:**
-  - A blob read whole is checked with `SHA-256(bytes) == blob ID` before use (`readBlob`: before its stream closes, §6.12). A mismatch or a failed decryption is an integrity error and is shown to the user; the data is never used.
-  - A range (§6.12) can't be checked against the ID. Each chunk is authenticated on its own, and the nonces fix its place and the end, so the data is the user's, of this kind, unaltered and in place. That it is this blob, and not another of the user's of the same kind, is certain only with the blob's salt from the document that lists it (e.g. a directory): the key then comes from that salt.
+  - A blob read whole is checked with `SHA-256(bytes) == blob ID` before use (a file's stream: before it closes, §6.12). A mismatch or a failed decryption is an integrity error and is shown to the user; the data is never used.
+  - A range (§6.12) can't be checked against the ID. Each chunk is authenticated on its own, and the nonces fix its place and the end, so the data is the user's, of this kind, unaltered and in place. That it is this blob, and not another of the same kind, is certain because the key comes from the salt the blob's directory entry lists, not from the blob.
 
 ### 3.3 Keys blob
 
@@ -105,10 +106,10 @@ The keys blob is plaintext JSON. Its secret parts are the wrapped keys.
 - **Slot names:** passkey slots are named by the credential ID as the browser returns it in `credential.id` (base64url).
 - **Wrong keys:** a wrong key fails GCM authentication. For example, a mistyped recovery key produces "wrong recovery key".
 - **Versioning:**
-  - `version` covers both this document and the vault blob format.
+  - `version` covers both this document and the tree's formats (§5).
   - Unknown fields are preserved when the document is rewritten.
-  - A `version` greater than 1 makes the SDK refuse to write anything and ask to update the app. The vault opens read-only (`session.vault.writable` is false), and an interrupted creation isn't completed (§6.1, step 5).
-  - A session reads the keys' version when it unlocks. Afterwards it checks again only where it finds the keys changed anyway: when a save runs into a conflict, and before cleanup. A save without a conflict doesn't read the keys, so a newer version that changes the vault's format must still read vaults written in the old one until every device has updated.
+  - A `version` greater than 1 makes the SDK refuse to write anything and ask to update the app. The tree opens read-only (`session.root.writable` is false), and an interrupted creation isn't completed (§6.1, step 5).
+  - A session reads the keys' version when it unlocks. Afterwards it checks again only where it finds the keys changed anyway: when a save runs into a conflict, and before cleanup. A save without a conflict doesn't read the keys, so a newer version that changes the tree's format must still read trees written in the old one until every device has updated.
 
 ### 3.4 Recovery key
 
@@ -123,28 +124,47 @@ The keys blob is plaintext JSON. Its secret parts are the wrapped keys.
 | Ref     | Points to | Changes |
 |---------|-----------|---------|
 | `keys`  | The keys blob (plaintext JSON, §3.3) | Created with the vault. Updated by compare-and-swap when passkeys or the recovery key change. |
-| `vault` | The current vault blob (encrypted, §3.2) | Created with the vault. Updated by compare-and-swap on every save. |
+| `vault` | The root directory (§5) | Created with the vault. Updated by compare-and-swap on every save. |
 
-- **Other blobs:** older vault versions and whatever else the vault document lists (`keep`, §5), and replaced keys blobs. Maintenance deletes the ones nothing needs (§6.11).
+- **Other blobs:** the directories and files the root reaches, including earlier versions an app keeps in the tree; and replaced keys blobs and roots. Maintenance deletes whatever nothing reaches (§6.11).
 - **Existence:** the `keys` ref is the sign that a vault exists. It is written first when the vault is created (§6.3).
 
-## 5. The vault document
+## 5. The tree
 
-The app defines its vault document and hands it to `makeFlows({ labels, document })`:
+An app's data is a tree of directories and files. The `vault` ref points to its root.
 
-| Function | Contract |
-|----------|----------|
-| `empty(now) → doc` | The vault of a new account, at revision 1. |
-| `read(doc) → { doc, writable }` | Validates a decrypted document; throws if it isn't one. `writable` is false for a newer format version: the vault then opens read-only, as it does with newer keys (§3.3). |
-| `commit(doc, operation, now, loadedBlobId) → doc` | Applies an operation (a function `(doc, now) → doc`) as the next revision: the revision grows by exactly 1. May be async, e.g. to upload blobs the new version refers to. |
-| `revision(doc) → integer` | The revision, for rollback detection (§6.5). |
-| `keep(vault, open) → [blob id]` | Every blob besides the vault blob itself that the vault still needs: earlier versions it keeps, and anything it refers to, directly or through other blobs. May be async. `open(id, label) → Uint8Array` reads a blob whole, checks it against its ID and decrypts it, to walk a tree of blobs (e.g. directories). Cleanup deletes the rest (§6.11). |
+- **Files** are blobs of the stream format (§3.2) with `labels.file`. Their content is the app's.
+- **Directories** are blobs with `labels.dir`, holding UTF-8 JSON:
 
-- **Walking a tree in `keep`:**
-  - It must throw rather than leave out a blob it can't read, because a blob it doesn't list is deleted. Cleanup then stops and deletes nothing (§6.11).
-  - It opens only what it has to walk (e.g. directories, not the files they list), and each blob once: blobs never change, so versions in a history share their unchanged subtrees.
-- **Operations** are pure functions of the form `(document, now) → document`. A save re-applies the same operation to a newer document after a conflict (§6.4), so operations must make sense on any version.
-- **Format:** the app's choice, apart from being JSON. Unknown fields should be preserved when the document is rewritten.
+```json
+{
+  "version": 1,
+  "entries": [
+    { "name": "01 Intro.flac", "kind": "file", "id": "9f2c…", "salt": "4be1…", "size": 18734512, "sha256": "e3b0…", "modified": "2026-10-23T14:02:11.000Z", "app": { "duration": 251.4 } },
+    { "name": "Bonus", "kind": "dir", "id": "…", "salt": "…" }
+  ]
+}
+```
+
+- **The root** is a directory with a `revision` as well: `{ "version": 1, "revision": 42, "entries": […] }`. The revision grows by one with every save, for rollback detection (§6.5). A new vault starts at 1.
+- **Entries:**
+
+  | Field | Meaning |
+  |-------|---------|
+  | `name` | The entry's name. A directory holds its children's names; it has no name of its own. |
+  | `kind` | `file` or `dir`. It also fixes the label the blob is opened with. |
+  | `id`, `salt` | The blob, and its salt (§3.2). Reads of a file are pinned to that salt. |
+  | `size` | Files: the plaintext's length. |
+  | `sha256` | Files: the plaintext's SHA-256 in hex, e.g. to recognise a lost file. |
+  | `modified` | Files: the file's own time, as an ISO 8601 string. |
+  | `app` | Files, optional: the app's own data, which the SDK keeps as it is. |
+
+- **Names:** not empty, not `.` or `..`, no `/` and no control characters, at most 255 UTF-8 bytes, and stored in NFC (`validName` checks one). A directory's entries are sorted by name (UTF-16 code units) and unique.
+- **Paths** are arrays of names; `[]` is the root.
+- **Checks:** a directory that isn't shaped like this is an integrity error. One of a higher `version` than the SDK knows can be read but not changed. A root of a higher version makes the whole tree read-only, as newer keys do (§3.3).
+- **Unknown fields:** a directory's unknown top-level fields are kept when it is rewritten, and entries a save doesn't change are kept as they are.
+- **History** is up to the app, e.g. a copy of an entry under another name (`vault@41`) before it is replaced. Copies share their blobs, so a kept version costs only what changed.
+- **Reachability:** a blob stays only while the root reaches it (§6.11). A blob referenced only from inside a file's content isn't kept.
 
 ## 6. Flows
 
@@ -158,8 +178,8 @@ The app defines its vault document and hands it to `makeFlows({ labels, document
 4. It loads the keys blob (`GET /refs/keys`, then the blob) and unwraps the MK from `passkeys[credential.id]`.
    - If there is no `keys` ref, the result is `no-vault`, or `keys-missing` if a `vault` ref exists (§6.2, step 3).
    - If there is no such slot, the result is `no-slot`. The app offers to unlock with the recovery key, which then sets the passkey up (§6.9).
-5. It loads the vault blob, verifies and decrypts it. The app checks for rollback (§6.5).
-   - If `keys` exists but `vault` doesn't, a vault creation was interrupted. The client creates an empty vault with `If-None-Match: *`, unless the keys are from a newer version: then it asks to update the app.
+5. It loads the root directory (the `vault` blob), verifies, decrypts and checks it (§5). The app checks for rollback (§6.5).
+   - If `keys` exists but `vault` doesn't, a vault creation was interrupted. The client creates an empty root with `If-None-Match: *`, unless the keys are from a newer version: then it asks to update the app.
 
 When the app starts, it calls `GET /me`.
 - **401:** it shows the unlock screen.
@@ -185,34 +205,50 @@ When the app starts with a fragment:
 2. Generate the MK and the recovery key.
 3. Show the recovery key. The user has to confirm they saved it before continuing. Nothing has been stored yet, so closing the tab here leaves no trace.
 4. Check that there is a `keys` ref or no `vault` ref. A `vault` ref without a `keys` ref stops the creation before anything is written (`keys-missing`, §6.2).
-5. Build the keys document (with the recovery slot and this passkey's slot) and the first vault (`document.empty`). Upload both blobs.
+5. Build the keys document (with the recovery slot and this passkey's slot) and an empty root at revision 1. Upload both blobs.
 6. `PUT keys` with `If-None-Match: *`. This is the commit.
    - A 412 means another device created a vault in the meantime. The client discards its own and switches to unlocking. Maintenance removes the orphaned blobs.
 7. `PUT vault` with `If-None-Match: *`. If the client is interrupted before this step, the next unlock creates the empty vault (§6.1, step 5).
 
 ### 6.4 Saving changes
 
-Both documents change only through operations: pure functions of the form `(document, now) → document`.
+**The keys document** changes through operations, pure functions of the form `(document, now) → document`: `setPasskey(credentialId, slot)`, `removePasskey(credentialId)`, `setRecovery(slot)` and `prune(existingCredentialIds)`. A save applies the operation, uploads the result, and writes `PUT keys` with `If-Match: "<loaded blob id>"`. On a 412, it reads the current keys, checks their version (§3.3), and applies the operation to them again, at most 5 times.
 
-| Document | Operations |
-|----------|------------|
-| Vault    | The app's (§5) |
-| Keys     | `setPasskey(credentialId, slot)`, `removePasskey(credentialId)`, `setRecovery(slot)`, `prune(existingCredentialIds)` |
+**The tree** changes through `save(session, steps, { signal, onProgress }) → { session }`. Each step is a function `(tx) => tx`, or a promise of one: it takes a transaction and returns the next.
 
-A save applies an operation:
+| On `tx` | |
+|---------|---|
+| `revision` | The revision the save is based on. The root it writes has the next one. |
+| `put(path, content) → tx` | Places `content` at `path`, replacing what is there and making missing directories. `content` is what `upload` returned, or an entry read from `tx`: an existing file or directory is re-pointed, not uploaded again. An entry may come back with a new `modified` and `app`, but otherwise as it was read. |
+| `remove(path) → tx` | Removes a file, or a directory with everything in it. Nothing at `path` is no change. |
+| `mkdir(path) → tx` | Makes an empty directory, and missing parents. An existing directory is no change. |
+| `upload(bytes, { modified, app }) → content` | New file content: a `Uint8Array`, or a `Blob` that is read only when it's uploaded. `modified` defaults to the save's time. |
+| `entry(path) → Promise<entry \| null>` | What is at `path` now. |
+| `list(path) → Promise<[entry]>` | A directory's entries now, sorted by name. |
+| `read(path) → Promise<Uint8Array \| null>` | A file's content now, whole and checked. |
 
-1. Apply the operation to the loaded document. For the vault, this goes through `document.commit`.
-2. Serialize the result (and encrypt it, for the vault), upload it, then `PUT <ref>` with `If-Match: "<loaded blob id>"`.
-3. On 412, fetch the document named in `current`, verify it (and decrypt it, for the vault), then apply the same operation to it and retry. The client tries at most 5 times, then reports an error.
-4. On success, the new document becomes the loaded state. `saveVault` also returns the document the operation was finally applied to, so the app can tell the user about changes made on another device in the meantime.
+- **`tx` never changes:** writes return a new one, and reads see the writes before them. Writes are only recorded; reads load the directories they need.
+- **Moves and copies:** a move is `put(to, await tx.entry(from))` then `remove(from)`, and a copy is the `put` alone. Content made in this save (an upload, or a directory made or changed) can be put at more than one path, and is written once.
 
+A save:
+
+1. Runs the steps on the loaded root.
+2. Uploads the new files, three at a time, then writes each changed directory once, bottom-up, and a new root with the next revision.
+3. `PUT vault` with `If-Match: "<loaded root's blob id>"`.
+4. On a 412, it reads the current root, checks it (§6.5), and runs the steps on it again from the start. Uploads of the same content object are reused, so only directories are written again. The client tries at most 5 times, then reports an error.
+
+- **Steps must be pure functions of `tx`.** They may run more than once, and only what they write to `tx` takes effect.
+- **Errors** are `TreeError`s, with a `code` and the `path` concerned: `invalid_name`, `not_found`, `not_a_directory`, `is_a_directory`, `no_content`, `invalid_content`, `read_only` and `too_large`. Any error, or a step that doesn't return a tx, fails the save, and the ref doesn't move.
+- **Progress and abort:** `onProgress({ files, bytes, totalFiles, totalBytes })` follows the uploads. `signal` aborts them, and the save, until the ref moves; after that, the save is done. Blobs uploaded by a save that didn't finish are orphans that cleanup removes.
+- **Size limit:** a file over the backend's `max_blob_size` fails the save with `too_large`, naming its path. The SDK doesn't know the limit in advance.
+- **Large imports:** upload in several saves (e.g. one per album), so a failure costs one part, and each save finishes well within cleanup's 24-hour grace period.
 - **When remote changes arrive:** there is no polling. A client sees other devices' changes when it unlocks, and through the 412 when it saves.
 
 ### 6.5 Rollback detection
 
-- The app stores the highest vault revision it has seen in `localStorage`, under the state ID (§3.1). `rollbackCheck(highestSeen, revision)` compares the two.
-- If a loaded vault has a lower revision, the app shows a warning and blocks saving until the user acknowledges it, which resets the stored value.
-- A save that runs into a conflict whose current vault isn't newer than the one being saved over is a rollback too: the save stops with `RollbackError`, and nothing is written on top of the older vault.
+- The app stores the highest root revision it has seen in `localStorage`, under the state ID (§3.1). `rollbackCheck(highestSeen, session.root.revision)` compares the two.
+- If a loaded root has a lower revision, the app shows a warning and blocks saving until the user acknowledges it, which resets the stored value.
+- A save that runs into a conflict whose current root isn't newer than the one being saved over is a rollback too: the save stops with `RollbackError`, and nothing is written on top of the older root.
 
 ### 6.6 Adding a passkey on this host
 
@@ -276,11 +312,12 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 0. **Check before deleting anything.** Stop, deleting nothing, if:
    - either ref is missing
-   - the server's current vault or keys document is from a newer version
-   - the server's vault is older than this session's (the app also doesn't run it while a rollback warning is shown)
+   - the vault is still in the layout before the tree (transitional, §6.13)
+   - the server's current root or keys document is from a newer version
+   - the server's root is older than this session's (the app also doesn't run it while a rollback warning is shown)
    - any listed blob ID isn't 64 hex characters (IDs go into URLs)
 1. **Prune the keys document:** remove passkey slots whose credential ID is not in `GET /me/passkeys`. Nothing is saved if nothing changed. Only the slots found stale are removed, also when the save is re-applied after a conflict, so a slot another device just added is never pruned.
-2. **Build the keep set:** the current `keys` blob, the current `vault` blob, and `document.keep(vault, open)`, where `open` reads blobs for this session. If `keep` throws, the run stops here.
+2. **Build the keep set:** the current `keys` blob, the root, and every directory and file the root reaches. Each directory is read once; ones this session has already read or written come from memory. A directory that can't be read stops the run here.
 3. **Delete old blobs:**
    - List all blobs.
    - Delete every blob that is not in the keep set and whose `created_at` is more than 24 hours before the server's time (taken from the `Date` header of the list response). Without that header, nothing is deleted: this device's clock is no substitute, as it can be days off.
@@ -302,18 +339,30 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 An automatic run that failed is due again at the next unlock.
 
-### 6.12 Reading and writing blobs
+### 6.12 Reading the tree
 
-An app keeps data besides its vault (files, tracks, directories) in encrypted blobs (§3.2), and lists them in its documents and through `keep` (§5).
-
-- **`putBlob(session, label, bytes, { signal })` → `{ id, salt }`** seals the bytes as a blob of kind `label` and uploads it. The salt (32 hex characters) is for the document that lists the blob, to pin it in range reads.
-- **`readBlob(session, label, id, { salt, from, to, signal })` → `{ size, stream }`:** `size` is the plaintext's length, and `stream` a `ReadableStream` of the plaintext bytes in `[from, to)`, as they are decrypted.
+- **`list(session, path) → [entry]`:** a directory's entries, sorted by name; `[]` is the root. A missing path is `not_found`, and a file is `not_a_directory`.
+- **`read(session, ref, { from, to, signal }) → { size, stream }`:** a file's content. `size` is the plaintext's length, and `stream` a `ReadableStream` of the plaintext bytes in `[from, to)`, as they are decrypted. `ref` is an entry from `list`, or an `{ id, salt }` the app kept; its salt pins the read to that blob (§3.2).
   - **All of it** (neither `from` nor `to`): one request. The blob is checked against its ID before the stream closes (§3.2), so whatever must be verified before use is read to the end first.
   - **A range:** `to` past the end is cut to the end, `from` at the end gives nothing, and `from` after it is a `RangeError`. Only the chunks the range touches are fetched, in one `Range` request, plus the 40-byte header if the range starts after the first chunk. A range aligned to `CHUNK_SIZE` fetches nothing it doesn't use. A server that ignores `Range` still works, at the cost of the whole download.
-  - **`salt`:** from the document that lists the blob. The key then comes from it, and another blob in this one's place fails (§3.2).
   - **Aborting:** `signal`, or cancelling the stream, aborts the requests, and nothing more comes out of the stream. An abort fails with the signal's reason, unchanged, so the app can tell it from a failure.
-  - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `readBlob` or from the stream where they are read.
+  - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `read` or from the stream where they are read.
 - **`CHUNK_SIZE`** (64 KiB, from `blobs.js`) is the plaintext in a chunk: the unit worth fetching.
+- **Caching:** directories never change, so a session keeps the ones it has read or written in memory, by ID. Browsing doesn't fetch a directory twice, and a save that runs again after a conflict doesn't either.
+
+### 6.13 Upgrading a vault from the layout before the tree (transitional)
+
+Before the tree, the `vault` ref pointed at the app's own vault document: its UTF-8 JSON in a blob of the stream format with `labels.vault`, with whatever history the app kept listed inside it.
+
+- **Opening:** a vault blob that doesn't open as a root directory is tried as such a document. The session then has `root: null` and `legacy: { doc, blobId }`, and `save`, `list` and `maintain` refuse it.
+- **`upgradeVault(session, convert) → session`:**
+  - `convert(doc, openOld)` gets the old document, and `openOld(blobId)` opens other documents of that layout (e.g. the history it lists).
+  - It returns `{ revision, steps }`: the new root's revision, which should continue from the old document's so devices see no rollback, and the steps that build the tree from an empty root.
+
+  The steps run on an empty root at `revision − 1`, and the result is committed as a save does it. The new root is then checked to open as it was written, uploaded, and written with `PUT vault` and `If-Match` on the old blob.
+- **Nothing changes before that `PUT`.** After a conflict, the session is returned as it was, and the next unlock tries again. A session whose keys are from a newer version is left as it is.
+- **The old blobs** are no longer referenced, and cleanup deletes them once they are past the grace period.
+- Once every vault is upgraded, this layout, `labels.vault`, `legacy` and `upgradeVault` go.
 
 ## 7. Modules
 
@@ -322,13 +371,14 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | Module            | Contents |
 |-------------------|----------|
 | `labels.js`       | `labels(namespace)` (§2) |
-| `flows.js`        | `makeFlows({ labels, document })` (§5, §6): unlock, create, save, passkey slots, recovery key, maintenance, `putBlob` / `readBlob` |
-| `blobs.js`        | `putBlob` / `readBlob` over the API and `CHUNK_SIZE` (§6.12) |
+| `flows.js`        | `makeFlows({ labels })` (§6): unlock, create, `save`, `list`, `read`, passkey slots, recovery key, maintenance; transitional: `upgradeVault` |
+| `tree.js`         | The tree (§5, §6.4): its formats and names, transactions, commits, `TreeError`, `validName`, and what a root reaches |
+| `blobs.js`        | Uploading and reading encrypted blobs over the API, and `CHUNK_SIZE` (§6.12) |
 | `stream.js`       | The blob format (§3.2): sealing, opening, and its layout |
 | `api.js`          | The backend client: errors with fixed messages, hash-checked blobs, ranges, compare-and-swap refs, the 401 handler |
 | `passkeys.js`     | WebAuthn ceremonies with PRF; `UserFacingError` |
 | `crypto.js`       | HKDF, AES-GCM, SHA-256, base64url, hex |
-| `envelope.js`     | The content key; `sealDocument` / `openDocument` (§3.2) |
+| `envelope.js`     | The content key; transitional: the reader of the vault document before the tree (§6.13) |
 | `keys.js`         | The keys document, wrap/unwrap, operations (§3.3) |
 | `save.js`         | `saveWithRetry` (I/O passed in), `RollbackError`, `rollbackCheck` (§6.4, §6.5) |
 | `maintenance.js`  | The cleanup plan, report and schedule (§6.11) |
@@ -340,7 +390,7 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 ## 8. Security notes
 
 - **What is protected:**
-  - The vault's content is hidden from the server and from leaked database copies. So is its history.
+  - The vault's content, its names and its structure are hidden from the server and from leaked database copies. So are the versions an app keeps.
   - Blob tampering is detected by content addressing plus GCM: in whole reads by both, in range reads by GCM, chunk by chunk (§3.2).
   - A rolled-back vault is detected by the revision check.
 - **What is not protected:**
@@ -349,11 +399,11 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - Malware on the device.
   - An attacker who already has the MK. Without key rotation, removing a passkey doesn't lock them out.
 - **What the server sees:**
-  - when and how often the vault and the keys blob change
+  - when and how often the root and the keys blob change
   - every blob's size, padded to 4 KiB steps, and the number of blobs
   - when blobs are uploaded and read. That can group them: an album's tracks are uploaded together and played one after another, and a group of known sizes can identify what it is.
   - from the plaintext keys blob: which credential IDs have slots, and when the recovery key changes
-- **Range reads without a salt:** a server can serve another of the user's blobs of the same kind in place of the one asked for. Its data is the user's, unaltered, but not the blob asked for (§3.2). Reading through a document that lists the salt closes this.
+- **Range reads:** `read` always pins a file to the salt its entry lists, so a server can't serve another of the user's files in its place, even for a range (§3.2).
 - **Tampering with the keys blob:** the server can delete or replay slots, which can only cause a failed unlock. It can't create a working slot, because that needs a KEK.
 - **Recovery key:** it is used whenever a new device is set up, so it gets pasted more often than a pure recovery secret would. Only paste it into the app.
   - The key plus a session gives full access. The key plus a stolen database also gives full access.
@@ -365,14 +415,14 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 - **Unit tests** (`node --test`; Node has WebCrypto) for the pure modules:
   - **Crypto:** wrap/unwrap round trips; a tampered nonce, ciphertext or AAD fails; keys of another kind or another namespace fail.
   - **Labels:** derived from the namespace; invalid namespaces are refused.
-  - **Documents:** padding and round trips.
+  - **Tree:** transactions (writes return new ones, reads see earlier writes), commits (only what changed, bottom-up, each directory and upload once), what `put` accepts back, names, read-only directories, errors, malformed directories, and what a root reaches.
   - **Blobs:** sizes, padding and chunks; round trips across chunk boundaries; damaged, reordered, shortened and lengthened blobs; another writer's padding; ranges and what they fetch, salts, a server that ignores ranges, aborting.
   - **Keys documents:** validation; every operation; `version > 1` is read-only; another app's keys document is refused.
   - **Saving:** retries on conflict, gives up after 5, sync and async operations, rollback.
   - **Recovery key, setup links, maintenance:** parsing, the plan with its grace period, the report, the schedule.
-- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, conflicts and rollback, newer versions, step-up, cleanup, and a server that misbehaves.
-- **Format vectors:** `test/vectors.json` holds a keys blob of version 1, a vault blob, and the recipe and ID of a file blob of two chunks. `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
-- **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows and a file blob with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
+- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, cleanup by reachability, a server that misbehaves, and the upgrade from the layout before the tree.
+- **Format vectors:** `test/vectors.json` holds a keys blob of version 1, a root directory listing a file blob of two chunks (the file's recipe and ID), and a vault document of the layout before the tree. `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
+- **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows and a file in the tree with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
   - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.
   - `Backend` runs admin commands (`setup_token(...)`) and reads the stored blobs.

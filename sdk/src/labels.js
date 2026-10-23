@@ -10,6 +10,9 @@ export function labels(namespace) {
     kek: { passkey: `${namespace}/kek/passkey/v1`, recovery: `${namespace}/kek/recovery/v1` },
     slot: { passkey: `${namespace}/keys/v1/passkey`, recovery: `${namespace}/keys/v1/recovery` },
     stream: `${namespace}/stream/v1`,
+    dir: `${namespace}/dir/v1`,
+    file: `${namespace}/file/v1`,
+    /** Transitional: the vault document of the layout before the tree (SPEC §6.13). */
     vault: `${namespace}/vault/v1`,
     stateId: `${namespace}/device-state-id/v1`,
   };

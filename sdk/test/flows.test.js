@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import * as api from "../src/api.js";
 import { contentKey } from "../src/envelope.js";
@@ -11,31 +11,38 @@ import { decodeKeys, encodeKeys, WrongKeyError } from "../src/keys.js";
 import { labels } from "../src/labels.js";
 import { UserFacingError } from "../src/passkeys.js";
 import { RollbackError } from "../src/save.js";
+import * as stream from "../src/stream.js";
 import { BOB, fakeAuthenticator, install, useAuthenticator } from "./fakes.js";
 
 const L = labels("test-app");
 const HOUR = 3600 * 1000;
+const flows = makeFlows({ labels: L });
 
-/** A small vault document: notes, and the two previous versions as history, which `keep` lists. */
-const notes = {
-  empty: () => ({ format: "test-app/notes", version: 1, revision: 1, notes: [], history: [] }),
-  read: (doc) => {
-    if (doc?.format !== "test-app/notes") throw new Error("Not a notes document");
-    return { doc, writable: doc.version <= 1 };
-  },
-  commit: (doc, operation, now, loadedBlobId) => ({ ...operation(doc, now), revision: doc.revision + 1, history: [loadedBlobId, ...doc.history].slice(0, 2) }),
-  revision: (doc) => doc.revision,
-  keep: async (doc) => doc.history,
-};
-const add = (text) => (doc) => ({ ...doc, notes: [...doc.notes, text] });
+const te = new TextEncoder();
+const td = new TextDecoder();
+const encode = (value) => te.encode(JSON.stringify(value));
+const decode = (bytes) => (bytes === null ? null : JSON.parse(td.decode(bytes)));
+const NOTES = ["notes.json"];
+/** A step adding a note to notes.json, as it is when the step runs. */
+const add = (text) => async (tx) => tx.put(NOTES, tx.upload(encode([...(decode(await tx.read(NOTES)) ?? []), text])));
+const collect = async (opened) => new Uint8Array(await new Response((await opened).stream).arrayBuffer());
+/** The notes in a session's tree. */
+async function notesOf(session) {
+  const entry = (await flows.list(session, [])).find((e) => e.name === "notes.json");
+  return entry ? decode(await collect(flows.read(session, entry))) : null;
+}
+const rootOf = ({ blobId: _blobId, writable: _writable, ...doc }) => doc;
 
-const flows = makeFlows({ labels: L, document: notes });
 const keysOf = (server) => decodeKeys(L, server.read("keys")).doc;
 const lock = (server) => {
   server.session = null;
 };
 /** Another device rewrites the keys document. */
 const writeKeys = (server, doc) => server.refs.set("keys", server.put(encodeKeys(doc)));
+/** Another device writes this root directory, e.g. one of a newer version. */
+async function writeRoot(server, session, doc) {
+  server.refs.set("vault", server.put(await stream.seal(session.contentKey, L.dir, encode(doc))));
+}
 
 /** A setup-token session, as after opening a setup link. */
 async function signedUp(options) {
@@ -61,13 +68,15 @@ test("a new vault unlocks with the passkey that created it, and no secret reache
   const keys = keysOf(server);
   assert.deepEqual(Object.keys(keys.passkeys), [credentialId]);
   assert.ok(keys.recovery);
-  const { session: saved } = await flows.saveVault(session, add("a secret note"));
+  assert.deepEqual(rootOf(session.root), { version: 1, revision: 1, entries: [] });
+  const { session: saved } = await flows.save(session, [add("a secret note")]);
 
   lock(server);
   const unlocked = await flows.unlockWithPasskey();
   assert.equal(unlocked.kind, "unlocked");
   assert.deepEqual(unlocked.session.masterKey, secrets.masterKey);
-  assert.deepEqual(unlocked.session.vault.doc, saved.vault.doc);
+  assert.deepEqual(unlocked.session.root, saved.root);
+  assert.deepEqual(await notesOf(unlocked.session), ["a secret note"]);
   assert.equal(unlocked.session.stateId, session.stateId);
   assert.match(session.stateId, /^[0-9a-f]{32}$/);
 
@@ -75,8 +84,9 @@ test("a new vault unlocks with the passkey that created it, and no secret reache
   const credentials = server.requests.filter((r) => r.json?.credential).map((r) => r.json.credential);
   assert.equal(credentials.length, 2, "the registration and the unlock's login");
   assert.ok(credentials.every((c) => !("prf" in c.clientExtensionResults)));
-  const secret = Buffer.from("a secret note");
-  assert.ok([...server.blobs.values()].every(({ bytes }) => Buffer.from(bytes).indexOf(secret) === -1));
+  for (const secret of ["a secret note", "notes.json"]) {
+    assert.ok([...server.blobs.values()].every(({ bytes }) => Buffer.from(bytes).indexOf(Buffer.from(secret)) === -1), secret);
+  }
 });
 
 test("an authenticator that gives the PRF output only at sign-in gets one more prompt", async () => {
@@ -128,16 +138,6 @@ test("the vault another device created first wins", async () => {
   assert.equal(server.refs.get("keys"), keys);
 });
 
-test("an interrupted creation gets its empty vault at the next unlock", async () => {
-  const { server } = await newAccount();
-  server.refs.delete("vault");
-  lock(server);
-  const unlocked = await flows.unlockWithPasskey();
-  assert.equal(unlocked.kind, "unlocked");
-  assert.deepEqual(unlocked.session.vault.doc, notes.empty());
-  assert.equal(server.refs.get("vault"), unlocked.session.vault.blobId);
-});
-
 test("a passkey without a slot unlocks with the recovery key and then gets its slot", async () => {
   const { server, secrets } = await newAccount();
   useAuthenticator(fakeAuthenticator());
@@ -164,39 +164,6 @@ test("a credential ID that is also an object property isn't taken for a slot", a
   }
 });
 
-test("a save that conflicts with another device's is applied on top of it", async () => {
-  const { session: laptop } = await newAccount();
-  const { session: phone } = await flows.unlockWithPasskey();
-  await flows.saveVault(laptop, add("from the laptop"));
-  const { session, base } = await flows.saveVault(phone, add("from the phone"));
-  assert.deepEqual(base.notes, ["from the laptop"], "what the operation was finally applied to");
-  assert.deepEqual(session.vault.doc.notes, ["from the laptop", "from the phone"]);
-  assert.equal(session.vault.doc.revision, 3);
-});
-
-test("a save that runs into an older vault stops and writes nothing", async () => {
-  const { server, session } = await newAccount();
-  const { session: second } = await flows.saveVault(session, add("one"));
-  const { session: third } = await flows.saveVault(second, add("two"));
-  server.refs.set("vault", second.vault.blobId);
-  await assert.rejects(flows.saveVault(third, add("three")), RollbackError);
-  assert.equal(server.refs.get("vault"), second.vault.blobId);
-});
-
-test("a vault from a newer version is read-only and never saved over", async () => {
-  const { server, session } = await newAccount();
-  const { session: newer } = await flows.saveVault(session, (doc) => ({ ...doc, version: 2 }));
-  const current = server.refs.get("vault");
-  await assert.rejects(flows.saveVault(session, add("stale")), UserFacingError, "a conflict with a newer version");
-  assert.equal(server.refs.get("vault"), current);
-
-  lock(server);
-  const unlocked = await flows.unlockWithPasskey();
-  assert.equal(unlocked.session.vault.writable, false);
-  await assert.rejects(flows.saveVault(unlocked.session, add("x")), UserFacingError);
-  assert.equal(newer.vault.blobId, current);
-});
-
 test("keys from a newer version are never saved over", async () => {
   const { server, session, credentialId } = await newAccount();
   // Another device, on a newer version of the app, rewrites the keys after this session loaded them.
@@ -212,21 +179,6 @@ test("keys from a newer version are never saved over", async () => {
   await assert.rejects(flows.removePasskeySlot(unlocked.session, credentialId), UserFacingError);
 });
 
-test("keys from a newer version make the vault read-only, as their version covers its format", async () => {
-  const { server, secrets } = await newAccount();
-  writeKeys(server, { ...keysOf(server), version: 2 });
-  const vault = server.refs.get("vault");
-
-  lock(server);
-  const unlocked = await flows.unlockWithPasskey();
-  assert.equal(unlocked.session.vault.writable, false);
-  await assert.rejects(flows.saveVault(unlocked.session, add("x")), /read-only/);
-  const recovered = await flows.unlockWithRecoveryKey(await flows.loadKeys(), secrets.recoveryKey);
-  assert.equal(recovered.vault.writable, false);
-  await assert.rejects(flows.saveVault(recovered, add("x")), /read-only/);
-  assert.equal(server.refs.get("vault"), vault);
-});
-
 test("a newer version's interrupted creation isn't completed in this version's format", async () => {
   const { server } = await newAccount();
   writeKeys(server, { ...keysOf(server), version: 2 });
@@ -234,16 +186,6 @@ test("a newer version's interrupted creation isn't completed in this version's f
   lock(server);
   await assert.rejects(flows.unlockWithPasskey(), /newer version/);
   assert.equal(server.refs.has("vault"), false);
-});
-
-test("a save stops when another device has moved the keys to a newer version since the unlock", async () => {
-  const { server, session: laptop } = await newAccount();
-  const { session: phone } = await flows.unlockWithPasskey();
-  await flows.saveVault(phone, add("from the phone"));
-  writeKeys(server, { ...keysOf(server), version: 2 });
-  const vault = server.refs.get("vault");
-  await assert.rejects(flows.saveVault(laptop, add("from the laptop")), /newer version/);
-  assert.equal(server.refs.get("vault"), vault);
 });
 
 test("replacing the recovery key retires the old one", async () => {
@@ -283,7 +225,156 @@ test("logging in again with another account's passkey doesn't switch accounts", 
   assert.equal(server.session, null, "Bob's login doesn't stay");
 });
 
-/** An account with five saved versions and a passkey deleted on another device, then a day later. */
+test("an interrupted creation gets its empty root at the next unlock", async () => {
+  const { server } = await newAccount();
+  server.refs.delete("vault");
+  lock(server);
+  const unlocked = await flows.unlockWithPasskey();
+  assert.equal(unlocked.kind, "unlocked");
+  assert.deepEqual(rootOf(unlocked.session.root), { version: 1, revision: 1, entries: [] });
+  assert.equal(server.refs.get("vault"), unlocked.session.root.blobId);
+});
+
+test("files saved in the tree read whole and in ranges, with the session's key", async () => {
+  const { session } = await newAccount();
+  const content = Uint8Array.from({ length: 100_000 }, (_, i) => i % 7);
+  const { session: saved } = await flows.save(session, [(tx) => tx.put(["Music", "a.bin"], tx.upload(content, { app: { tag: 1 } }))]);
+  const [entry] = await flows.list(saved, ["Music"]);
+  assert.deepEqual([entry.name, entry.size, entry.app], ["a.bin", 100_000, { tag: 1 }]);
+  assert.equal(entry.sha256, createHash("sha256").update(content).digest("hex"));
+  assert.deepEqual(await collect(flows.read(saved, entry)), content);
+  assert.deepEqual(await collect(flows.read(saved, entry, { from: 70_000, to: 70_010 })), content.subarray(70_000, 70_010));
+  const stranger = { ...saved, contentKey: await contentKey(L, new Uint8Array(32)) };
+  await assert.rejects(collect(flows.read(stranger, entry)), api.IntegrityError, "another master key");
+  assert.throws(() => flows.read(saved, { id: entry.id }), TypeError, "a ref has a salt");
+  await assert.rejects(flows.list(saved, ["Music", "a.bin"]), /is a file/);
+});
+
+test("a save that conflicts with another device's runs its steps again on top of it", async () => {
+  const { session: laptop } = await newAccount();
+  const { session: phone } = await flows.unlockWithPasskey();
+  await flows.save(laptop, [add("from the laptop")]);
+  const { session } = await flows.save(phone, [add("from the phone")]);
+  assert.deepEqual(await notesOf(session), ["from the laptop", "from the phone"]);
+  assert.equal(session.root.revision, 3);
+});
+
+test("after a conflict the steps run again, but what they upload is uploaded once", async () => {
+  const { server, session: laptop } = await newAccount();
+  const { session: phone } = await flows.unlockWithPasskey();
+  await flows.save(laptop, [add("from the laptop")]);
+  const big = new Uint8Array(200_000).fill(7);
+  server.requests = [];
+  const { session } = await flows.save(phone, [(tx) => tx.put(["big.bin"], tx.upload(big))]);
+  const uploads = server.requests.filter((r) => r.method === "PUT" && r.path.startsWith("/blobs/"));
+  assert.equal(uploads.length, 3, "the file once, and a root for each of the two attempts");
+  assert.deepEqual((await flows.list(session, [])).map((e) => e.name), ["big.bin", "notes.json"]);
+});
+
+test("a save reports its uploads, and an abort before the ref moves changes nothing", async () => {
+  const { server, session } = await newAccount();
+  const progress = [];
+  const { session: saved } = await flows.save(
+    session,
+    [(tx) => tx.put(["a"], tx.upload(new Uint8Array(10))).put(["b"], tx.upload(new Uint8Array(20)))],
+    { onProgress: (p) => progress.push(p) },
+  );
+  assert.deepEqual(progress[0], { files: 0, bytes: 0, totalFiles: 2, totalBytes: 30 });
+  assert.deepEqual(progress.at(-1), { files: 2, bytes: 30, totalFiles: 2, totalBytes: 30 });
+
+  const vault = server.refs.get("vault");
+  const controller = new AbortController();
+  const reason = new Error("stop");
+  const aborting = (tx) => {
+    controller.abort(reason);
+    return tx.put(["c"], tx.upload(new Uint8Array(5)));
+  };
+  await assert.rejects(flows.save(saved, [aborting], { signal: controller.signal }), (e) => e === reason);
+  await assert.rejects(flows.save(saved, [add("x")], { signal: controller.signal }), (e) => e === reason, "already aborted");
+  assert.equal(server.refs.get("vault"), vault);
+  await assert.rejects(flows.save(saved, [(tx) => tx.put(["d"], null)]), /nothing to put/);
+  await assert.rejects(flows.save(saved, [() => "not a tx"]), TypeError);
+  assert.equal(server.refs.get("vault"), vault);
+});
+
+test("a save that runs into an older root stops and writes nothing", async () => {
+  const { server, session } = await newAccount();
+  const { session: second } = await flows.save(session, [add("one")]);
+  const { session: third } = await flows.save(second, [add("two")]);
+  server.refs.set("vault", second.root.blobId);
+  await assert.rejects(flows.save(third, [add("three")]), RollbackError);
+  assert.equal(server.refs.get("vault"), second.root.blobId);
+});
+
+test("a tree from a newer version is read-only and never saved over", async () => {
+  const { server, session } = await newAccount();
+  await writeRoot(server, session, { version: 2, revision: 2, entries: [] });
+  const current = server.refs.get("vault");
+  await assert.rejects(flows.save(session, [add("stale")]), UserFacingError, "a conflict with a newer version");
+  assert.equal(server.refs.get("vault"), current);
+
+  lock(server);
+  const unlocked = await flows.unlockWithPasskey();
+  assert.equal(unlocked.session.root.writable, false);
+  await assert.rejects(flows.save(unlocked.session, [add("x")]), UserFacingError);
+  assert.deepEqual(await flows.list(unlocked.session, []), [], "it can still be read");
+  assert.equal(server.refs.get("vault"), current);
+});
+
+test("keys from a newer version make the tree read-only, as their version covers its format", async () => {
+  const { server, secrets } = await newAccount();
+  writeKeys(server, { ...keysOf(server), version: 2 });
+  const vault = server.refs.get("vault");
+
+  lock(server);
+  const unlocked = await flows.unlockWithPasskey();
+  assert.equal(unlocked.session.root.writable, false);
+  await assert.rejects(flows.save(unlocked.session, [add("x")]), /read-only/);
+  const recovered = await flows.unlockWithRecoveryKey(await flows.loadKeys(), secrets.recoveryKey);
+  assert.equal(recovered.root.writable, false);
+  await assert.rejects(flows.save(recovered, [add("x")]), /read-only/);
+  assert.equal(server.refs.get("vault"), vault);
+});
+
+test("a save stops when another device has moved the keys to a newer version since the unlock", async () => {
+  const { server, session: laptop } = await newAccount();
+  const { session: phone } = await flows.unlockWithPasskey();
+  await flows.save(phone, [add("from the phone")]);
+  writeKeys(server, { ...keysOf(server), version: 2 });
+  const vault = server.refs.get("vault");
+  await assert.rejects(flows.save(laptop, [add("from the laptop")]), /newer version/);
+  assert.equal(server.refs.get("vault"), vault);
+});
+
+test("a vault that doesn't decrypt, or isn't a directory, is an integrity error, and nothing is written", async () => {
+  const { server, session } = await newAccount();
+  const notADirectory = server.put(await stream.seal(session.contentKey, L.dir, encode({ notes: [] })));
+  for (const vault of [server.put(randomBytes(4152)), notADirectory]) {
+    server.refs.set("vault", vault);
+    const before = new Map(server.refs);
+    lock(server);
+    await assert.rejects(flows.unlockWithPasskey(), api.IntegrityError);
+    assert.deepEqual(server.refs, before);
+  }
+});
+
+test("a directory that isn't one, or a file where a directory should be, is an integrity error", async () => {
+  const { server, session } = await newAccount();
+  const notADirectory = server.put(await stream.seal(session.contentKey, L.dir, encode({ entries: "no" })));
+  const { session: saved } = await flows.save(session, [(tx) => tx.put(["f"], tx.upload(encode("a file")))]);
+  const [file] = await flows.list(saved, []);
+  for (const id of [notADirectory, file.id]) {
+    await writeRoot(server, saved, { version: 1, revision: 9, entries: [{ name: "d", kind: "dir", id, salt: file.salt }] });
+    lock(server);
+    const { session: unlocked } = await flows.unlockWithPasskey();
+    await assert.rejects(flows.list(unlocked, ["d"]), api.IntegrityError, id);
+  }
+});
+
+/**
+ * An account a day old: five saves of notes.json, a copy of its second version kept in history/, and a passkey
+ * deleted on another device.
+ */
 async function aDayOfUse() {
   const account = await newAccount();
   const { server } = account;
@@ -291,18 +382,22 @@ async function aDayOfUse() {
   const phone = await flows.registerPasskey("Phone");
   useAuthenticator(account.authenticator);
   let session = await flows.addPasskeySlot(account.session, phone.credentialId, phone.prfOutput);
-  const versions = [session.vault.blobId];
+  const roots = [session.root.blobId];
+  const versions = [];
   for (const text of ["a", "b", "c", "d"]) {
-    session = (await flows.saveVault(session, add(text))).session;
-    versions.push(session.vault.blobId);
+    session = (await flows.save(session, [add(text)])).session;
+    roots.push(session.root.blobId);
+    versions.push((await flows.list(session, [])).find((e) => e.name === "notes.json"));
   }
+  session = (await flows.save(session, [(tx) => tx.put(["history", "notes-2.json"], versions[1])])).session;
+  roots.push(session.root.blobId);
   server.passkeys.delete(phone.credentialId);
   server.now += 25 * HOUR;
-  return { ...account, session, versions, phone: phone.credentialId };
+  return { ...account, session, roots, versions, history: (await flows.list(session, [])).find((e) => e.name === "history"), phone: phone.credentialId };
 }
 
-test("cleanup prunes stale slots and deletes old blobs nothing needs, by the server's clock", async () => {
-  const { server, session, versions, phone } = await aDayOfUse();
+test("cleanup prunes stale slots and deletes what the tree doesn't reach, by the server's clock", async () => {
+  const { server, session, roots, versions, history, phone } = await aDayOfUse();
   const young = server.put(new Uint8Array([7]));
   server.pageSize = 2;
 
@@ -312,56 +407,142 @@ test("cleanup prunes stale slots and deletes old blobs nothing needs, by the ser
   assert.equal(phone in keysOf(server).passkeys, false);
   assert.equal(cleaned.keys.blobId, server.refs.get("keys"));
 
-  // Kept: the current keys and vault, and the two versions in the history. Deleted: the older versions and
-  // the replaced keys blobs. The young blob would be old by the client's clock, which is years ahead.
+  // Kept: the current keys and root, the latest notes, the history directory and the version it keeps. Deleted: the
+  // earlier roots and keys, and the notes nothing lists. The young blob would be old by the client's clock.
   const remaining = new Set(server.blobs.keys());
-  assert.deepEqual(
-    versions.map((id) => remaining.has(id)),
-    [false, false, true, true, true],
-  );
+  assert.deepEqual(roots.map((id) => remaining.has(id)), [false, false, false, false, false, true]);
+  assert.deepEqual(versions.map((v) => remaining.has(v.id)), [false, true, false, true]);
+  assert.ok(remaining.has(history.id));
   assert.ok(remaining.has(young));
-  assert.equal(remaining.size, 5);
+  assert.equal(remaining.size, 6);
   assert.equal(report.too_recent.count, 1);
-  assert.equal(report.kept.count, 4);
-  assert.equal(report.deleted.count, report.blobs_total - 5);
+  assert.equal(report.kept.count, 5);
+  assert.equal(report.deleted.count, report.blobs_total - 6);
   lock(server);
-  assert.deepEqual((await flows.unlockWithPasskey()).session.vault.doc, session.vault.doc);
+  const unlocked = (await flows.unlockWithPasskey()).session;
+  assert.deepEqual(await notesOf(unlocked), ["a", "b", "c", "d"]);
+  assert.deepEqual(decode(await collect(flows.read(unlocked, (await flows.list(unlocked, ["history"]))[0]))), ["a", "b"]);
 });
 
 const deletions = (server) => server.requests.filter((r) => r.method === "DELETE" && r.path.startsWith("/blobs/"));
 
 test("cleanup deletes nothing when the server's data can't be trusted", async (t) => {
   const cases = {
-    "the server's vault is older than the session's": ({ server, versions }) => server.refs.set("vault", versions[3]),
+    "the server's root is older than the session's": ({ server, roots }) => server.refs.set("vault", roots[3]),
     "a ref is missing": ({ server }) => server.refs.delete("keys"),
     "the server doesn't say what time it is": ({ server }) => {
       server.sendsDate = false;
     },
     "the server lists an invalid blob ID": ({ server }) => server.blobs.set("../../me", { bytes: new Uint8Array(1), created_at: 0 }),
-    "the vault was saved by a newer version": ({ session }) => flows.saveVault(session, (doc) => ({ ...doc, version: 2 })),
+    "the root was saved by a newer version": ({ server, session }) => writeRoot(server, session, { version: 2, revision: 99, entries: [] }),
     "the keys were saved by a newer version since the unlock": ({ server, phone }) => {
       server.passkeys.set(phone, { name: "Phone" }); // no slot to prune: only the version check stops it
       writeKeys(server, { ...keysOf(server), version: 2 });
     },
+    "a directory of the tree doesn't match its ID": ({ server, history }) => {
+      const { bytes } = server.blobs.get(history.id);
+      server.blobs.get(history.id).bytes = Uint8Array.from(bytes, (b, i) => (i === bytes.length - 1 ? b ^ 1 : b));
+    },
+    "a directory of the tree is missing": ({ server, history }) => server.blobs.delete(history.id),
   };
   for (const [name, tamper] of Object.entries(cases)) {
     await t.test(name, async () => {
       const account = await aDayOfUse();
       await tamper(account);
-      const { report } = await flows.maintain(account.session, "automatic");
+      // A device that wrote a directory keeps it in memory; a fresh unlock has to read it from the server.
+      const fresh = name.startsWith("a directory");
+      if (fresh) lock(account.server);
+      const session = fresh ? (await flows.unlockWithPasskey()).session : account.session;
+      const { report } = await flows.maintain(session, "automatic");
       assert.notEqual(report.error, null);
+      assert.doesNotMatch(report.error, /session has ended/, "stopped by the check, not by a lost session");
       assert.deepEqual(deletions(account.server), []);
     });
   }
 });
 
 test("a failed deletion is reported and the others go ahead", async () => {
-  const { server, session, versions } = await aDayOfUse();
-  server.failingDeletes.add(versions[0]);
+  const { server, session, roots } = await aDayOfUse();
+  server.failingDeletes.add(roots[0]);
   const { report } = await flows.maintain(session, "manual");
   assert.equal(report.error, null);
-  assert.deepEqual(report.failed.map((f) => f.id), [versions[0]]);
-  assert.equal(server.blobs.has(versions[1]), false);
+  assert.deepEqual(report.failed.map((f) => f.id), [roots[0]]);
+  assert.equal(server.blobs.has(roots[1]), false);
+});
+
+// ---------------------------------------------------------------- transitional: the layout before the tree (SPEC §6.13)
+
+/** A vault in the layout before the tree: a JSON document in a blob labelled `vault`, with two earlier versions as its history. */
+async function legacyAccount() {
+  const account = await newAccount();
+  const { server, session } = account;
+  const legacy = async (doc) => server.put(await stream.seal(session.contentKey, L.vault, encode(doc)));
+  const first = { revision: 5, notes: ["a"], history: [] };
+  const second = { revision: 6, notes: ["a", "b"], history: [await legacy(first)] };
+  const current = { revision: 7, notes: ["a", "b", "c"], history: [await legacy(second), second.history[0]] };
+  server.refs.set("vault", await legacy(current));
+  lock(server);
+  const { session: unlocked } = await flows.unlockWithPasskey();
+  return { ...account, session: unlocked, current };
+}
+
+/** The app's conversion: notes.json, and notes@<revision> for each earlier version. */
+const convert = async (doc, openOld) => ({
+  revision: doc.revision + 1,
+  steps: [
+    (tx) => tx.put(NOTES, tx.upload(encode(doc.notes))),
+    ...(await Promise.all(doc.history.map(openOld))).map((old) => (tx) => tx.put([`notes@${old.revision}`], tx.upload(encode(old.notes)))),
+  ],
+});
+
+test("a vault of the layout before the tree opens for upgrading only, and the upgrade rewrites it as a tree", async () => {
+  const { server, session, current } = await legacyAccount();
+  assert.equal(session.root, null);
+  assert.deepEqual(session.legacy.doc, current);
+  await assert.rejects(flows.save(session, [add("x")]), UserFacingError);
+  await assert.rejects(async () => flows.list(session, []), UserFacingError);
+  const { report } = await flows.maintain(session, "manual");
+  assert.match(report.error, /upgraded/);
+  assert.deepEqual(deletions(server), []);
+
+  const upgraded = await flows.upgradeVault(session, convert);
+  assert.equal(upgraded.legacy, undefined);
+  assert.equal(upgraded.root.revision, 8);
+  assert.equal(server.refs.get("vault"), upgraded.root.blobId);
+  assert.deepEqual((await flows.list(upgraded, [])).map((e) => e.name), ["notes.json", "notes@5", "notes@6"]);
+  assert.deepEqual(await notesOf(upgraded), ["a", "b", "c"]);
+
+  lock(server);
+  const unlocked = (await flows.unlockWithPasskey()).session;
+  assert.deepEqual(unlocked.root, upgraded.root);
+  server.requests = [];
+  assert.equal(await flows.upgradeVault(unlocked, convert), unlocked, "nothing left to upgrade");
+  assert.deepEqual(server.requests, []);
+});
+
+test("an upgrade that runs into another device's save, or can't read the old vault, changes nothing", async () => {
+  const { server, session } = await legacyAccount();
+  const other = server.put(new Uint8Array([1]));
+  server.refs.set("vault", other);
+  assert.equal(await flows.upgradeVault(session, convert), session);
+  assert.equal(server.refs.get("vault"), other);
+
+  const second = await legacyAccount();
+  second.server.blobs.delete(second.current.history[0]);
+  const vault = second.server.refs.get("vault");
+  await assert.rejects(flows.upgradeVault(second.session, convert), api.ApiError);
+  assert.equal(second.server.refs.get("vault"), vault);
+});
+
+test("after the upgrade, cleanup deletes the blobs of the old layout", async () => {
+  const { server, session, current } = await legacyAccount();
+  const old = [session.legacy.blobId, ...current.history];
+  const upgraded = await flows.upgradeVault(session, convert);
+  server.now += 25 * HOUR;
+  const { report } = await flows.maintain(upgraded, "manual");
+  assert.equal(report.error, null);
+  assert.deepEqual(old.filter((id) => server.blobs.has(id)), []);
+  assert.ok((await flows.list(upgraded, [])).every((e) => server.blobs.has(e.id)));
 });
 
 test("cleanup stops when the session ends", async () => {
@@ -370,94 +551,4 @@ test("cleanup stops when the session ends", async () => {
   const { report } = await flows.maintain(session, "automatic");
   assert.notEqual(report.error, null);
   assert.deepEqual(deletions(server), []);
-});
-
-test("putBlob and readBlob use the session's key", async () => {
-  const { session } = await newAccount();
-  const content = Uint8Array.from({ length: 100_000 }, (_, i) => i % 7);
-  const { id, salt } = await flows.putBlob(session, "test-app/file/v1", content);
-  const read = async (options, as = session) => new Uint8Array(await new Response((await flows.readBlob(as, "test-app/file/v1", id, options)).stream).arrayBuffer());
-  assert.deepEqual(await read(), content);
-  assert.deepEqual(await read({ salt, from: 70_000, to: 70_010 }), content.subarray(70_000, 70_010));
-  const stranger = { ...session, contentKey: await contentKey(L, new Uint8Array(32)) };
-  await assert.rejects(read({}, stranger), api.IntegrityError, "another master key");
-});
-
-test("a vault that doesn't decrypt, or isn't JSON, is an integrity error, and nothing is written", async () => {
-  const { server, session } = await newAccount();
-  const notJson = (await flows.putBlob(session, L.vault, new TextEncoder().encode("not JSON"))).id;
-  for (const vault of [server.put(randomBytes(4152)), notJson]) {
-    server.refs.set("vault", vault);
-    const before = new Map(server.refs);
-    lock(server);
-    await assert.rejects(flows.unlockWithPasskey(), api.IntegrityError);
-    assert.deepEqual(server.refs, before);
-  }
-});
-
-/**
- * The notes vault, with a tree besides: `root` names a directory blob, and a directory lists its subdirectories and
- * files by ID. `keep` walks the directories through `open` and lists the files without reading them.
- */
-const DIR = "test-app/dir/v1";
-const FILE = "test-app/file/v1";
-const tree = makeFlows({
-  labels: L,
-  document: {
-    ...notes,
-    keep: async (vault, open) => {
-      const visited = new Set();
-      const walk = async (id) => {
-        if (visited.has(id)) return [];
-        visited.add(id);
-        const dir = JSON.parse(new TextDecoder().decode(await open(id, DIR)));
-        return [id, ...dir.files, ...(await Promise.all(dir.dirs.map(walk))).flat()];
-      };
-      return [...vault.history, ...(vault.root ? await walk(vault.root) : [])];
-    },
-  },
-});
-
-/** An account a day old, whose vault's tree is a root directory with a file and a subdirectory with another. */
-async function aTree() {
-  const account = await newAccount();
-  const put = async (label, value) => (await flows.putBlob(account.session, label, new TextEncoder().encode(JSON.stringify(value)))).id;
-  const files = [await put(FILE, "one"), await put(FILE, "two")];
-  const sub = await put(DIR, { dirs: [], files: [files[1]] });
-  const root = await put(DIR, { dirs: [sub], files: [files[0]] });
-  const orphan = await put(FILE, "nothing lists this");
-  const { session } = await flows.saveVault(account.session, (doc) => ({ ...doc, root }));
-  account.server.now += 25 * HOUR;
-  return { ...account, session, tree: [root, sub, ...files], orphan };
-}
-
-test("keep walks a tree of blobs through open, and cleanup keeps what it finds", async () => {
-  const { server, session, tree: reachable, orphan } = await aTree();
-  server.requests = [];
-  const { report } = await tree.maintain(session, "manual");
-  assert.equal(report.error, null);
-  assert.ok(reachable.every((id) => server.blobs.has(id)), "the tree stays");
-  assert.equal(server.blobs.has(orphan), false, "a blob nothing lists goes");
-  const read = server.requests.filter((r) => r.method === "GET" && r.path.startsWith("/blobs/")).map((r) => r.path.slice("/blobs/".length));
-  assert.deepEqual(read.sort(), reachable.slice(0, 2).sort(), "only the directories were read, once each");
-});
-
-test("cleanup deletes nothing when keep can't open a blob of the tree", async (t) => {
-  const cases = {
-    "a directory that doesn't match its ID": ({ server, tree: [, sub] }) => {
-      const { bytes } = server.blobs.get(sub);
-      server.blobs.get(sub).bytes = Uint8Array.from(bytes, (b, i) => (i === bytes.length - 1 ? b ^ 1 : b));
-    },
-    "a directory that is missing": ({ server, tree: [, sub] }) => server.blobs.delete(sub),
-    "a blob of another kind in a directory's place": async ({ session, tree: [, , file] }) => flows.saveVault(session, (doc) => ({ ...doc, root: file })),
-  };
-  for (const [name, damage] of Object.entries(cases)) {
-    await t.test(name, async () => {
-      const account = await aTree();
-      const saved = await damage(account);
-      const { report } = await tree.maintain(saved?.session ?? account.session, "manual");
-      assert.match(report.error ?? "", /Integrity check failed|Not found/);
-      assert.deepEqual(deletions(account.server), []);
-    });
-  }
 });

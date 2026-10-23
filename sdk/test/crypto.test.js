@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { aesGcmDecrypt, aesGcmEncrypt, b64urlDecode, b64urlEncode, DecryptError, hexDecode, hexEncode, hkdfAesKey, sha256Hex, te } from "../src/crypto.js";
-import { contentKey, openDocument, sealDocument } from "../src/envelope.js";
+import { contentKey, openDocument } from "../src/envelope.js";
+import { seal } from "../src/stream.js";
 import { WrongKeyError, unwrap, wrap } from "../src/keys.js";
 import { labels } from "../src/labels.js";
 
@@ -41,14 +42,11 @@ test("tampering with the nonce, ciphertext or AAD fails", async () => {
   await assert.rejects(aesGcmDecrypt(key, nonce, ciphertext, te.encode("other")), DecryptError);
 });
 
-test("documents are blobs padded to 4 KiB, and round-trip", async () => {
+test("a vault document of the layout before the tree opens only with its key and label (transitional)", async () => {
   const key = await contentKey(L, new Uint8Array(32).fill(7));
   const doc = { format: "test-app/vault", entries: [{ title: "ü" }] };
-  const blob = await sealDocument(key, L.vault, doc);
-  assert.equal(blob.length, 40 + 4096 + 16, "header, one padded chunk, its tag");
+  const blob = await seal(key, L.vault, te.encode(JSON.stringify(doc)));
   assert.deepEqual(await openDocument(key, L.vault, blob), doc);
-  const large = { ...doc, notes: "x".repeat(5000) };
-  assert.equal((await sealDocument(key, L.vault, large)).length, 40 + 8192 + 16);
   await assert.rejects(openDocument(await contentKey(L, new Uint8Array(32)), L.vault, blob), DecryptError);
   await assert.rejects(openDocument(key, "test-app/other/v1", blob), DecryptError, "the label names the kind of blob");
   await assert.rejects(openDocument(await contentKey(labels("other-app"), new Uint8Array(32).fill(7)), L.vault, blob), DecryptError, "another app's content key");
@@ -103,6 +101,8 @@ test("labels are derived from the namespace, which must be a plain name", () => 
     kek: { passkey: "notes/kek/passkey/v1", recovery: "notes/kek/recovery/v1" },
     slot: { passkey: "notes/keys/v1/passkey", recovery: "notes/keys/v1/recovery" },
     stream: "notes/stream/v1",
+    dir: "notes/dir/v1",
+    file: "notes/file/v1",
     vault: "notes/vault/v1",
     stateId: "notes/device-state-id/v1",
   });
