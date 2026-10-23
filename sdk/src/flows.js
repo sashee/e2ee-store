@@ -7,12 +7,13 @@
 //   read(doc) → { doc, writable }                      validates; throws if it isn't one
 //   commit(doc, operation, now, loadedBlobId) → doc    applies an operation as the next revision (may be async)
 //   revision(doc) → integer                            grows by one with every save
-//   keep(doc) → [blob id]                              blobs besides the current one that cleanup keeps (may be async)
+//   keep(vault, open) → [blob id]                      blobs besides the current one that cleanup keeps (may be async);
+//                                                      open(id, label) → bytes reads one whole, to walk a tree of blobs
 //
 // A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, vault: { doc, blobId, writable } }.
 
 import * as api from "./api.js";
-import * as blobs from "./blobs.js";
+import * as encrypted from "./blobs.js";
 import * as passkeys from "./passkeys.js";
 import { UserFacingError } from "./passkeys.js";
 import { hexEncode, hkdfBytes, randomBytes } from "./crypto.js";
@@ -215,7 +216,8 @@ export function makeFlows({ labels, document }) {
       const { blobs, serverNow } = await listAllBlobs();
       if (serverNow === null) throw new Error("The server didn't say what time it is, so nothing was deleted.");
       blobs.forEach((b) => api.checkBlobId(b.id));
-      const keep = [stale.length > 0 ? current.keys.blobId : keysId, vaultId, ...((await document.keep(vault.doc)) ?? [])];
+      const open = (id, label) => encrypted.openBlob(current.contentKey, label, id);
+      const keep = [stale.length > 0 ? current.keys.blobId : keysId, vaultId, ...((await document.keep(vault.doc, open)) ?? [])];
       plan = planBlobs({ keep, blobs, now: serverNow });
       for (const [index, blob] of plan.toDelete.entries()) {
         onProgress(`Deleting ${index + 1} of ${plan.toDelete.length}`);
@@ -324,8 +326,8 @@ export function makeFlows({ labels, document }) {
     createVault,
     saveVault,
     /** Seals `data` as a blob of kind `label` and uploads it (SPEC §6.12). → { id, salt } */
-    putBlob: (session, label, data, options) => blobs.putBlob(session.contentKey, label, data, options),
+    putBlob: (session, label, data, options) => encrypted.putBlob(session.contentKey, label, data, options),
     /** Reads all of a blob or a range of it (SPEC §6.12). → { size, stream } */
-    readBlob: (session, label, id, options) => blobs.readBlob(session.contentKey, label, id, options),
+    readBlob: (session, label, id, options) => encrypted.readBlob(session.contentKey, label, id, options),
   };
 }

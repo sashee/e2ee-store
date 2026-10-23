@@ -15,6 +15,20 @@ export async function putBlob(rootKey, label, data, { signal } = {}) {
   return { id, salt: hexEncode(sealed.subarray(0, stream.SALT)) };
 }
 
+/**
+ * All of blob `id`'s plaintext, returned only once the whole blob is checked against its ID: for code that acts on what
+ * it reads, e.g. `keep` walking a tree of blobs (SPEC §5).
+ */
+export async function openBlob(rootKey, label, id) {
+  checkLabel(label);
+  const sealed = await api.getBlob(id);
+  try {
+    return await stream.open(rootKey, label, sealed);
+  } catch (error) {
+    throw error instanceof DecryptError ? new api.IntegrityError(`blob ${id} doesn't decrypt`) : error;
+  }
+}
+
 function checkLabel(label) {
   if (typeof label !== "string" || label.length === 0) throw new TypeError("A blob's label is a non-empty string, e.g. `<namespace>/track/v1`");
 }

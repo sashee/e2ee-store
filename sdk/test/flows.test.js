@@ -394,3 +394,70 @@ test("a vault that doesn't decrypt, or isn't JSON, is an integrity error, and no
     assert.deepEqual(server.refs, before);
   }
 });
+
+/**
+ * The notes vault, with a tree besides: `root` names a directory blob, and a directory lists its subdirectories and
+ * files by ID. `keep` walks the directories through `open` and lists the files without reading them.
+ */
+const DIR = "test-app/dir/v1";
+const FILE = "test-app/file/v1";
+const tree = makeFlows({
+  labels: L,
+  document: {
+    ...notes,
+    keep: async (vault, open) => {
+      const visited = new Set();
+      const walk = async (id) => {
+        if (visited.has(id)) return [];
+        visited.add(id);
+        const dir = JSON.parse(new TextDecoder().decode(await open(id, DIR)));
+        return [id, ...dir.files, ...(await Promise.all(dir.dirs.map(walk))).flat()];
+      };
+      return [...vault.history, ...(vault.root ? await walk(vault.root) : [])];
+    },
+  },
+});
+
+/** An account a day old, whose vault's tree is a root directory with a file and a subdirectory with another. */
+async function aTree() {
+  const account = await newAccount();
+  const put = async (label, value) => (await flows.putBlob(account.session, label, new TextEncoder().encode(JSON.stringify(value)))).id;
+  const files = [await put(FILE, "one"), await put(FILE, "two")];
+  const sub = await put(DIR, { dirs: [], files: [files[1]] });
+  const root = await put(DIR, { dirs: [sub], files: [files[0]] });
+  const orphan = await put(FILE, "nothing lists this");
+  const { session } = await flows.saveVault(account.session, (doc) => ({ ...doc, root }));
+  account.server.now += 25 * HOUR;
+  return { ...account, session, tree: [root, sub, ...files], orphan };
+}
+
+test("keep walks a tree of blobs through open, and cleanup keeps what it finds", async () => {
+  const { server, session, tree: reachable, orphan } = await aTree();
+  server.requests = [];
+  const { report } = await tree.maintain(session, "manual");
+  assert.equal(report.error, null);
+  assert.ok(reachable.every((id) => server.blobs.has(id)), "the tree stays");
+  assert.equal(server.blobs.has(orphan), false, "a blob nothing lists goes");
+  const read = server.requests.filter((r) => r.method === "GET" && r.path.startsWith("/blobs/")).map((r) => r.path.slice("/blobs/".length));
+  assert.deepEqual(read.sort(), reachable.slice(0, 2).sort(), "only the directories were read, once each");
+});
+
+test("cleanup deletes nothing when keep can't open a blob of the tree", async (t) => {
+  const cases = {
+    "a directory that doesn't match its ID": ({ server, tree: [, sub] }) => {
+      const { bytes } = server.blobs.get(sub);
+      server.blobs.get(sub).bytes = Uint8Array.from(bytes, (b, i) => (i === bytes.length - 1 ? b ^ 1 : b));
+    },
+    "a directory that is missing": ({ server, tree: [, sub] }) => server.blobs.delete(sub),
+    "a blob of another kind in a directory's place": async ({ session, tree: [, , file] }) => flows.saveVault(session, (doc) => ({ ...doc, root: file })),
+  };
+  for (const [name, damage] of Object.entries(cases)) {
+    await t.test(name, async () => {
+      const account = await aTree();
+      const saved = await damage(account);
+      const { report } = await tree.maintain(saved?.session ?? account.session, "manual");
+      assert.match(report.error ?? "", /Integrity check failed|Not found/);
+      assert.deepEqual(deletions(account.server), []);
+    });
+  }
+});

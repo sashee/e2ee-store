@@ -138,8 +138,11 @@ The app defines its vault document and hands it to `makeFlows({ labels, document
 | `read(doc) → { doc, writable }` | Validates a decrypted document; throws if it isn't one. `writable` is false for a newer format version: the vault then opens read-only, as it does with newer keys (§3.3). |
 | `commit(doc, operation, now, loadedBlobId) → doc` | Applies an operation (a function `(doc, now) → doc`) as the next revision: the revision grows by exactly 1. May be async, e.g. to upload blobs the new version refers to. |
 | `revision(doc) → integer` | The revision, for rollback detection (§6.5). |
-| `keep(doc) → [blob id]` | Every blob besides the vault blob itself that the vault still needs: earlier versions it keeps, and anything it refers to. May be async, e.g. to walk a tree of blobs. Cleanup deletes the rest (§6.11). |
+| `keep(vault, open) → [blob id]` | Every blob besides the vault blob itself that the vault still needs: earlier versions it keeps, and anything it refers to, directly or through other blobs. May be async. `open(id, label) → Uint8Array` reads a blob whole, checks it against its ID and decrypts it, to walk a tree of blobs (e.g. directories). Cleanup deletes the rest (§6.11). |
 
+- **Walking a tree in `keep`:**
+  - It must throw rather than leave out a blob it can't read, because a blob it doesn't list is deleted. Cleanup then stops and deletes nothing (§6.11).
+  - It opens only what it has to walk (e.g. directories, not the files they list), and each blob once: blobs never change, so versions in a history share their unchanged subtrees.
 - **Operations** are pure functions of the form `(document, now) → document`. A save re-applies the same operation to a newer document after a conflict (§6.4), so operations must make sense on any version.
 - **Format:** the app's choice, apart from being JSON. Unknown fields should be preserved when the document is rewritten.
 
@@ -277,7 +280,7 @@ The server never cleans anything up, so the client does. The app runs `maintain`
    - the server's vault is older than this session's (the app also doesn't run it while a rollback warning is shown)
    - any listed blob ID isn't 64 hex characters (IDs go into URLs)
 1. **Prune the keys document:** remove passkey slots whose credential ID is not in `GET /me/passkeys`. Nothing is saved if nothing changed. Only the slots found stale are removed, also when the save is re-applied after a conflict, so a slot another device just added is never pruned.
-2. **Build the keep set:** the current `keys` blob, the current `vault` blob, and `document.keep(vault)`.
+2. **Build the keep set:** the current `keys` blob, the current `vault` blob, and `document.keep(vault, open)`, where `open` reads blobs for this session. If `keep` throws, the run stops here.
 3. **Delete old blobs:**
    - List all blobs.
    - Delete every blob that is not in the keep set and whose `created_at` is more than 24 hours before the server's time (taken from the `Date` header of the list response). Without that header, nothing is deleted: this device's clock is no substitute, as it can be days off.
