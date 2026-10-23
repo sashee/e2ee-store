@@ -1,9 +1,9 @@
 //! Persistence (SPEC §5, §7): plain functions over a connection. Callers pass `now`; nothing here reads
 //! the clock. Outcomes the API distinguishes are returned as enums; `Err` is reserved for SQLite failures.
 
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::domain::{BlobId, Precondition, is_live, precondition_holds};
+use crate::domain::{BlobId, ByteRange, Precondition, is_live, precondition_holds};
 
 pub type UserId = [u8; 16];
 
@@ -367,17 +367,42 @@ pub fn blob_meta(
     .optional()
 }
 
+/// The blob's metadata, the range `pick` chooses for its size, and that range's bytes (empty when it's
+/// unsatisfiable). The bytes come through incremental BLOB I/O, so SQLite reads only the pages up to the
+/// range's end and only the range is held in memory.
 pub fn blob_content(
-    conn: &Connection,
+    conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
-) -> rusqlite::Result<Option<(BlobMeta, Vec<u8>)>> {
-    conn.query_row(
-        "SELECT id, size, created_at, content FROM blobs WHERE user_id = ?1 AND id = ?2",
-        params![user_id, id.0],
-        |r| Ok((blob_meta_row(r)?, r.get(3)?)),
-    )
-    .optional()
+    pick: impl FnOnce(u64) -> ByteRange,
+) -> rusqlite::Result<Option<(BlobMeta, ByteRange, Vec<u8>)>> {
+    // One read transaction, so the rowid can't be deleted and reused between the lookup and the read.
+    let tx = conn.transaction()?;
+    let Some((meta, rowid)) = tx
+        .query_row(
+            "SELECT id, size, created_at, rowid FROM blobs WHERE user_id = ?1 AND id = ?2",
+            params![user_id, id.0],
+            |r| Ok((blob_meta_row(r)?, r.get::<_, i64>(3)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let range = pick(meta.size);
+    let content = match range {
+        ByteRange::Full => read_blob(&tx, rowid, 0, meta.size)?,
+        ByteRange::Partial { start, end } => read_blob(&tx, rowid, start, end - start + 1)?,
+        ByteRange::Unsatisfiable => Vec::new(),
+    };
+    Ok(Some((meta, range, content)))
+}
+
+fn read_blob(conn: &Connection, rowid: i64, start: u64, len: u64) -> rusqlite::Result<Vec<u8>> {
+    let index = |n: u64| usize::try_from(n).map_err(|_| rusqlite::Error::BlobSizeError);
+    let mut content = vec![0; index(len)?];
+    conn.blob_open(MAIN_DB, c"blobs", c"content", rowid, true)?
+        .read_at_exact(&mut content, index(start)?)?;
+    Ok(content)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -129,24 +129,22 @@ pub async fn get_blob(
 ) -> Result<Response, ApiError> {
     let id = blob_id(&id)?;
     let user_id = authed.session.user_id;
-    let (meta, content) = state
-        .db(move |c| store::blob_content(c, &user_id, id))
+    let range_header = header_str(&headers, header::RANGE).map(str::to_owned);
+    let (meta, range, body) = state
+        .db(move |c| {
+            store::blob_content(c, &user_id, id, |size| {
+                parse_range(range_header.as_deref(), size)
+            })
+        })
         .await?
         .ok_or_else(ApiError::not_found)?;
     let size = meta.size;
-    let (status, body, content_range) = match parse_range(header_str(&headers, header::RANGE), size)
-    {
-        ByteRange::Full => (StatusCode::OK, content, None),
-        ByteRange::Partial { start, end } => {
-            let slice = content
-                [usize::try_from(start).unwrap_or(0)..=usize::try_from(end).unwrap_or(0)]
-                .to_vec();
-            (
-                StatusCode::PARTIAL_CONTENT,
-                slice,
-                Some(format!("bytes {start}-{end}/{size}")),
-            )
-        }
+    let (status, content_range) = match range {
+        ByteRange::Full => (StatusCode::OK, None),
+        ByteRange::Partial { start, end } => (
+            StatusCode::PARTIAL_CONTENT,
+            Some(format!("bytes {start}-{end}/{size}")),
+        ),
         ByteRange::Unsatisfiable => {
             let mut error = ApiError::new(
                 StatusCode::RANGE_NOT_SATISFIABLE,

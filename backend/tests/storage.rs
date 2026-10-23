@@ -103,6 +103,43 @@ async fn blobs_round_trip_with_ranges() {
 }
 
 #[tokio::test]
+async fn ranges_span_overflow_pages() {
+    let h = Harness::with(|config| config.max_blob_size = 1 << 20);
+    let cookie = h.signed_up("alice", PHONE).await;
+    let content: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+    let id = BlobId::of(&content);
+    assert_eq!(
+        put_blob(&h, &cookie, &content).await.status,
+        StatusCode::CREATED
+    );
+
+    let range = |r: String| common::Call {
+        cookie: Some(&cookie),
+        headers: vec![("range", r)],
+        ..h.call(Method::GET, PHONE, format!("/api/v1/blobs/{id}"))
+    };
+    for (start, end) in [(0, 99), (4000, 70_000), ((1 << 20) - 5000, (1 << 20) - 1)] {
+        let partial = h.send(range(format!("bytes={start}-{end}"))).await;
+        assert_eq!(partial.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.body, content[start..=end]);
+    }
+    assert_eq!(
+        h.get(PHONE, &format!("/api/v1/blobs/{id}"), &cookie)
+            .await
+            .body,
+        content
+    );
+
+    let empty = BlobId::of(b"");
+    put_blob(&h, &cookie, b"").await;
+    let full = h
+        .get(PHONE, &format!("/api/v1/blobs/{empty}"), &cookie)
+        .await;
+    assert_eq!(full.status, StatusCode::OK);
+    assert!(full.body.is_empty());
+}
+
+#[tokio::test]
 async fn uploads_are_checked() {
     let h = Harness::new();
     let cookie = h.signed_up("alice", PHONE).await;

@@ -285,6 +285,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 - Uploading is idempotent. Uploading an ID that already exists does nothing, and `created_at` stays the same.
 - A blob can't be deleted while a ref points to it (409).
 - Each upload is limited by `max_blob_size` (16 MiB by default). There are no per-user quotas.
+- Reads use SQLite's incremental BLOB I/O, so a `Range` read holds only the requested bytes in memory. SQLite still reads every page up to the range's end, which makes ranges near the start cheap and ranges near the end of a large blob cost about as much I/O as a full read.
 
 ### 7.2 Refs
 
