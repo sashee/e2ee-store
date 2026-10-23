@@ -9,13 +9,15 @@
 //   revision(doc) → integer                            grows by one with every save
 //   keep(doc) → [blob id]                              blobs besides the current one that cleanup keeps (may be async)
 //
-// A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, vault: { doc, blobId, writable } }.
+// A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, vault: { doc, blobId, writable, legacy } },
+// where `legacy` says the vault blob is in the format before streams (SPEC §3.5), which `upgradeVault` rewrites.
 
 import * as api from "./api.js";
+import * as blobs from "./blobs.js";
 import * as passkeys from "./passkeys.js";
 import { UserFacingError } from "./passkeys.js";
-import { hexEncode, hkdfBytes, randomBytes } from "./crypto.js";
-import { contentKey as deriveContentKey, openDocument, sealDocument } from "./envelope.js";
+import { DecryptError, hexEncode, hkdfBytes, randomBytes } from "./crypto.js";
+import { contentKey as deriveContentKey, legacyContentKey, openDocument, openLegacyDocument, sealDocument } from "./envelope.js";
 import { decodeKeys, emptyKeys, encodeKeys, removePasskey, setPasskey, setRecovery, unwrap, WrongKeyError, wrap } from "./keys.js";
 import { makeReport, planBlobs, prunableSlots } from "./maintenance.js";
 import { generateRecoveryKey } from "./recovery-key.js";
@@ -46,15 +48,27 @@ export function makeFlows({ labels, document }) {
     return { ...decodeKeys(labels, await api.getBlob(blobId)), blobId };
   }
 
-  async function decryptVault(contentKey, data) {
+  /** A vault blob's document: in the stream format, or the one before it (transitional, SPEC §3.5). */
+  async function openVaultBlob({ masterKey, contentKey }, data) {
     try {
-      return document.read(await openDocument(contentKey, labels.vault, data));
+      return { doc: await openDocument(contentKey, labels.vault, data), legacy: false };
+    } catch (error) {
+      if (!(error instanceof DecryptError)) throw error;
+      return { doc: await openLegacyDocument(await legacyContentKey(labels, masterKey), labels.vault, data), legacy: true };
+    }
+  }
+
+  /** `keys` are the session's (or { masterKey, contentKey }). → { doc, writable, legacy } */
+  async function decryptVault(keys, data) {
+    try {
+      const { doc, legacy } = await openVaultBlob(keys, data);
+      return { ...document.read(doc), legacy };
     } catch (error) {
       throw new api.IntegrityError(`the vault doesn't decrypt (${error.message})`);
     }
   }
 
-  const loadVault = async (contentKey, blobId) => ({ ...(await decryptVault(contentKey, await api.getBlob(blobId))), blobId });
+  const loadVault = async (keys, blobId) => ({ ...(await decryptVault(keys, await api.getBlob(blobId))), blobId });
 
   /**
    * What this device remembers about the vault (the highest revision seen, the last cleanup) is filed under
@@ -72,7 +86,7 @@ export function makeFlows({ labels, document }) {
     const user = await api.me();
     const blobId = await api.getRef("vault");
     if (blobId) {
-      const vault = await loadVault(contentKey, blobId);
+      const vault = await loadVault({ masterKey, contentKey }, blobId);
       return { masterKey, contentKey, stateId, keys, user, vault: { ...vault, writable: vault.writable && keys.writable } };
     }
     if (!keys.writable) throw new UserFacingError("This vault was created by a newer version of the app; update this one to open it.");
@@ -80,7 +94,7 @@ export function makeFlows({ labels, document }) {
     const created = await api.putBlob(await sealDocument(contentKey, labels.vault, doc));
     const write = await api.putRef("vault", created, null);
     if (!write.ok) return open(masterKey, keys);
-    return { masterKey, contentKey, stateId, keys, user, vault: { doc, blobId: created, writable: true } };
+    return { masterKey, contentKey, stateId, keys, user, vault: { doc, blobId: created, writable: true, legacy: false } };
   }
 
   /**
@@ -196,7 +210,7 @@ export function makeFlows({ labels, document }) {
       const keysId = await api.getRef("keys");
       const vaultId = await api.getRef("vault");
       if (!keysId || !vaultId) throw new Error("The keys or the vault are missing on the server, so nothing was deleted.");
-      const vault = vaultId === current.vault.blobId ? current.vault : await loadVault(current.contentKey, vaultId);
+      const vault = vaultId === current.vault.blobId ? current.vault : await loadVault(current, vaultId);
       if (!(await keysWritable(current, keysId)) || !vault.writable) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
       if (document.revision(vault.doc) < document.revision(current.vault.doc)) throw new Error("The server returned an older vault than this session's, so nothing was deleted.");
 
@@ -270,7 +284,14 @@ export function makeFlows({ labels, document }) {
     if (!vaultWrite.ok) return { kind: "created", session: await open(masterKey, keys) };
     return {
       kind: "created",
-      session: { masterKey, contentKey, stateId: await deriveStateId(masterKey), keys, user: await api.me(), vault: { doc: vaultDoc, blobId: vaultId, writable: true } },
+      session: {
+        masterKey,
+        contentKey,
+        stateId: await deriveStateId(masterKey),
+        keys,
+        user: await api.me(),
+        vault: { doc: vaultDoc, blobId: vaultId, writable: true, legacy: false },
+      },
     };
   }
 
@@ -286,7 +307,7 @@ export function makeFlows({ labels, document }) {
       apply: (doc, blobId) => document.commit(doc, operation, now(), blobId),
       encode: (doc) => sealDocument(session.contentKey, labels.vault, doc),
       decode: async (data) => {
-        const conflict = await decryptVault(session.contentKey, data);
+        const conflict = await decryptVault(session, data);
         const keysId = await api.getRef("keys");
         if (!conflict.writable || (keysId && !(await keysWritable(session, keysId)))) {
           throw new UserFacingError("Another device saved this vault with a newer version of the app; update this one first.");
@@ -296,7 +317,32 @@ export function makeFlows({ labels, document }) {
       // Another device's save is always a later revision; anything else is the server rolling the vault back.
       accept: (conflict, base) => document.revision(conflict) > document.revision(base),
     });
-    return { session: { ...session, vault: { doc: saved.doc, blobId: saved.blobId, writable: true } }, base: saved.previous.doc };
+    return { session: { ...session, vault: { doc: saved.doc, blobId: saved.blobId, writable: true, legacy: false } }, base: saved.previous.doc };
+  }
+
+  /**
+   * Transitional (SPEC §6.13): rewrites a vault from the format before streams in the stream format, as one save.
+   * `rewrite(doc, reseal)` returns the document with the blobs it refers to rewritten too, through
+   * `reseal(blobId, label = labels.vault) → new blob ID`, which re-encrypts one document of the old format. The loaded
+   * blob is resealed as well, and `document.commit` puts the copy where the loaded blob goes (e.g. into a history).
+   * The new blob has to open to the same document before the ref moves. No retry: after a conflict nothing has
+   * changed, and the next unlock tries again. A vault that isn't legacy, or is read-only, stays as it is.
+   * → session
+   */
+  async function upgradeVault(session, rewrite = (doc) => doc) {
+    if (!session.vault.legacy || !session.vault.writable) return session;
+    const legacyKey = await legacyContentKey(labels, session.masterKey);
+    const reseal = async (blobId, label = labels.vault) =>
+      api.putBlob(await sealDocument(session.contentKey, label, await openLegacyDocument(legacyKey, label, await api.getBlob(blobId))));
+    const copy = await reseal(session.vault.blobId);
+    const doc = await document.commit(await rewrite(session.vault.doc, reseal), (d) => d, now(), copy);
+    const sealed = await sealDocument(session.contentKey, labels.vault, doc);
+    if (JSON.stringify(await openDocument(session.contentKey, labels.vault, sealed)) !== JSON.stringify(doc)) {
+      throw new Error("The upgraded vault doesn't open to the same document; nothing was changed.");
+    }
+    const blobId = await api.putBlob(sealed);
+    if (!(await api.putRef("vault", blobId, session.vault.blobId)).ok) return session;
+    return { ...session, vault: { doc, blobId, writable: true, legacy: false } };
   }
 
   return {
@@ -315,5 +361,10 @@ export function makeFlows({ labels, document }) {
     newSecrets,
     createVault,
     saveVault,
+    upgradeVault,
+    /** Seals `data` as a blob of kind `label` and uploads it (SPEC §6.12). → { id, salt } */
+    putBlob: (session, label, data, options) => blobs.putBlob(session.contentKey, label, data, options),
+    /** Reads all of a blob or a range of it (SPEC §6.12). → { size, stream } */
+    readBlob: (session, label, id, options) => blobs.readBlob(session.contentKey, label, id, options),
   };
 }

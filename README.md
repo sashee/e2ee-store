@@ -6,7 +6,8 @@ Building blocks for web apps that keep each user's data end-to-end encrypted, un
   opaque bytes and has no app-specific code. See `backend/SPEC.md`.
 - `sdk/` is the browser side, in plain JavaScript with no dependencies and no build step: the backend client,
   WebAuthn with PRF, the key hierarchy (master key, passkey slots, recovery key), the encrypted vault with
-  compare-and-swap saves and rollback detection, setup links, and cleanup. See `sdk/SPEC.md`.
+  compare-and-swap saves and rollback detection, encrypted blobs read whole or in ranges as streams, setup
+  links, and cleanup. See `sdk/SPEC.md`.
 - `nix/module.nix` runs one backend per app on NixOS; `nix/tests/lib.nix` is its VM test.
 
 ## Building an app on it

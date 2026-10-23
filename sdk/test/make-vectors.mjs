@@ -1,11 +1,12 @@
-// Writes vectors.json: a keys blob and a vault blob of format version 1, built from SPEC.md §2–§3 with
-// node:crypto alone, not with the SDK, from fixed keys and nonces. vectors.test.js checks that the SDK opens them,
-// so a change to the format (labels, HKDF, padding, layout) can't go unnoticed: data written today must open
-// forever (SPEC §2). The output never changes; rerunning this is only for reading how the vectors were made.
+// Writes vectors.json: a keys blob, a vault blob in the stream format and one in the format before it, and the
+// recipe and ID of a file blob that spans two chunks, built from SPEC.md §2–§3 with node:crypto alone (reference.mjs),
+// not with the SDK, from fixed keys, nonces and salts. vectors.test.js checks that the SDK opens them, so a change to
+// a format (labels, HKDF, padding, layout) can't go unnoticed: data written today must open forever (SPEC §2). The
+// output never changes; rerunning this is only for reading how the vectors were made.
 //
 //   node sdk/test/make-vectors.mjs > sdk/test/vectors.json
 
-import { createCipheriv, createHash, hkdfSync } from "node:crypto";
+import { hkdf, legacyDocument, seal, sha256, streamBlob } from "./reference.mjs";
 
 const namespace = "test-vectors";
 const filled = (length, byte) => Buffer.alloc(length, byte);
@@ -14,13 +15,6 @@ const masterKey = filled(32, 0x11);
 const prfOutput = filled(32, 0x22);
 const recoveryKey = filled(32, 0x33);
 const credentialId = filled(16, 0x44).toString("base64url");
-
-const hkdf = (ikm, info, length) => Buffer.from(hkdfSync("sha256", ikm, Buffer.alloc(0), info, length));
-/** AES-256-GCM: ciphertext ‖ 16-byte tag. */
-function seal(key, nonce, plaintext, aad) {
-  const cipher = createCipheriv("aes-256-gcm", key, nonce).setAAD(Buffer.from(aad));
-  return Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
-}
 
 // §3.3: the master key wrapped under each KEK, with the slot's label as AAD.
 const slot = (secret, kind, nonce) => ({
@@ -38,14 +32,16 @@ const keys = {
 };
 const keysBlob = Buffer.from(JSON.stringify(keys));
 
-// §3.2: nonce ‖ AES-256-GCM(content key, JSON padded with spaces to a multiple of 4096) with the vault label as AAD.
 const vaultDocument = { format: "test-vectors/notes", revision: 7, notes: ["plain", "ü", "📝"] };
-const json = Buffer.from(JSON.stringify(vaultDocument));
-const padded = Buffer.concat([json, filled(Math.ceil(json.length / 4096) * 4096 - json.length, 0x20)]);
-const vaultNonce = filled(12, 0x03);
-const vaultBlob = Buffer.concat([vaultNonce, seal(hkdf(masterKey, `${namespace}/content/v1`, 32), vaultNonce, padded, `${namespace}/vault/v1`)]);
+// §3.5: the vault as it was written before the stream format.
+const vaultBlob = legacyDocument({ masterKey, namespace, label: `${namespace}/vault/v1`, nonce: filled(12, 0x03), doc: vaultDocument });
+// §3.2: the same vault in the stream format.
+const streamVaultBlob = streamBlob({ masterKey, namespace, label: `${namespace}/vault/v1`, salt: filled(16, 0x05), plaintext: Buffer.from(JSON.stringify(vaultDocument)) });
 
-const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+// §3.2: a file of 70,000 bytes, byte i being i mod 251: a full chunk and one of 8192 padded bytes. Only its ID is
+// stored; the test makes it again with reference.mjs.
+const file = { label: `${namespace}/file/v1`, salt: filled(16, 0x06).toString("hex"), length: 70000 };
+const fileBlob = streamBlob({ masterKey, namespace, label: file.label, salt: Buffer.from(file.salt, "hex"), plaintext: Buffer.from(Array.from({ length: file.length }, (_, i) => i % 251)) });
 
 const vectors = {
   namespace,
@@ -60,5 +56,8 @@ const vectors = {
   vaultBlobId: sha256(vaultBlob),
   vaultBlob: vaultBlob.toString("base64"),
   vaultDocument,
+  streamVaultBlobId: sha256(streamVaultBlob),
+  streamVaultBlob: streamVaultBlob.toString("base64"),
+  file: { ...file, blobId: sha256(fileBlob) },
 };
 process.stdout.write(`${JSON.stringify(vectors, null, 2)}\n`);

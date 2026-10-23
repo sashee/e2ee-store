@@ -3,7 +3,7 @@
 #   nix-build                       # packages + all checks (what CI runs)
 #   nix-build -A backend            # the backend (its doCheck runs the Rust suite)
 #   nix-build -A sdk                # the SDK's ES modules and the browser-test harness
-#   nix-build -A checks.sdk-unit    # one check: lint, sdk-unit, vm
+#   nix-build -A checks.sdk-unit    # one check: lint, sdk-unit, browser, vm
 #
 # No flake: the packages are callPackage functions and take the caller's nixpkgs, so an app builds them with
 # its own pin (./nix/pkgs.nix is only this repository's). An app imports this file with its `pkgs`, or calls

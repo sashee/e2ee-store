@@ -9,8 +9,10 @@ export function labels(namespace) {
     keysFormat: `${namespace}/keys`,
     kek: { passkey: `${namespace}/kek/passkey/v1`, recovery: `${namespace}/kek/recovery/v1` },
     slot: { passkey: `${namespace}/keys/v1/passkey`, recovery: `${namespace}/keys/v1/recovery` },
-    content: `${namespace}/content/v1`,
+    stream: `${namespace}/stream/v1`,
     vault: `${namespace}/vault/v1`,
+    /** Transitional: the content key of the format before streams (SPEC §3.5). */
+    content: `${namespace}/content/v1`,
     stateId: `${namespace}/device-state-id/v1`,
   };
 }

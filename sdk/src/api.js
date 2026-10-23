@@ -52,8 +52,8 @@ export const setUnauthenticatedHandler = (handler) => {
   onUnauthenticated = handler;
 };
 
-async function call(method, path, { json, body, headers = {}, okStatuses = [], quiet401 = false } = {}) {
-  const init = { method, headers: { ...headers }, credentials: "same-origin" };
+async function call(method, path, { json, body, headers = {}, okStatuses = [], quiet401 = false, signal } = {}) {
+  const init = { method, headers: { ...headers }, credentials: "same-origin", signal };
   if (json !== undefined) {
     init.body = JSON.stringify(json);
     init.headers["Content-Type"] = "application/json";
@@ -100,9 +100,9 @@ export async function putRef(name, blobId, expected) {
 }
 
 /** Uploads a blob under its SHA-256 and returns the ID. */
-export async function putBlob(bytes) {
+export async function putBlob(bytes, { signal } = {}) {
   const id = await sha256Hex(bytes);
-  await call("PUT", `/blobs/${id}`, { body: bytes });
+  await call("PUT", `/blobs/${id}`, { body: bytes, signal });
   return id;
 }
 
@@ -111,6 +111,22 @@ export async function getBlob(id) {
   const data = new Uint8Array(await (await call("GET", `/blobs/${checkBlobId(id)}`)).arrayBuffer());
   if ((await sha256Hex(data)) !== id) throw new IntegrityError(`blob ${id}`);
   return data;
+}
+
+/**
+ * A blob's bytes as they arrive: all of them, or `range` ({ from, to }: [from, to), `to` null for the rest).
+ * → { start, total, body }: the offset the body starts at, and the blob's size from `Content-Range`; a server that
+ * sends the whole blob instead gives start 0 and no size. The bytes aren't checked here: blobs.js does that.
+ */
+export async function getBlobStream(id, { range = null, signal } = {}) {
+  const headers = range === null ? {} : { Range: `bytes=${range.from}-${range.to === null ? "" : range.to - 1}` };
+  const response = await call("GET", `/blobs/${checkBlobId(id)}`, { headers, signal });
+  if (response.status !== 206) return { start: 0, total: null, body: response.body };
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
+  const [start, end, total] = (match ?? []).slice(1).map(Number);
+  const asked = range !== null && start === range.from && start <= end && end < total && (range.to === null || end < range.to);
+  if (!match || !asked) throw new IntegrityError(`blob ${id} came back with a range that wasn't asked for`);
+  return { start, total, body: response.body };
 }
 
 export const deletePasskey = (id) => call("DELETE", `/me/passkeys/${encodeURIComponent(id)}`).then(json);

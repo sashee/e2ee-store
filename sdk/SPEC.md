@@ -1,6 +1,6 @@
 # SDK Specification: End-to-End Encrypted Vaults
 
-Status: **Draft v0.1** (2026-10-10)
+Status: **Draft v0.2** (2026-10-23)
 
 ## 1. Purpose & scope
 
@@ -11,6 +11,7 @@ The SDK provides:
 - the backend client, WebAuthn ceremonies with PRF, and the cryptography
 - a master key per user, wrapped once per passkey and once for a recovery key
 - the **vault**: one encrypted root document per user, saved by compare-and-swap, with rollback detection
+- **encrypted blobs** of any size up to the backend's limit, read whole or in ranges, as streams (§6.12)
 - setup links, adding devices, recovery, and cleanup of unneeded blobs
 - a browser-test harness for apps (§9)
 
@@ -24,7 +25,6 @@ Non-goals for v1:
 
 - More than one vault per user, and sharing between users.
 - Rotating the master key.
-- Encrypted blobs besides the vault itself. An app that stores more (e.g. a tree of files) encrypts them with the content key and lists them through `keep` (§5).
 
 ## 2. Labels
 
@@ -38,8 +38,9 @@ Every HKDF info, AAD, the PRF input and the keys format start with the app's nam
 | `kek.recovery`   | `<ns>/kek/recovery/v1` |
 | `slot.passkey`   | `<ns>/keys/v1/passkey` |
 | `slot.recovery`  | `<ns>/keys/v1/recovery` |
-| `content`        | `<ns>/content/v1` |
+| `stream`         | `<ns>/stream/v1` |
 | `vault`          | `<ns>/vault/v1` |
+| `content`        | `<ns>/content/v1`: transitional, the format before streams (§3.5) |
 | `stateId`        | `<ns>/device-state-id/v1` |
 
 - **Fixed forever:** every key and blob of an existing vault is bound to the labels. An app must never change its namespace; a test should pin it against data written by an earlier version.
@@ -54,27 +55,35 @@ All derivations use HKDF-SHA256 with an empty salt.
 | Key             | Origin | Purpose |
 |-----------------|--------|---------|
 | Master key (MK) | 32 random bytes, generated when the vault is created | Root key. It is never stored unwrapped. |
-| Content key     | `HKDF(ikm = MK, info = labels.content)` | Encrypts the vault blob |
+| Content key     | `HKDF(ikm = MK, info = labels.stream)` | The root of every blob's key (§3.2) |
 | Passkey KEK     | `HKDF(ikm = PRF output, info = labels.kek.passkey)` | Wraps the MK for one passkey |
 | Recovery KEK    | `HKDF(ikm = recovery key, info = labels.kek.recovery)` | Wraps the MK for the recovery key |
 
-- **Algorithms:** all derived keys are AES-256-GCM `CryptoKey`s and are non-extractable. Every encryption uses a fresh random 12-byte nonce.
+- **Algorithms:** all derived keys are non-extractable `CryptoKey`s: the content key an HKDF key, the others AES-256-GCM keys. A keyslot's encryption uses a fresh random 12-byte nonce; a blob's chunks are numbered, under a key of the blob's own (§3.2).
 - **The MK in memory:** while the vault is unlocked, the MK is held as raw bytes, because it has to be wrapped again whenever a passkey is added. The app drops it by reloading the page.
 - **PRF input:** a constant, `prf.eval.first = UTF-8(labels.prf)`. Login uses discoverable credentials, so the client doesn't know which credential will answer and can't choose a different input per credential. The PRF output is still unique to each passkey.
 - **No key stretching:** the recovery key is 32 random bytes, so HKDF is enough.
 - **Sizes are checked:** a PRF output must be exactly 32 bytes in an `ArrayBuffer` or a view of one, and wrapping refuses any secret or master key that isn't 32 bytes. A client that returned the PRF output in another form (e.g. a base64 string) would otherwise wrap the master key under a key anyone can compute.
 - **State ID:** `HKDF(MK, info = labels.stateId)`, 16 bytes in hex. What a device remembers about the vault in `localStorage` is filed under it, so the server can't redirect it (e.g. by reporting another user ID).
 
-### 3.2 Vault blob
+### 3.2 Encrypted blobs
+
+Every encrypted blob, the vault included, has this format (`stream.js`). It is age's STREAM construction with AES-256-GCM in place of ChaCha20-Poly1305, which WebCrypto doesn't have. Any part of a blob can be read and checked without the rest.
 
 ```
-nonce (12 bytes) ‖ AES-256-GCM ciphertext ‖ tag (16 bytes)
+salt (16 bytes) ‖ length block (8 + 16-byte tag) ‖ chunk_0 ‖ … ‖ chunk_n-1
 ```
 
-- **Encryption:** the content key, with AAD `UTF-8(labels.vault)`. Other encrypted documents of an app use the same format (`sealDocument`) with an AAD of their own.
-- **Plaintext:** the UTF-8 JSON vault document (§5), padded with spaces (`0x20`) to a multiple of 4096 bytes. JSON ignores trailing whitespace, and the padding hides small changes in size.
-- **Nothing in plaintext:** apart from the nonce, nothing is readable without the MK. That includes the format version and the links to earlier versions. The format of this blob is identified by the keys document's `version` (§3.3).
-- **Integrity:** every downloaded blob is checked with `SHA-256(bytes) == blob ID` before use. A mismatch or a failed decryption is an integrity error and is shown to the user; the data is never used.
+- **Blob key:** `HKDF(ikm = content key, salt = the blob's salt, info = UTF-8(label))`, an AES-256-GCM key. The salt is 16 random bytes, so no two blobs share a key. The label names the kind of blob (`labels.vault`, or an app's own, e.g. `<ns>/track/v1`), so a blob of one kind can't be passed off as another.
+- **Length block:** the plaintext's length as 8 bytes, big-endian, encrypted with the nonce `0 (11 bytes) ‖ 0x02`.
+- **Chunks:** the padded plaintext in chunks of 64 KiB (`CHUNK_SIZE`); the last one may be shorter. Chunk `i` is encrypted with the nonce `i (11 bytes, big-endian) ‖ 0x01` if it is the last, `‖ 0x00` otherwise, so chunks can't be reordered, dropped or cut off. There is no AAD.
+- **Padding:** zeros, to a multiple of 4096 bytes (at least 4096). This is the writer's choice: readers take any padding, as the length block says where the plaintext ends. Padding can change (e.g. to Padmé) without a new format.
+- **Shape:** every chunk but the last is full, the last holds at least one byte, and the length is at most the padded length. Anything else is an integrity error.
+- **Nothing in plaintext** apart from the salt, not even the format version. A new format gets new labels, and readers try the formats they know; every format is authenticated, so a blob can't be read as the wrong one (as with §3.5).
+- **Documents:** the vault (§5), and an app's other JSON documents, are the document's UTF-8 JSON in such a blob (`sealDocument` / `openDocument`). The padding hides small changes in their size.
+- **Integrity:**
+  - A blob read whole is checked with `SHA-256(bytes) == blob ID` before use (`readBlob`: before its stream closes, §6.12). A mismatch or a failed decryption is an integrity error and is shown to the user; the data is never used.
+  - A range (§6.12) can't be checked against the ID. Each chunk is authenticated on its own, and the nonces fix its place and the end, so the data is the user's, of this kind, unaltered and in place. That it is this blob, and not another of the user's of the same kind, is certain only with the blob's salt from the document that lists it (e.g. a directory): the key then comes from that salt.
 
 ### 3.3 Keys blob
 
@@ -109,6 +118,13 @@ The keys blob is plaintext JSON. Its secret parts are the wrapped keys.
 - **Uses:**
   - recovery after losing all passkeys
   - setting up a new device that has no usable passkey (§6.8)
+
+### 3.5 The format before streams (transitional)
+
+Vaults written before the stream format are `nonce (12) ‖ AES-256-GCM(legacy content key, JSON padded with spaces to a multiple of 4096) ‖ tag (16)`, with the AAD `UTF-8(labels.vault)` and the legacy content key `HKDF(ikm = MK, info = labels.content)`.
+
+- The SDK still reads this format, for the vault alone: a vault blob that doesn't open in the stream format is tried in this one, and the session marks it (`vault.legacy`). Nothing writes it any more; every save writes the stream format.
+- `upgradeVault` (§6.13) rewrites such a vault. Once every vault is upgraded, this format, `labels.content` and `upgradeVault` go.
 
 ## 4. Storage layout
 
@@ -147,7 +163,7 @@ The app defines its vault document and hands it to `makeFlows({ labels, document
 4. It loads the keys blob (`GET /refs/keys`, then the blob) and unwraps the MK from `passkeys[credential.id]`.
    - If there is no `keys` ref, the result is `no-vault`, or `keys-missing` if a `vault` ref exists (§6.2, step 3).
    - If there is no such slot, the result is `no-slot`. The app offers to unlock with the recovery key, which then sets the passkey up (§6.9).
-5. It loads the vault blob, verifies and decrypts it. The app checks for rollback (§6.5).
+5. It loads the vault blob, verifies and decrypts it (in either format, §3.5). The app checks for rollback (§6.5).
    - If `keys` exists but `vault` doesn't, a vault creation was interrupted. The client creates an empty vault with `If-None-Match: *`, unless the keys are from a newer version: then it asks to update the app.
 
 When the app starts, it calls `GET /me`.
@@ -291,6 +307,32 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 An automatic run that failed is due again at the next unlock.
 
+### 6.12 Reading and writing blobs
+
+An app keeps data besides its vault (files, tracks, directories) in encrypted blobs (§3.2), and lists them in its documents and through `keep` (§5).
+
+- **`putBlob(session, label, bytes, { signal })` → `{ id, salt }`** seals the bytes as a blob of kind `label` and uploads it. The salt (32 hex characters) is for the document that lists the blob, to pin it in range reads.
+- **`readBlob(session, label, id, { salt, from, to, signal })` → `{ size, stream }`:** `size` is the plaintext's length, and `stream` a `ReadableStream` of the plaintext bytes in `[from, to)`, as they are decrypted.
+  - **All of it** (neither `from` nor `to`): one request. The blob is checked against its ID before the stream closes (§3.2), so whatever must be verified before use is read to the end first.
+  - **A range:** `to` past the end is cut to the end, `from` at the end gives nothing, and `from` after it is a `RangeError`. Only the chunks the range touches are fetched, in one `Range` request, plus the 40-byte header if the range starts after the first chunk. A range aligned to `CHUNK_SIZE` fetches nothing it doesn't use. A server that ignores `Range` still works, at the cost of the whole download.
+  - **`salt`:** from the document that lists the blob. The key then comes from it, and another blob in this one's place fails (§3.2).
+  - **Aborting:** `signal`, or cancelling the stream, aborts the requests, and nothing more comes out of the stream. An abort fails with the signal's reason, unchanged, so the app can tell it from a failure.
+  - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `readBlob` or from the stream where they are read.
+- **`CHUNK_SIZE`** (64 KiB, from `blobs.js`) is the plaintext in a chunk: the unit worth fetching.
+
+### 6.13 Upgrading a vault from the format before streams (transitional)
+
+`upgradeVault(session, rewrite)` rewrites a vault of the format before streams (§3.5) in the stream format, as one save. The app calls it after unlocking when `session.vault.legacy` is set, before anything else writes or cleans up.
+
+1. The loaded vault blob is resealed: downloaded and checked against its ID, decrypted in the old format, encrypted in the stream format, and uploaded.
+2. `rewrite(doc, reseal)` returns the document with the blobs it refers to resealed the same way, e.g. a history of earlier versions. `reseal(blobId, label = labels.vault)` returns the new blob's ID.
+3. `document.commit(rewritten, identity, now, resealed copy)` makes the next revision, with the copy where the loaded blob goes (e.g. the front of a history).
+4. The result is sealed, checked to open to the same document, uploaded, and written with `PUT vault` and `If-Match` on the loaded blob.
+
+- **Nothing changes before step 4.** After a conflict, the session is returned as it was and the next unlock tries again; the uploaded copies are orphans that cleanup removes.
+- A vault that isn't legacy, or is read-only (§3.3), stays as it is. The keys document isn't touched.
+- The old blobs are no longer referenced, and cleanup deletes them once they are past the grace period (§6.11): usually at once.
+
 ## 7. Modules
 
 Plain ES modules with no dependencies and no build step. An app copies `src/` into its static files (the Nix package has it at `share/e2ee-store/sdk`) and imports the modules by relative path; the backend's CSP (`script-src 'self'`) rules out import maps.
@@ -298,11 +340,13 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | Module            | Contents |
 |-------------------|----------|
 | `labels.js`       | `labels(namespace)` (§2) |
-| `flows.js`        | `makeFlows({ labels, document })` (§5, §6): unlock, create, save, passkey slots, recovery key, maintenance |
-| `api.js`          | The backend client: errors with fixed messages, hash-checked blobs, compare-and-swap refs, the 401 handler |
+| `flows.js`        | `makeFlows({ labels, document })` (§5, §6): unlock, create, save, passkey slots, recovery key, maintenance, `putBlob` / `readBlob`, `upgradeVault` |
+| `blobs.js`        | `putBlob` / `readBlob` over the API and `CHUNK_SIZE` (§6.12) |
+| `stream.js`       | The blob format (§3.2): sealing, opening, and its layout |
+| `api.js`          | The backend client: errors with fixed messages, hash-checked blobs, ranges, compare-and-swap refs, the 401 handler |
 | `passkeys.js`     | WebAuthn ceremonies with PRF; `UserFacingError` |
 | `crypto.js`       | HKDF, AES-GCM, SHA-256, base64url, hex |
-| `envelope.js`     | The content key; `sealDocument` / `openDocument` (§3.2) |
+| `envelope.js`     | The content key; `sealDocument` / `openDocument` (§3.2); the reader of the format before streams (§3.5) |
 | `keys.js`         | The keys document, wrap/unwrap, operations (§3.3) |
 | `save.js`         | `saveWithRetry` (I/O passed in), `RollbackError`, `rollbackCheck` (§6.4, §6.5) |
 | `maintenance.js`  | The cleanup plan, report and schedule (§6.11) |
@@ -315,7 +359,7 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 
 - **What is protected:**
   - The vault's content is hidden from the server and from leaked database copies. So is its history.
-  - Blob tampering is detected by content addressing plus GCM.
+  - Blob tampering is detected by content addressing plus GCM: in whole reads by both, in range reads by GCM, chunk by chunk (§3.2).
   - A rolled-back vault is detected by the revision check.
 - **What is not protected:**
   - A server that serves malicious JavaScript. This is inherent to web apps, and the app is served by the same backend.
@@ -324,8 +368,10 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - An attacker who already has the MK. Without key rotation, removing a passkey doesn't lock them out.
 - **What the server sees:**
   - when and how often the vault and the keys blob change
-  - the vault's size, padded to 4 KiB steps, and the number and sizes of other blobs
+  - every blob's size, padded to 4 KiB steps, and the number of blobs
+  - when blobs are uploaded and read. That can group them: an album's tracks are uploaded together and played one after another, and a group of known sizes can identify what it is.
   - from the plaintext keys blob: which credential IDs have slots, and when the recovery key changes
+- **Range reads without a salt:** a server can serve another of the user's blobs of the same kind in place of the one asked for. Its data is the user's, unaltered, but not the blob asked for (§3.2). Reading through a document that lists the salt closes this.
 - **Tampering with the keys blob:** the server can delete or replay slots, which can only cause a failed unlock. It can't create a working slot, because that needs a KEK.
 - **Recovery key:** it is used whenever a new device is set up, so it gets pasted more often than a pure recovery secret would. Only paste it into the app.
   - The key plus a session gives full access. The key plus a stolen database also gives full access.
@@ -338,12 +384,13 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - **Crypto:** wrap/unwrap round trips; a tampered nonce, ciphertext or AAD fails; keys of another kind or another namespace fail.
   - **Labels:** derived from the namespace; invalid namespaces are refused.
   - **Documents:** padding and round trips.
+  - **Blobs:** sizes, padding and chunks; round trips across chunk boundaries; damaged, reordered, shortened and lengthened blobs; another writer's padding; ranges and what they fetch, salts, a server that ignores ranges, aborting.
   - **Keys documents:** validation; every operation; `version > 1` is read-only; another app's keys document is refused.
   - **Saving:** retries on conflict, gives up after 5, sync and async operations, rollback.
   - **Recovery key, setup links, maintenance:** parsing, the plan with its grace period, the report, the schedule.
 - **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, conflicts and rollback, newer versions, step-up, cleanup, and a server that misbehaves.
-- **Format vectors:** `test/vectors.json` holds a keys blob and a vault blob of version 1, made from this spec by `test/make-vectors.mjs` with `node:crypto` alone. The SDK must keep opening them (§2).
-- **Browser tests:** real WebAuthn against the real backend. This repository runs the flows with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
+- **Format vectors:** `test/vectors.json` holds a keys blob of version 1, a vault blob in the stream format and one in the format before it, and the recipe and ID of a file blob of two chunks. `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
+- **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows and a file blob with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
   - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.
   - `Backend` runs admin commands (`setup_token(...)`) and reads the stored blobs.

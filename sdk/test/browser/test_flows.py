@@ -67,6 +67,10 @@ def run(browser, backend, port: int) -> None:
     assert report["error"] is None, report
     assert report["deleted"]["count"] == 0 and report["too_recent"]["count"] > 0, report
 
+    # A file blob through the backend's ranges: whole, in ranges, pinned by its salt, and aborted while it streams.
+    file = call(laptop, "file")
+    assert file == {"ranges": [True] * 5, "pinned": True, "aborted": "next track"}, file
+
     # What the server saw: no plaintext, and no PRF output.
     assert all(b"from the laptop" not in blob for blob in backend.blob_contents())
     assert all(b'"results"' not in body for body in laptop.sent + phone.sent)

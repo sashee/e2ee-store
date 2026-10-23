@@ -45,6 +45,7 @@ jobs:
         uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
 
       # Both packages and every check, in the Nix sandbox: lint (rustfmt, clippy), the Rust suite (in the
-      # backend's build), the SDK's unit tests and the NixOS module in a VM. The same as `make check` locally.
+      # backend's build), the SDK's unit tests, the SDK in Chromium against the backend, and the NixOS module
+      # in a VM. The same as `make check` locally.
       - name: Build and test
         run: make check

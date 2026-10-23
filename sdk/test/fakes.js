@@ -1,7 +1,7 @@
 // Stand-ins for what surrounds the SDK in a browser, so the flows run under `node --test`:
 //
 // - the backend behind `fetch`: blobs, refs, passkeys and a session, with the behaviour of backend/SPEC.md §7–§8
-//   that the SDK relies on (compare-and-swap refs, hash-checked uploads, step-up). Passkeys belong to ALICE unless
+//   that the SDK relies on (compare-and-swap refs, hash-checked uploads, ranges, step-up). Passkeys belong to ALICE unless
 //   they name another user; the storage is ALICE's whoever logs in.
 // - a platform authenticator with PRF behind `navigator.credentials`
 //
@@ -31,8 +31,12 @@ export function fakeServer() {
     blobs: new Map(), // blob ID → { bytes, created_at }
     refs: new Map(), // ref name → blob ID
     challenges: new Set(),
-    /** Every request: { method, path, json }. */
+    /** Every request: { method, path, json, range, signal }. */
     requests: [],
+    /** Blob bodies arrive in pieces of this many bytes, as from a network. */
+    pieceSize: 16 * 1024,
+    /** Answers a `Range` request with the whole blob, as a server without range support would. */
+    ignoresRanges: false,
     /** Runs just before a ref write is checked: another device can write first. */
     beforeRefWrite: (_name) => {},
     /** Blob IDs whose deletion fails with a 500. */
@@ -56,6 +60,49 @@ export function fakeServer() {
       headers: server.sendsDate ? { date: new Date(server.now).toUTCString() } : {},
     });
   const error = (status, code) => reply(status, { error: code, message: `server says: ${code}` });
+
+  /** A blob body that arrives in pieces and breaks off when the request is aborted, like fetch's. */
+  const pieces = (bytes, signal) =>
+    new ReadableStream({
+      start(controller) {
+        signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+      },
+      pull(controller) {
+        if (bytes.length === 0) return controller.close();
+        controller.enqueue(bytes.slice(0, server.pieceSize));
+        bytes = bytes.subarray(server.pieceSize);
+      },
+    });
+
+  /** backend/SPEC.md §8.4: one range of the forms a-b, a- and -n; anything else is the whole blob. */
+  function byteRange(header, size) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(header ?? "");
+    if (!match || (match[1] === "" && match[2] === "")) return "full";
+    const [first, last] = [match[1], match[2]].map((n) => (n === "" ? null : Number(n)));
+    if (first === null) return last === 0 || size === 0 ? "unsatisfiable" : { start: Math.max(0, size - last), end: size - 1 };
+    if (last !== null && last < first) return "full";
+    return first >= size ? "unsatisfiable" : { start: first, end: Math.min(last ?? size - 1, size - 1) };
+  }
+
+  function getBlob({ match, headers, signal }) {
+    const blob = server.blobs.get(match[1]);
+    if (!blob) return error(404, "not_found");
+    const size = blob.bytes.length;
+    const range = server.ignoresRanges ? "full" : byteRange(headers.Range, size);
+    const date = server.sendsDate ? { date: new Date(server.now).toUTCString() } : {};
+    if (range === "unsatisfiable") {
+      return new Response(JSON.stringify({ error: "range_not_satisfiable", message: "server says: range_not_satisfiable" }), {
+        status: 416,
+        headers: { ...date, "content-range": `bytes */${size}` },
+      });
+    }
+    const { start, end } = range === "full" ? { start: 0, end: size - 1 } : range;
+    const partial = range !== "full";
+    return new Response(pieces(blob.bytes.subarray(start, end + 1), signal), {
+      status: partial ? 206 : 200,
+      headers: { ...date, "content-length": String(end + 1 - start), ...(partial ? { "content-range": `bytes ${start}-${end}/${size}` } : {}) },
+    });
+  }
 
   const authed = (handler) => (request) => (server.session ? handler(request) : error(401, "unauthenticated"));
   const fresh = (handler) => authed((request) => (server.session.fresh ? handler(request) : error(403, "reauth_required")));
@@ -171,7 +218,7 @@ export function fakeServer() {
         return reply(created ? 201 : 200, { id: match[1], size: body.length, created_at: iso(server.blobs.get(match[1]).created_at) });
       }),
     ],
-    ["GET", /^\/blobs\/([0-9a-f]{64})$/, authed(({ match }) => (server.blobs.has(match[1]) ? reply(200, server.blobs.get(match[1]).bytes) : error(404, "not_found")))],
+    ["GET", /^\/blobs\/([0-9a-f]{64})$/, authed(getBlob)],
     [
       "DELETE",
       /^\/blobs\/([0-9a-f]{64})$/,
@@ -207,10 +254,11 @@ export function fakeServer() {
     const headers = init.headers ?? {};
     const json = headers["Content-Type"] === "application/json" ? JSON.parse(init.body) : undefined;
     const body = headers["Content-Type"] === "application/octet-stream" ? new Uint8Array(init.body) : undefined;
-    server.requests.push({ method, path, json });
+    server.requests.push({ method, path, json, range: headers.Range, signal: init.signal });
+    init.signal?.throwIfAborted();
     for (const [routeMethod, pattern, handler] of routes) {
       const match = routeMethod === method && path.match(pattern);
-      if (match) return handler({ match, json, body, headers, query: searchParams });
+      if (match) return handler({ match, json, body, headers, query: searchParams, signal: init.signal });
     }
     return error(404, "not_found");
   };

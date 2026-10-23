@@ -2,6 +2,7 @@
 // calls these and gets JSON back. The SDK is next to it in `sdk/`, as an app ships it.
 
 import * as api from "./sdk/api.js";
+import { CHUNK_SIZE } from "./sdk/blobs.js";
 import { makeFlows } from "./sdk/flows.js";
 import { labels } from "./sdk/labels.js";
 import { formatRecoveryKey, parseRecoveryKey } from "./sdk/recovery-key.js";
@@ -57,5 +58,33 @@ window.app = {
   async maintain() {
     const { report } = await flows.maintain(session, "manual");
     return report;
+  },
+  /** A file through putBlob and readBlob: whole, in ranges, pinned by its salt, and aborted while it streams. */
+  async file() {
+    const label = "browser-test/file/v1";
+    const content = Uint8Array.from({ length: 3 * CHUNK_SIZE + 5000 }, (_, i) => (i * 7 + Math.floor(i / CHUNK_SIZE)) % 256);
+    const { id, salt } = await flows.putBlob(session, label, content);
+    const read = async (options) => {
+      const { size, stream } = await flows.readBlob(session, label, id, options);
+      return { size, bytes: new Uint8Array(await new Response(stream).arrayBuffer()) };
+    };
+    const matches = async (from, to, options = {}) => {
+      const { size, bytes } = await read({ ...options, from, to });
+      const expected = content.subarray(from ?? 0, Math.min(to ?? content.length, content.length));
+      return size === content.length && bytes.length === expected.length && bytes.every((b, i) => b === expected[i]);
+    };
+    const ranges = [[undefined, undefined], [0, 10], [CHUNK_SIZE - 5, CHUNK_SIZE + 5], [2 * CHUNK_SIZE, undefined], [content.length - 3, content.length + 100]];
+    const controller = new AbortController();
+    const reader = (await flows.readBlob(session, label, id, { signal: controller.signal })).stream.getReader();
+    await reader.read();
+    controller.abort(new Error("next track"));
+    return {
+      ranges: await Promise.all(ranges.map(([from, to]) => matches(from, to))),
+      pinned: await matches(CHUNK_SIZE, 2 * CHUNK_SIZE, { salt }),
+      aborted: await reader.read().then(
+        () => "not aborted",
+        (e) => e.message,
+      ),
+    };
   },
 };
