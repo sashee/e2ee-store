@@ -7,11 +7,16 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
-use backend::config::{Config, DEFAULT_STATIC_CSP};
+use backend::config::{Config, DEFAULT_STATIC_CSP, Target};
+use backend::domain::BlobId;
 use backend::http::{AppState, router};
+use backend::objects::Objects;
 use backend::{accounts, db, store};
 use http_body_util::BodyExt as _;
+use serde_json::json;
 use tower::ServiceExt as _;
+
+pub mod s3;
 
 pub const PHONE: &str = "6c4b9e.localhost:24038";
 pub const LAPTOP: &str = "localhost:8080";
@@ -75,6 +80,62 @@ impl Harness {
         Self::with(|_| {})
     }
 
+    /// A harness with S3 (the stand-in) and `target`.
+    pub async fn with_s3(target: Target) -> (Self, s3::FakeS3) {
+        Self::with_s3_and(target, |_| {}).await
+    }
+
+    pub async fn with_s3_and(
+        target: Target,
+        adjust: impl FnOnce(&mut Config),
+    ) -> (Self, s3::FakeS3) {
+        let s3 = s3::FakeS3::start().await;
+        let harness = Self::with(|config| {
+            config.blob_target = target;
+            config.s3_file = Some("s3".into());
+            adjust(config);
+        });
+        let state = harness
+            .state
+            .clone()
+            .with_objects(Some(Objects::from_file(&s3.file()).unwrap()));
+        (
+            Self {
+                app: router(state.clone()),
+                state,
+                ..harness
+            },
+            s3,
+        )
+    }
+
+    /// The same database and target, with another S3 client: e.g. one that can't reach S3.
+    pub fn with_objects(self, objects: Objects) -> Self {
+        let state = self.state.clone().with_objects(Some(objects));
+        Self {
+            app: router(state.clone()),
+            state,
+            ..self
+        }
+    }
+
+    /// The same database and S3, with another target, as after a restart.
+    pub fn retarget(self, target: Target) -> Self {
+        let config = Config {
+            blob_target: target,
+            ..(*self.state.config).clone()
+        };
+        let state = AppState {
+            config: Arc::new(config),
+            ..self.state.clone()
+        };
+        Self {
+            app: router(state.clone()),
+            state,
+            ..self
+        }
+    }
+
     /// A harness whose configuration `adjust` changes first.
     pub fn with(adjust: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -96,6 +157,8 @@ impl Harness {
             session_ttl: std::time::Duration::from_secs(4 * 3600),
             reauth_window: std::time::Duration::from_secs(300),
             max_blob_size: 1024,
+            blob_target: Target::Local,
+            s3_file: None,
         };
         adjust(&mut config);
         db::open_and_migrate(&config.database).unwrap();
@@ -323,6 +386,60 @@ impl Harness {
             .unwrap();
         backend::secret::b64url(&user.id)
     }
+}
+
+// ---------------------------------------------------------------- storage requests
+
+pub async fn put_blob(h: &Harness, cookie: &str, content: &[u8]) -> Reply {
+    put_blob_with(h, cookie, content, vec![]).await
+}
+
+pub async fn put_blob_with<'a>(
+    h: &Harness,
+    cookie: &'a str,
+    content: &[u8],
+    headers: Vec<(&'a str, String)>,
+) -> Reply {
+    let id = BlobId::of(content);
+    h.send(Call {
+        cookie: Some(cookie),
+        body: content.to_vec(),
+        content_type: Some("application/octet-stream"),
+        headers,
+        ..h.call(Method::PUT, PHONE, format!("/api/v1/blobs/{id}"))
+    })
+    .await
+}
+
+pub async fn patch_blob(h: &Harness, cookie: &str, id: &BlobId, flags: serde_json::Value) -> Reply {
+    h.send(Call {
+        cookie: Some(cookie),
+        body: flags.to_string().into_bytes(),
+        content_type: Some("application/json"),
+        ..h.call(Method::PATCH, PHONE, format!("/api/v1/blobs/{id}"))
+    })
+    .await
+}
+
+pub fn offloadable(value: &str) -> Vec<(&'static str, String)> {
+    vec![("blob-offloadable", value.to_owned())]
+}
+
+pub async fn put_ref(
+    h: &Harness,
+    cookie: &str,
+    name: &str,
+    blob: &BlobId,
+    precondition: Option<(&str, String)>,
+) -> Reply {
+    h.send(Call {
+        cookie: Some(cookie),
+        body: json!({ "blob": blob.to_string() }).to_string().into_bytes(),
+        content_type: Some("application/json"),
+        headers: precondition.into_iter().collect(),
+        ..h.call(Method::PUT, PHONE, format!("/api/v1/refs/{name}"))
+    })
+    .await
 }
 
 pub fn origin_of(host: &str) -> String {

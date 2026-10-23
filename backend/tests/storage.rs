@@ -7,63 +7,6 @@ use backend::domain::BlobId;
 use common::*;
 use serde_json::json;
 
-async fn put_blob(h: &Harness, cookie: &str, content: &[u8]) -> common::Reply {
-    put_blob_with(h, cookie, content, vec![]).await
-}
-
-async fn put_blob_with<'a>(
-    h: &Harness,
-    cookie: &'a str,
-    content: &[u8],
-    headers: Vec<(&'a str, String)>,
-) -> common::Reply {
-    let id = BlobId::of(content);
-    h.send(common::Call {
-        cookie: Some(cookie),
-        body: content.to_vec(),
-        content_type: Some("application/octet-stream"),
-        headers,
-        ..h.call(Method::PUT, PHONE, format!("/api/v1/blobs/{id}"))
-    })
-    .await
-}
-
-async fn patch_blob(
-    h: &Harness,
-    cookie: &str,
-    id: &BlobId,
-    flags: serde_json::Value,
-) -> common::Reply {
-    h.send(common::Call {
-        cookie: Some(cookie),
-        body: flags.to_string().into_bytes(),
-        content_type: Some("application/json"),
-        ..h.call(Method::PATCH, PHONE, format!("/api/v1/blobs/{id}"))
-    })
-    .await
-}
-
-fn offloadable(value: &str) -> Vec<(&'static str, String)> {
-    vec![("blob-offloadable", value.to_owned())]
-}
-
-async fn put_ref(
-    h: &Harness,
-    cookie: &str,
-    name: &str,
-    blob: &BlobId,
-    precondition: Option<(&str, String)>,
-) -> common::Reply {
-    h.send(common::Call {
-        cookie: Some(cookie),
-        body: json!({ "blob": blob.to_string() }).to_string().into_bytes(),
-        content_type: Some("application/json"),
-        headers: precondition.into_iter().collect(),
-        ..h.call(Method::PUT, PHONE, format!("/api/v1/refs/{name}"))
-    })
-    .await
-}
-
 fn tag(id: &BlobId) -> String {
     format!("\"{id}\"")
 }

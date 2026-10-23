@@ -3,18 +3,22 @@
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::guard::Authed;
 use super::{ApiError, AppState, json_body, read_body, unsupported_media_type};
+use crate::config::Target;
 use crate::domain::{
     BlobId, ByteRange, etag, format_timestamp, page_limit, parse_precondition, parse_range,
     valid_ref_name,
 };
-use crate::store::{self, BlobDeletion, BlobMeta, FlagWrite, RefDeletion, RefRow, RefWrite};
+use crate::offload;
+use crate::store::{
+    self, BlobDeletion, BlobMeta, FlagWrite, RefDeletion, RefRow, RefWrite, Stored,
+};
 
 const PAGE_MAX: usize = 1000;
 
@@ -130,9 +134,15 @@ pub async fn put_blob(
     }
     let user_id = authed.session.user_id;
     let now = state.now();
-    let (created, meta) = state
-        .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, now))
-        .await?;
+    let to_s3 = offloadable && state.config.blob_target == Target::S3;
+    let (created, meta) = match state.objects.clone().filter(|_| to_s3) {
+        Some(objects) => offload::upload(&state, &objects, user_id, id, content, now).await?,
+        None => {
+            state
+                .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, None, now))
+                .await?
+        }
+    };
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -141,24 +151,45 @@ pub async fn put_blob(
     Ok((status, Json(blob_json(&meta))).into_response())
 }
 
-/// GET and HEAD (axum answers HEAD with the GET handler and drops the body).
+/// GET and HEAD (axum answers HEAD with the GET handler and drops the body). A blob in S3 streams from there
+/// (SPEC §7.4); HEAD doesn't fetch it.
 pub async fn get_blob(
     State(state): State<AppState>,
     authed: Authed,
+    method: Method,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let id = blob_id(&id)?;
     let user_id = authed.session.user_id;
     let range_header = header_str(&headers, header::RANGE).map(str::to_owned);
-    let (meta, range, body) = state
-        .db(move |c| {
+    let read = || {
+        let range_header = range_header.clone();
+        state.db(move |c| {
             store::blob_content(c, &user_id, id, |size| {
                 parse_range(range_header.as_deref(), size)
             })
         })
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    };
+    let (meta, range, content) = read().await?.ok_or_else(ApiError::not_found)?;
+    let in_s3 =
+        meta.stored == Stored::S3 && range != ByteRange::Unsatisfiable && method != Method::HEAD;
+    let (meta, range, body) = match state.objects.clone().filter(|_| in_s3) {
+        _ if !in_s3 => (meta, range, Body::from(content)),
+        None => {
+            return Err(ApiError::storage_unavailable(
+                "a blob is in S3, but S3 isn't configured",
+            ));
+        }
+        Some(objects) => match offload::read(&state, &objects, user_id, meta, range).await? {
+            Some(response) => (meta, range, Body::from_stream(response.bytes_stream())),
+            // Back in the database since it was looked up.
+            None => {
+                let (meta, range, content) = read().await?.ok_or_else(ApiError::not_found)?;
+                (meta, range, Body::from(content))
+            }
+        },
+    };
     let size = meta.size;
     let (status, content_range) = match range {
         ByteRange::Full => (StatusCode::OK, None),
@@ -182,6 +213,13 @@ pub async fn get_blob(
     };
     let mut response = (status, body).into_response();
     let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(match range {
+            ByteRange::Partial { start, end } => end - start + 1,
+            _ => size,
+        }),
+    );
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -223,16 +261,50 @@ pub async fn patch_blob(
     let id = blob_id(&id)?;
     let BlobFlags { offloadable } = json_body(&headers, body).await?;
     let user_id = authed.session.user_id;
-    match state
-        .db(move |c| store::set_offloadable(c, &user_id, id, offloadable))
-        .await?
-    {
-        FlagWrite::Written(meta) => Ok(Json(blob_json(&meta))),
-        FlagWrite::NotFound => Err(ApiError::not_found()),
-        FlagWrite::Referenced => Err(blob_offloadable(
-            "A ref points to this blob, so it can't be offloadable",
-        )),
+    // A blob in S3 comes back before it stops being offloadable. A pass can move it out again in between, so
+    // a few rounds; each ends with the flag set or an error.
+    for _ in 0..3 {
+        match state
+            .db(move |c| store::set_offloadable(c, &user_id, id, offloadable))
+            .await?
+        {
+            FlagWrite::Written(meta) => {
+                let objects = state.objects.clone();
+                if let Some(objects) =
+                    objects.filter(|_| offloadable && state.config.blob_target == Target::S3)
+                    && let Err(e) = offload::to_s3(&state, &objects, user_id, id).await
+                {
+                    tracing::warn!("blob {id} stays in the database for now: {e:?}");
+                }
+                return Ok(Json(blob_json(&meta)));
+            }
+            FlagWrite::NotFound => return Err(ApiError::not_found()),
+            FlagWrite::Referenced => {
+                return Err(blob_offloadable(
+                    "A ref points to this blob, so it can't be offloadable",
+                ));
+            }
+            FlagWrite::InS3 => {
+                let objects = state.objects.clone().ok_or_else(|| {
+                    ApiError::storage_unavailable("a blob is in S3, but S3 isn't configured")
+                })?;
+                let meta = state
+                    .db(move |c| store::blob_meta(c, &user_id, id))
+                    .await?
+                    .ok_or_else(ApiError::not_found)?;
+                if offload::to_local(&state, &objects, user_id, meta, true).await? {
+                    let meta = state
+                        .db(move |c| store::blob_meta(c, &user_id, id))
+                        .await?
+                        .ok_or_else(ApiError::not_found)?;
+                    return Ok(Json(blob_json(&meta)));
+                }
+            }
+        }
     }
+    Err(ApiError::storage_unavailable(format!(
+        "blob {id} kept moving while its flag was changed"
+    )))
 }
 
 pub async fn delete_blob(
@@ -246,7 +318,12 @@ pub async fn delete_blob(
         .db(move |c| store::delete_blob(c, &user_id, id))
         .await?
     {
-        BlobDeletion::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
+        BlobDeletion::Deleted(stored) => {
+            if let Some(objects) = state.objects.clone().filter(|_| stored == Stored::S3) {
+                offload::forget(&state, &objects, user_id, id).await;
+            }
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         BlobDeletion::NotFound => Err(ApiError::not_found()),
         BlobDeletion::Referenced => Err(ApiError::new(
             StatusCode::CONFLICT,

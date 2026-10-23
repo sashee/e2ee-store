@@ -22,6 +22,17 @@ pub struct Config {
     pub session_ttl: Duration,
     pub reauth_window: Duration,
     pub max_blob_size: u64,
+    /// Where offloadable blobs belong (SPEC §7.4).
+    pub blob_target: Target,
+    /// The S3 credential file (SPEC §10.1), read by `serve` only.
+    pub s3_file: Option<PathBuf>,
+}
+
+/// Where offloadable blobs belong: in the database, or in S3. Every other blob is in the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Local,
+    S3,
 }
 
 /// The file as written: every key optional, values still strings where they need parsing.
@@ -37,6 +48,8 @@ struct RawConfig {
     session_ttl: Option<String>,
     reauth_window: Option<String>,
     max_blob_size: Option<String>,
+    blob_target: Option<String>,
+    s3_file: Option<String>,
 }
 
 /// Reads the file (a missing file counts as empty) and applies the environment.
@@ -82,6 +95,15 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
     let max_blob_size = get("max_blob_size", raw.max_blob_size).unwrap_or_else(|| "16MiB".into());
     let static_dir =
         get("static_dir", raw.static_dir).ok_or_else(|| anyhow!("static_dir is required"))?;
+    let blob_target = match get("blob_target", raw.blob_target).as_deref() {
+        None | Some("local") => Target::Local,
+        Some("s3") => Target::S3,
+        Some(other) => bail!("blob_target: {other:?} is neither \"local\" nor \"s3\""),
+    };
+    let s3_file = get("s3_file", raw.s3_file).map(PathBuf::from);
+    if blob_target == Target::S3 && s3_file.is_none() {
+        bail!("blob_target = \"s3\" needs s3_file");
+    }
 
     Ok(Config {
         socket: get("socket", raw.socket)
@@ -98,6 +120,8 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
         reauth_window: duration("reauth_window", raw.reauth_window, "5m")?,
         max_blob_size: parse_size(&max_blob_size)
             .ok_or_else(|| anyhow!("max_blob_size: cannot parse {max_blob_size:?}"))?,
+        blob_target,
+        s3_file,
     })
 }
 
@@ -120,7 +144,32 @@ mod tests {
         assert_eq!(config.reauth_window, Duration::from_secs(300));
         assert_eq!(config.max_blob_size, 16 << 20);
         assert!(config.public_hosts.is_empty());
+        assert_eq!(config.blob_target, Target::Local);
+        assert_eq!(config.s3_file, None);
         assert!(resolve("", &env(&[])).is_err());
+    }
+
+    #[test]
+    fn the_s3_target_needs_the_s3_file() {
+        let s3 = resolve(
+            "static_dir = \"w\"\nblob_target = \"s3\"\ns3_file = \"/run/credentials/x/s3\"",
+            &env(&[]),
+        )
+        .unwrap();
+        assert_eq!(s3.blob_target, Target::S3);
+        assert_eq!(s3.s3_file, Some(PathBuf::from("/run/credentials/x/s3")));
+        assert!(resolve("static_dir = \"w\"\nblob_target = \"s3\"", &env(&[])).is_err());
+        assert!(resolve("static_dir = \"w\"\nblob_target = \"S3\"", &env(&[])).is_err());
+        let back = resolve(
+            "static_dir = \"w\"\nblob_target = \"s3\"\ns3_file = \"f\"",
+            &env(&[("BACKEND_BLOB_TARGET", "local")]),
+        )
+        .unwrap();
+        assert_eq!(
+            back.blob_target,
+            Target::Local,
+            "the environment overrides it too"
+        );
     }
 
     #[test]

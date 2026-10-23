@@ -73,6 +73,21 @@ impl ApiError {
         )
     }
 
+    /// An offloadable blob whose content S3 has lost (SPEC §7.4).
+    pub fn blob_lost() -> Self {
+        Self::new(StatusCode::GONE, "blob_lost", "The blob's content is lost")
+    }
+
+    /// S3 can't be reached; logged in full, reported without detail.
+    pub fn storage_unavailable(detail: impl Display) -> Self {
+        tracing::warn!("S3 is unavailable: {detail}");
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+            "The storage is unavailable; try again later",
+        )
+    }
+
     pub fn too_large(limit: u64) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

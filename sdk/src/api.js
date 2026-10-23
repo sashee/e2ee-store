@@ -18,6 +18,7 @@ const MESSAGES = {
   blob_referenced: "This data is still in use.",
   blob_offloadable: "The vault's root has to stay in the server's database.",
   blob_lost: "This file was stored outside the server's database, and that storage lost it.",
+  storage_unavailable: "The server's storage can't be reached right now. Try again later.",
   precondition_failed: "Someone else changed this at the same time.",
   blob_too_large: "This is too large to store.",
   unknown_host: "This address isn't served by the server.",

@@ -9,6 +9,7 @@
 #   nothing needs the network.
 # - vm: the NixOS module (./module.nix) in a VM (./tests/lib.nix), with a stand-in app on a minimal machine.
 #   An app runs the same test against its own instance.
+# - vm-s3: the same with offloading to S3: Garage behind nginx for TLS (./tests/s3.nix).
 {
   pkgs,
   backend,
@@ -91,5 +92,10 @@ in
       with subtest("the app's static files are served"):
           assert "<title>e2ee-store demo</title>" in get("/", CLIENT)
     '';
+  };
+
+  vm-s3 = import ./tests/s3.nix {
+    inherit pkgs;
+    staticDir = demoApp;
   };
 }

@@ -5,6 +5,8 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod http;
+pub mod objects;
+pub mod offload;
 pub mod passkey;
 pub mod secret;
 pub mod server;

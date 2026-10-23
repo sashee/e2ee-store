@@ -52,6 +52,15 @@ in
   The backend listens on `/run/notes/backend.sock`; only members of the `notes` group can connect, so whatever
   exposes it (`iroh-uds-listen`, a reverse proxy) joins that group. The data is in `/var/lib/notes`. Admin
   commands: `sudo notes user create alice`.
+- **Offloadable blobs in S3** (optional; backend SPEC §7.4): the S3 location and keys are one TOML file
+  (backend SPEC §10.1), kept encrypted with `systemd-creds encrypt --name=s3 - /etc/credentials/notes/s3`.
+
+  ```nix
+  services.e2ee-store.instances.notes = {
+    settings.blob_target = "s3";                       # "local" (the default) moves them back at the next start
+    s3CredentialFile = "/etc/credentials/notes/s3";
+  };
+  ```
 - **Several apps on one host:** each instance has its own users, passkeys and data. On the iroh path, give each
   app its own loopback name (`http://notes.localhost:PORT`, `http://todo.localhost:PORT`): cookies ignore the
   port, so two apps on plain `localhost` would log each other out, and each would offer the other's passkeys.

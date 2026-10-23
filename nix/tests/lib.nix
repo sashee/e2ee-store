@@ -43,6 +43,8 @@ pkgs.testers.runNixOSTest {
     ''
       NAME = "${instance}"
       SOCKET = "${cfg.socketPath}"
+      # S3 needs IP (backend SPEC §7.4); without it, only the Unix socket.
+      FAMILIES = ${if cfg.s3CredentialFile != null then ''{"AF_UNIX", "AF_INET", "AF_INET6"}'' else ''{"AF_UNIX"}''}
       STATE = f"/var/lib/{NAME}"
       CLIENT = "store-client"
 
@@ -89,7 +91,7 @@ pkgs.testers.runNixOSTest {
           assert get("/healthz", CLIENT) == "ok"
 
       with subtest("the sandbox applies and doesn't get in the way"):
-          assert prop("RestrictAddressFamilies") == "AF_UNIX", prop("RestrictAddressFamilies")
+          assert set(prop("RestrictAddressFamilies").split()) == FAMILIES, prop("RestrictAddressFamilies")
           assert prop("NoNewPrivileges") == "yes"
           assert prop("ProtectSystem") == "strict"
           assert prop("CapabilityBoundingSet") == ""

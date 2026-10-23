@@ -1,4 +1,4 @@
-//! Serving on the Unix socket (SPEC §3.1) and the background cleanup (SPEC §5.1).
+//! Serving on the Unix socket (SPEC §3.1), the background cleanup (SPEC §5.1) and the offloading pass (SPEC §7.4).
 
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -11,7 +11,8 @@ use tokio::net::UnixListener;
 use crate::config::Config;
 use crate::db;
 use crate::http::{AppState, Clock, router, system_clock};
-use crate::store;
+use crate::objects::Objects;
+use crate::{offload, store};
 
 const PURGE_EVERY: Duration = Duration::from_secs(10 * 60);
 
@@ -39,12 +40,42 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Everything before serving: S3 from `s3_file`, the migrated database, a refusal if blobs are in S3 the server can't
+/// reach (SPEC §7.4), and freed pages returnable to the file system.
+pub fn prepare(config: &Config) -> anyhow::Result<Option<Objects>> {
+    let objects = config
+        .s3_file
+        .as_ref()
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading s3_file {}", path.display()))?;
+            Objects::from_file(&text).with_context(|| format!("in s3_file {}", path.display()))
+        })
+        .transpose()?;
+    let conn = db::open_and_migrate(&config.database)?;
+    let (in_s3, recorded) = store::s3_usage(&conn)?;
+    offload::check_location(
+        in_s3,
+        recorded.as_ref(),
+        objects.as_ref().map(Objects::location),
+    )?;
+    match db::enable_incremental_vacuum(&conn) {
+        Ok(true) => tracing::info!("the database now returns freed pages to the file system"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "switching to incremental vacuum failed; trying again at the next start: {e}"
+        ),
+    }
+    Ok(objects)
+}
+
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    db::open_and_migrate(&config.database)?;
+    let objects = prepare(&config)?;
     let socket = config.socket.clone();
     let listener = bind(&socket)?;
-    let state = AppState::new(config, system_clock());
+    let state = AppState::new(config, system_clock()).with_objects(objects);
     tokio::spawn(purge_loop(state.clone(), state.clock.clone()));
+    tokio::spawn(offload_loop(state.clone()));
     tracing::info!("listening on {}", socket.display());
     let served = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -63,6 +94,15 @@ async fn purge_loop(state: AppState, clock: Clock) {
             Ok(n) => tracing::info!("purged {n} expired rows"),
             Err(e) => tracing::warn!("purge failed: {}", e.message),
         }
+    }
+}
+
+/// The first pass right away, then every hour.
+async fn offload_loop(state: AppState) {
+    let mut interval = tokio::time::interval(offload::PASS_EVERY);
+    loop {
+        interval.tick().await;
+        offload::pass(&state).await;
     }
 }
 

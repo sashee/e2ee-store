@@ -67,7 +67,7 @@ impl std::fmt::Display for Version {
 }
 
 /// The schema this binary writes.
-pub const SCHEMA_VERSION: Version = Version::new(1, 1);
+pub const SCHEMA_VERSION: Version = Version::new(1, 2);
 
 /// A new major stops every older binary from starting, so it needs a plan, not just an edit: deliver a binary that
 /// no longer depends on what the major changes first, through the pipeline, then the major. Changing this line is
@@ -93,7 +93,8 @@ struct Migration {
 ///
 /// Everything else is a major: dropping or renaming a table or column, changing a column's type, a constraint an
 /// older binary's writes could break, or a new meaning for existing data. The test is whether the previous binary
-/// would still behave correctly against the database.
+/// would still behave correctly against the database. One exception: data that only a newer binary's configuration
+/// creates may make an older binary fail loudly, never quietly wrong (1.2's blobs in S3).
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: Version::new(1, 0),
@@ -171,6 +172,23 @@ CREATE INDEX refs_by_blob ON refs(user_id, blob_id);
         version: Version::new(1, 1),
         sql: "ALTER TABLE blobs ADD COLUMN offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1));",
     },
+    // Offloadable blobs in S3 (SPEC §7.4): where each blob's content is, and which bucket they went to. Only a
+    // server configured for S3 moves blobs there. An older binary answers 500 for those, as it reads past their
+    // empty content, and leaves their objects behind when it deletes them, for the sweep.
+    Migration {
+        version: Version::new(1, 2),
+        sql: r#"
+ALTER TABLE blobs ADD COLUMN location TEXT NOT NULL DEFAULT 'local' CHECK (location IN ('local', 's3'));
+CREATE INDEX blobs_by_location ON blobs(location, offloadable);
+
+CREATE TABLE s3_location (
+  id        INTEGER PRIMARY KEY CHECK (id = 1),
+  endpoint  TEXT NOT NULL,
+  bucket    TEXT NOT NULL,
+  prefix    TEXT NOT NULL
+) STRICT;
+"#,
+    },
 ];
 
 /// A connection with the per-connection settings every caller needs. Foreign keys in particular are off
@@ -220,6 +238,32 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     tx.commit()?;
     tracing::info!("database schema migrated from {current} to {SCHEMA_VERSION}");
     Ok(())
+}
+
+/// Makes freed pages returnable to the file system (SPEC §7.4): a database from before needs one full `VACUUM` for
+/// that, run here, before serving. Not in a migration: `VACUUM` can't run in a transaction, and no binary depends on
+/// it.
+pub fn enable_incremental_vacuum(conn: &Connection) -> rusqlite::Result<bool> {
+    let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+    if mode == INCREMENTAL {
+        return Ok(false);
+    }
+    conn.pragma_update(None, "auto_vacuum", INCREMENTAL)?;
+    conn.execute_batch("VACUUM")?;
+    Ok(true)
+}
+
+const INCREMENTAL: i64 = 2;
+
+/// Returns up to `pages` free pages to the file system; → how many are still free.
+pub fn reclaim(conn: &Connection, pages: u32) -> rusqlite::Result<u64> {
+    conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages})"))?;
+    free_pages(conn)
+}
+
+pub fn free_pages(conn: &Connection) -> rusqlite::Result<u64> {
+    let free: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+    Ok(free.try_into().unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -280,9 +324,9 @@ mod tests {
         assert_eq!(foreign_keys, 1);
     }
 
-    /// The database on the host is at 1, written before versions had a minor.
+    /// The database on the host was at 1, written before versions had a minor.
     #[test]
-    fn a_1_0_database_gets_offloadable_blobs_and_still_takes_a_1_0_binarys_writes() {
+    fn a_1_0_database_is_migrated_and_still_takes_a_1_0_binarys_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backend.sqlite3");
         let conn = open(&path).unwrap();
@@ -297,16 +341,39 @@ mod tests {
         drop(conn);
 
         let conn = open_and_migrate(&path).unwrap();
-        assert_eq!(stored(&conn), 1001);
+        assert_eq!(stored(&conn), 1002);
         conn.execute(insert, [b"after".to_vec()]).unwrap();
-        let flags: Vec<i64> = conn
-            .prepare("SELECT offloadable FROM blobs ORDER BY id")
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT offloadable, location FROM blobs ORDER BY id")
             .unwrap()
-            .query_map([], |r| r.get(0))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(flags, [0, 0]);
+        assert_eq!(rows, [(0, "local".into()), (0, "local".into())]);
+    }
+
+    #[test]
+    fn freed_pages_go_back_to_the_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sqlite3");
+        let conn = open_and_migrate(&path).unwrap();
+        assert!(enable_incremental_vacuum(&conn).unwrap(), "once");
+        assert!(!enable_incremental_vacuum(&conn).unwrap());
+        let pages = |conn: &Connection| -> i64 {
+            conn.pragma_query_value(None, "page_count", |r| r.get(0))
+                .unwrap()
+        };
+        conn.execute_batch("CREATE TABLE t (x BLOB); INSERT INTO t VALUES (zeroblob(1000000));")
+            .unwrap();
+        let full = pages(&conn);
+        conn.execute_batch("UPDATE t SET x = x''").unwrap();
+        assert!(reclaim(&conn, 100).unwrap() > 0, "a step at a time");
+        while reclaim(&conn, 100).unwrap() > 0 {}
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        assert!(pages(&conn) < full / 10, "{} of {full} pages", pages(&conn));
+        assert!(std::fs::metadata(&path).unwrap().len() < 200_000);
     }
 
     #[test]

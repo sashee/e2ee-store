@@ -22,6 +22,8 @@ use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::db;
+use crate::objects::Objects;
+use crate::offload::KeyLocks;
 pub use error::ApiError;
 pub use guard::{cookie_value, session_cookie};
 
@@ -43,6 +45,10 @@ pub fn system_clock() -> Clock {
 pub struct AppState {
     pub config: Arc<Config>,
     pub clock: Clock,
+    /// S3, when the server has an `s3_file` (SPEC §7.4).
+    pub objects: Option<Arc<Objects>>,
+    /// One writer at a time per S3 object (offload.rs).
+    pub moving: Arc<KeyLocks>,
 }
 
 impl AppState {
@@ -50,6 +56,15 @@ impl AppState {
         Self {
             config: Arc::new(config),
             clock,
+            objects: None,
+            moving: Arc::default(),
+        }
+    }
+
+    pub fn with_objects(self, objects: Option<Objects>) -> Self {
+        Self {
+            objects: objects.map(Arc::new),
+            ..self
         }
     }
 
