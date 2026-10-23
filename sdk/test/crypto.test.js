@@ -2,8 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { aesGcmDecrypt, aesGcmEncrypt, b64urlDecode, b64urlEncode, DecryptError, hexDecode, hexEncode, hkdfAesKey, sha256Hex, te } from "../src/crypto.js";
-import { contentKey, openDocument } from "../src/envelope.js";
-import { seal } from "../src/stream.js";
 import { WrongKeyError, unwrap, wrap } from "../src/keys.js";
 import { labels } from "../src/labels.js";
 
@@ -40,16 +38,6 @@ test("tampering with the nonce, ciphertext or AAD fails", async () => {
   await assert.rejects(aesGcmDecrypt(key, flip(nonce, 0), ciphertext, aad), DecryptError);
   await assert.rejects(aesGcmDecrypt(key, nonce, flip(ciphertext, 3), aad), DecryptError);
   await assert.rejects(aesGcmDecrypt(key, nonce, ciphertext, te.encode("other")), DecryptError);
-});
-
-test("a vault document of the layout before the tree opens only with its key and label (transitional)", async () => {
-  const key = await contentKey(L, new Uint8Array(32).fill(7));
-  const doc = { format: "test-app/vault", entries: [{ title: "ü" }] };
-  const blob = await seal(key, L.vault, te.encode(JSON.stringify(doc)));
-  assert.deepEqual(await openDocument(key, L.vault, blob), doc);
-  await assert.rejects(openDocument(await contentKey(L, new Uint8Array(32)), L.vault, blob), DecryptError);
-  await assert.rejects(openDocument(key, "test-app/other/v1", blob), DecryptError, "the label names the kind of blob");
-  await assert.rejects(openDocument(await contentKey(labels("other-app"), new Uint8Array(32).fill(7)), L.vault, blob), DecryptError, "another app's content key");
 });
 
 test("keyslots unwrap only with the right secret and kind", async () => {
@@ -103,9 +91,8 @@ test("labels are derived from the namespace, which must be a plain name", () => 
     stream: "notes/stream/v1",
     dir: "notes/dir/v1",
     file: "notes/file/v1",
-    vault: "notes/vault/v1",
     stateId: "notes/device-state-id/v1",
   });
-  for (const ok of ["1", "my-app", "a.b_c-d", "x".repeat(64)]) assert.equal(labels(ok).vault, `${ok}/vault/v1`);
+  for (const ok of ["1", "my-app", "a.b_c-d", "x".repeat(64)]) assert.equal(labels(ok).dir, `${ok}/dir/v1`);
   for (const bad of ["", "Notes", "a/b", "-x", ".x", "x".repeat(65), undefined]) assert.throws(() => labels(bad), /namespace/, String(bad));
 });

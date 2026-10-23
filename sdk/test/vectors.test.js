@@ -1,5 +1,5 @@
 // Data made by make-vectors.mjs from the SPEC without the SDK must open forever (SPEC §2): keys of version 1, a root
-// directory and the file it lists; transitional, a vault document of the layout before the tree.
+// directory and the file it lists.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,15 +18,15 @@ const L = labels(v.namespace);
 const flows = makeFlows({ labels: L });
 const content = Uint8Array.from({ length: v.file.length }, (_, i) => i % 251);
 
-/** The fake backend with the vectors' blobs (`vault` the root, or another), and an authenticator holding the vectors' passkey. */
-function stored({ vault = v.rootBlobId } = {}) {
+/** The fake backend with the vectors' blobs, and an authenticator holding the vectors' passkey. */
+function stored() {
   const { server, authenticator } = install();
   const file = streamBlob({ masterKey: Buffer.from(v.masterKey, "hex"), namespace: v.namespace, label: v.file.label, salt: Buffer.from(v.file.salt, "hex"), plaintext: content });
   assert.equal(sha256(file), v.file.blobId, "reference.mjs still makes the vector's file blob");
-  const ids = [v.keysBlob, v.rootBlob, v.vaultBlob].map((blob) => server.put(Buffer.from(blob, "base64")));
-  assert.deepEqual([...ids, server.put(file)], [v.keysBlobId, v.rootBlobId, v.vaultBlobId, v.file.blobId], "the vectors are intact");
+  const ids = [v.keysBlob, v.rootBlob].map((blob) => server.put(Buffer.from(blob, "base64")));
+  assert.deepEqual([...ids, server.put(file)], [v.keysBlobId, v.rootBlobId, v.file.blobId], "the vectors are intact");
   server.refs.set("keys", v.keysBlobId);
-  server.refs.set("vault", vault);
+  server.refs.set("vault", v.rootBlobId);
   server.passkeys.set(v.credentialId, { name: "Vectors" });
   authenticator.add(v.credentialId, (input) => {
     assert.equal(new TextDecoder().decode(input), v.prfInput, "the PRF input");
@@ -71,9 +71,3 @@ test("the file the root lists reads whole and in ranges", async () => {
   assert.deepEqual(await read({ from: 65000, to: 66000 }), { size: v.file.length, bytes: content.subarray(65000, 66000) });
 });
 
-test("a vault document of the layout before the tree opens for the upgrade (transitional)", async () => {
-  stored({ vault: v.vaultBlobId });
-  const { session } = await flows.unlockWithPasskey();
-  assert.equal(session.root, null);
-  assert.deepEqual(session.legacy, { doc: v.vaultDocument, blobId: v.vaultBlobId });
-});

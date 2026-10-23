@@ -40,7 +40,6 @@ Every HKDF info, AAD, the PRF input and the keys format start with the app's nam
 | `stream`         | `<ns>/stream/v1` |
 | `dir`            | `<ns>/dir/v1` |
 | `file`           | `<ns>/file/v1` |
-| `vault`          | `<ns>/vault/v1`: transitional, the vault document of the layout before the tree (§6.13) |
 | `stateId`        | `<ns>/device-state-id/v1` |
 
 - **Fixed forever:** every key and blob of an existing vault is bound to the labels. An app must never change its namespace; a test should pin it against data written by an earlier version.
@@ -312,7 +311,6 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 0. **Check before deleting anything.** Stop, deleting nothing, if:
    - either ref is missing
-   - the vault is still in the layout before the tree (transitional, §6.13)
    - the server's current root or keys document is from a newer version
    - the server's root is older than this session's (the app also doesn't run it while a rollback warning is shown)
    - any listed blob ID isn't 64 hex characters (IDs go into URLs)
@@ -350,20 +348,6 @@ An automatic run that failed is due again at the next unlock.
 - **`CHUNK_SIZE`** (64 KiB, from `blobs.js`) is the plaintext in a chunk: the unit worth fetching.
 - **Caching:** directories never change, so a session keeps the ones it has read or written in memory, by ID. Browsing doesn't fetch a directory twice, and a save that runs again after a conflict doesn't either.
 
-### 6.13 Upgrading a vault from the layout before the tree (transitional)
-
-Before the tree, the `vault` ref pointed at the app's own vault document: its UTF-8 JSON in a blob of the stream format with `labels.vault`, with whatever history the app kept listed inside it.
-
-- **Opening:** a vault blob that doesn't open as a root directory is tried as such a document. The session then has `root: null` and `legacy: { doc, blobId }`, and `save`, `list` and `maintain` refuse it.
-- **`upgradeVault(session, convert) → session`:**
-  - `convert(doc, openOld)` gets the old document, and `openOld(blobId)` opens other documents of that layout (e.g. the history it lists).
-  - It returns `{ revision, steps }`: the new root's revision, which should continue from the old document's so devices see no rollback, and the steps that build the tree from an empty root.
-
-  The steps run on an empty root at `revision − 1`, and the result is committed as a save does it. The new root is then checked to open as it was written, uploaded, and written with `PUT vault` and `If-Match` on the old blob.
-- **Nothing changes before that `PUT`.** After a conflict, the session is returned as it was, and the next unlock tries again. A session whose keys are from a newer version is left as it is.
-- **The old blobs** are no longer referenced, and cleanup deletes them once they are past the grace period.
-- Once every vault is upgraded, this layout, `labels.vault`, `legacy` and `upgradeVault` go.
-
 ## 7. Modules
 
 Plain ES modules with no dependencies and no build step. An app copies `src/` into its static files (the Nix package has it at `share/e2ee-store/sdk`) and imports the modules by relative path; the backend's CSP (`script-src 'self'`) rules out import maps.
@@ -371,14 +355,14 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | Module            | Contents |
 |-------------------|----------|
 | `labels.js`       | `labels(namespace)` (§2) |
-| `flows.js`        | `makeFlows({ labels })` (§6): unlock, create, `save`, `list`, `read`, passkey slots, recovery key, maintenance; transitional: `upgradeVault` |
+| `flows.js`        | `makeFlows({ labels })` (§6): unlock, create, `save`, `list`, `read`, passkey slots, recovery key, maintenance |
 | `tree.js`         | The tree (§5, §6.4): its formats and names, transactions, commits, `TreeError`, `validName`, and what a root reaches |
 | `blobs.js`        | Uploading and reading encrypted blobs over the API, and `CHUNK_SIZE` (§6.12) |
 | `stream.js`       | The blob format (§3.2): sealing, opening, and its layout |
 | `api.js`          | The backend client: errors with fixed messages, hash-checked blobs, ranges, compare-and-swap refs, the 401 handler |
 | `passkeys.js`     | WebAuthn ceremonies with PRF; `UserFacingError` |
 | `crypto.js`       | HKDF, AES-GCM, SHA-256, base64url, hex |
-| `envelope.js`     | The content key; transitional: the reader of the vault document before the tree (§6.13) |
+| `envelope.js`     | The content key (§3.1) |
 | `keys.js`         | The keys document, wrap/unwrap, operations (§3.3) |
 | `save.js`         | `saveWithRetry` (I/O passed in), `RollbackError`, `rollbackCheck` (§6.4, §6.5) |
 | `maintenance.js`  | The cleanup plan, report and schedule (§6.11) |
@@ -420,8 +404,8 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - **Keys documents:** validation; every operation; `version > 1` is read-only; another app's keys document is refused.
   - **Saving:** retries on conflict, gives up after 5, sync and async operations, rollback.
   - **Recovery key, setup links, maintenance:** parsing, the plan with its grace period, the report, the schedule.
-- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, cleanup by reachability, a server that misbehaves, and the upgrade from the layout before the tree.
-- **Format vectors:** `test/vectors.json` holds a keys blob of version 1, a root directory listing a file blob of two chunks (the file's recipe and ID), and a vault document of the layout before the tree. `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
+- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, cleanup by reachability, and a server that misbehaves.
+- **Format vectors:** `test/vectors.json` holds a keys blob of version 1, and a root directory listing a file blob of two chunks (the file's recipe and ID). `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
 - **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows and a file in the tree with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
   - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.

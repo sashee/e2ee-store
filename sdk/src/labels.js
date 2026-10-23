@@ -12,8 +12,6 @@ export function labels(namespace) {
     stream: `${namespace}/stream/v1`,
     dir: `${namespace}/dir/v1`,
     file: `${namespace}/file/v1`,
-    /** Transitional: the vault document of the layout before the tree (SPEC §6.13). */
-    vault: `${namespace}/vault/v1`,
     stateId: `${namespace}/device-state-id/v1`,
   };
 }

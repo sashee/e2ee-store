@@ -60,7 +60,7 @@ test("a blob opens only with its key and label, and with its own salt when one i
   const blob = await seal(root, FILE, data(100));
   await assert.rejects(open(await contentKey(L, new Uint8Array(32)), FILE, blob), DecryptError, "another master key");
   await assert.rejects(open(await contentKey(labels("other-app"), masterKey), FILE, blob), DecryptError, "another app");
-  await assert.rejects(open(root, L.vault, blob), DecryptError, "another kind");
+  await assert.rejects(open(root, L.dir, blob), DecryptError, "another kind");
   assert.deepEqual(await open(root, FILE, blob, blob.subarray(0, 16)), data(100));
   await assert.rejects(open(root, FILE, blob, new Uint8Array(16)), DecryptError, "another salt");
 });

@@ -1,6 +1,6 @@
-// Writes vectors.json: a keys blob, a root directory listing a file blob of two chunks (only its recipe and ID are
-// stored), and a vault document of the layout before the tree, built from SPEC.md §2–§5 with node:crypto alone
-// (reference.mjs), not with the SDK, from fixed keys, nonces and salts.
+// Writes vectors.json: a keys blob, and a root directory listing a file blob of two chunks (only its recipe and ID are
+// stored), built from SPEC.md §2–§5 with node:crypto alone (reference.mjs), not with the SDK, from fixed keys, nonces
+// and salts.
 // vectors.test.js checks that the SDK opens them, so a change to a format (labels, HKDF, padding, layout) can't go
 // unnoticed: data written today must open forever (SPEC §2). The output never changes; rerunning this is only for
 // reading how the vectors were made.
@@ -33,10 +33,6 @@ const keys = {
 };
 const keysBlob = Buffer.from(JSON.stringify(keys));
 
-const vaultDocument = { format: "test-vectors/notes", revision: 7, notes: ["plain", "ü", "📝"] };
-// §6.13, transitional: the vault document of the layout before the tree.
-const vaultBlob = streamBlob({ masterKey, namespace, label: `${namespace}/vault/v1`, salt: filled(16, 0x05), plaintext: Buffer.from(JSON.stringify(vaultDocument)) });
-
 // §3.2: a file of 70,000 bytes, byte i being i mod 251: a full chunk and one of 8192 padded bytes. Only its ID is
 // stored; the test makes it again with reference.mjs.
 const file = { label: `${namespace}/file/v1`, salt: filled(16, 0x06).toString("hex"), length: 70000 };
@@ -61,9 +57,6 @@ const vectors = {
   stateId: hkdf(masterKey, `${namespace}/device-state-id/v1`, 16).toString("hex"),
   keysBlobId: sha256(keysBlob),
   keysBlob: keysBlob.toString("base64"),
-  vaultBlobId: sha256(vaultBlob),
-  vaultBlob: vaultBlob.toString("base64"),
-  vaultDocument,
   file: { ...file, blobId: sha256(fileBlob) },
   root,
   rootBlobId: sha256(rootBlob),

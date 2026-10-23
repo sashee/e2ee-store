@@ -4,15 +4,14 @@
 // labels.js.
 //
 // A session is { masterKey, contentKey, stateId, keys: { doc, blobId, writable }, user, root }, where `root` is the
-// loaded root directory: { version, revision, entries, blobId, writable }. Transitional: a vault of the layout before
-// the tree opens with `root: null` and `legacy: { doc, blobId }`, for `upgradeVault` (SPEC §6.13).
+// loaded root directory: { version, revision, entries, blobId, writable }.
 
 import * as api from "./api.js";
 import * as encrypted from "./blobs.js";
 import * as passkeys from "./passkeys.js";
 import { UserFacingError } from "./passkeys.js";
-import { DecryptError, hexEncode, hkdfBytes, randomBytes, td, te } from "./crypto.js";
-import { contentKey as deriveContentKey, openDocument } from "./envelope.js";
+import { hexEncode, hkdfBytes, randomBytes, td, te } from "./crypto.js";
+import { contentKey as deriveContentKey } from "./envelope.js";
 import { decodeKeys, emptyKeys, encodeKeys, removePasskey, setPasskey, setRecovery, unwrap, WrongKeyError, wrap } from "./keys.js";
 import { makeReport, planBlobs, prunableSlots } from "./maintenance.js";
 import { generateRecoveryKey } from "./recovery-key.js";
@@ -149,29 +148,14 @@ export function makeFlows({ labels }) {
     };
   }
 
-  /** The vault blob's root directory; transitional (SPEC §6.13): or a vault document of the layout before the tree. */
-  async function openVaultBlob(contentKey, data) {
-    try {
-      return { root: tree.parseDir(td.decode(await stream.open(contentKey, labels.dir, data)), { root: true }) };
-    } catch (error) {
-      if (!(error instanceof DecryptError)) throw new api.IntegrityError(`the vault isn't a directory (${error.message})`);
-    }
-    try {
-      return { legacy: await openDocument(contentKey, labels.vault, data) };
-    } catch (error) {
-      throw new api.IntegrityError(`the vault doesn't decrypt (${error.message})`);
-    }
-  }
-
+  /** The vault blob's root directory, decrypted and checked. */
   async function openRoot(contentKey, data) {
-    const opened = await openVaultBlob(contentKey, data);
-    if (!opened.root) throw new api.IntegrityError("the vault is in the layout before the tree");
-    return opened.root;
+    try {
+      return tree.parseDir(td.decode(await stream.open(contentKey, labels.dir, data)), { root: true });
+    } catch (error) {
+      throw new api.IntegrityError(`the vault doesn't decrypt to a directory (${error.message})`);
+    }
   }
-
-  const notLegacy = (session) => {
-    if (session.legacy) throw new UserFacingError("This vault has to be upgraded before it can be used.");
-  };
 
   /**
    * What this device remembers about the vault (the highest revision seen, the last cleanup) is filed under
@@ -189,10 +173,8 @@ export function makeFlows({ labels }) {
     const opened = { masterKey, contentKey, stateId: await deriveStateId(masterKey), keys, user: await api.me() };
     const blobId = await api.getRef("vault");
     if (blobId) {
-      const vault = await openVaultBlob(contentKey, await api.getBlob(blobId));
-      if (vault.legacy) return { ...opened, root: null, legacy: { doc: vault.legacy, blobId } };
-      remember(contentKey, blobId, vault.root);
-      return { ...opened, root: { ...vault.root, blobId, writable: tree.writable(vault.root) && keys.writable } };
+      const root = remember(contentKey, blobId, await openRoot(contentKey, await api.getBlob(blobId)));
+      return { ...opened, root: { ...root, blobId, writable: tree.writable(root) && keys.writable } };
     }
     if (!keys.writable) throw new UserFacingError("This vault was created by a newer version of the app; update this one to open it.");
     const root = tree.emptyRoot(1);
@@ -315,7 +297,6 @@ export function makeFlows({ labels }) {
       const keysId = await api.getRef("keys");
       const vaultId = await api.getRef("vault");
       if (!keysId || !vaultId) throw new Error("The keys or the vault are missing on the server, so nothing was deleted.");
-      if (current.legacy) throw new Error("The vault has to be upgraded first, so nothing was deleted.");
       const vault = vaultId === current.root.blobId ? rootDoc(current.root) : await openRoot(current.contentKey, await api.getBlob(vaultId));
       if (!(await keysWritable(current, keysId)) || !tree.writable(vault)) throw new Error("The vault was written by a newer version of the app, so nothing was deleted.");
       if (vault.revision < current.root.revision) throw new Error("The server returned an older vault than this session's, so nothing was deleted.");
@@ -420,7 +401,6 @@ export function makeFlows({ labels }) {
    * uploads; `signal` aborts them, and the save, until the ref moves. → { session }
    */
   async function save(session, steps, { signal, onProgress = () => {} } = {}) {
-    notLegacy(session);
     checkSteps(steps);
     if (!session.root.writable) throw new UserFacingError("This vault was written by a newer version of the app; it's read-only here.");
     signal?.throwIfAborted();
@@ -467,7 +447,6 @@ export function makeFlows({ labels }) {
 
   /** The entries of the directory at `path` ([] is the root), sorted by name (SPEC §6.12). */
   function list(session, path) {
-    notLegacy(session);
     return tree.begin(rootDoc(session.root), treeIO(session), now()).list(path);
   }
 
@@ -475,32 +454,6 @@ export function makeFlows({ labels }) {
   function read(session, ref, options = {}) {
     if (typeof ref?.id !== "string" || typeof ref?.salt !== "string") throw new TypeError("A file's ref has an id and a salt: an entry from list, or one saved earlier");
     return encrypted.readBlob(session.contentKey, labels.file, ref.id, { ...options, salt: ref.salt });
-  }
-
-  /**
-   * Transitional (SPEC §6.13): rewrites a vault of the layout before the tree as a tree, as one save. `convert(doc,
-   * openOld)` gets the old vault document, and `openOld(blobId)` opens other documents of that layout (e.g. its
-   * history). It returns { revision, steps }: the new root's revision, and the steps that build the tree from an empty
-   * one. The new root must open as written before the ref moves. No retry: after a conflict nothing has changed, and
-   * the next unlock tries again. A vault already a tree, or with keys from a newer version, stays as it is. → session
-   */
-  async function upgradeVault(session, convert) {
-    if (!session.legacy || !session.keys.writable) return session;
-    const openOld = async (blobId) => openDocument(session.contentKey, labels.vault, await api.getBlob(api.checkBlobId(blobId)));
-    const { revision, steps } = await convert(session.legacy.doc, openOld);
-    if (!Number.isInteger(revision) || revision < 1) throw new TypeError("The upgraded root's revision is an integer from 1 up");
-    checkSteps(steps);
-    const treeIo = treeIO(session);
-    const root = await (await committed(tree.emptyRoot(revision - 1), steps, treeIo)).root();
-    const sealed = await sealDir(session.contentKey, root);
-    if (JSON.stringify(await openRoot(session.contentKey, sealed)) !== JSON.stringify(root)) {
-      throw new Error("The upgraded vault doesn't open as it was written; nothing was changed.");
-    }
-    const blobId = await api.putBlob(sealed);
-    if (!(await api.putRef("vault", blobId, session.legacy.blobId)).ok) return session;
-    remember(session.contentKey, blobId, root);
-    const { legacy: _legacy, ...upgraded } = session;
-    return { ...upgraded, root: { ...root, blobId, writable: true } };
   }
 
   return {
@@ -521,6 +474,5 @@ export function makeFlows({ labels }) {
     save,
     list,
     read,
-    upgradeVault,
   };
 }

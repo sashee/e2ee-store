@@ -64,7 +64,7 @@ export function layoutOf(size) {
 
 const encrypt = async (key, iv, plaintext) => (await aesGcmEncrypt(key, plaintext, NO_AAD, iv)).ciphertext;
 
-/** Encrypts `plaintext` as a blob of kind `label` (an HKDF info, e.g. `labels.vault`), under a fresh salt. */
+/** Encrypts `plaintext` as a blob of kind `label` (an HKDF info, e.g. `labels.dir`), under a fresh salt. */
 export async function seal(rootKey, label, plaintext) {
   const salt = randomBytes(SALT);
   const key = await hkdfSaltedAesKey(rootKey, salt, label);
