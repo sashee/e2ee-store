@@ -14,7 +14,7 @@ use crate::domain::{
     BlobId, ByteRange, etag, format_timestamp, page_limit, parse_precondition, parse_range,
     valid_ref_name,
 };
-use crate::store::{self, BlobDeletion, BlobMeta, RefDeletion, RefRow, RefWrite};
+use crate::store::{self, BlobDeletion, BlobMeta, FlagWrite, RefDeletion, RefRow, RefWrite};
 
 const PAGE_MAX: usize = 1000;
 
@@ -30,7 +30,12 @@ fn ref_name(name: &str) -> Result<String, ApiError> {
 }
 
 fn blob_json(meta: &BlobMeta) -> Value {
-    json!({ "id": meta.id.to_string(), "size": meta.size, "created_at": format_timestamp(meta.created_at) })
+    json!({
+        "id": meta.id.to_string(),
+        "size": meta.size,
+        "created_at": format_timestamp(meta.created_at),
+        "offloadable": meta.offloadable,
+    })
 }
 
 fn ref_json(row: &RefRow) -> Value {
@@ -59,6 +64,21 @@ fn paginate<T, K>(mut items: Vec<T>, limit: usize, key: impl Fn(&T) -> K) -> (Ve
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// `Blob-Offloadable: true|false` on an upload; without it, a new blob isn't offloadable.
+fn offloadable_header(headers: &HeaderMap) -> Result<bool, ApiError> {
+    match headers.get("blob-offloadable").map(HeaderValue::as_bytes) {
+        None | Some(b"false") => Ok(false),
+        Some(b"true") => Ok(true),
+        Some(_) => Err(ApiError::bad_request(
+            "Blob-Offloadable is either true or false",
+        )),
+    }
+}
+
+fn blob_offloadable(message: &str) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "blob_offloadable", message)
 }
 
 // ---------------------------------------------------------------- blobs
@@ -94,6 +114,7 @@ pub async fn put_blob(
     body: Body,
 ) -> Result<Response, ApiError> {
     let id = blob_id(&id)?;
+    let offloadable = offloadable_header(&headers)?;
     let is_octet_stream = header_str(&headers, header::CONTENT_TYPE)
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/octet-stream"));
     if !is_octet_stream {
@@ -110,7 +131,7 @@ pub async fn put_blob(
     let user_id = authed.session.user_id;
     let now = state.now();
     let (created, meta) = state
-        .db(move |c| store::put_blob(c, &user_id, id, &content, now))
+        .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, now))
         .await?;
     let status = if created {
         StatusCode::CREATED
@@ -185,6 +206,33 @@ pub async fn get_blob(
         );
     }
     Ok(response)
+}
+
+#[derive(Deserialize)]
+struct BlobFlags {
+    offloadable: bool,
+}
+
+pub async fn patch_blob(
+    State(state): State<AppState>,
+    authed: Authed,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    let id = blob_id(&id)?;
+    let BlobFlags { offloadable } = json_body(&headers, body).await?;
+    let user_id = authed.session.user_id;
+    match state
+        .db(move |c| store::set_offloadable(c, &user_id, id, offloadable))
+        .await?
+    {
+        FlagWrite::Written(meta) => Ok(Json(blob_json(&meta))),
+        FlagWrite::NotFound => Err(ApiError::not_found()),
+        FlagWrite::Referenced => Err(blob_offloadable(
+            "A ref points to this blob, so it can't be offloadable",
+        )),
+    }
 }
 
 pub async fn delete_blob(
@@ -288,6 +336,9 @@ pub async fn put_ref(
             StatusCode::CONFLICT,
             "blob_not_found",
             "The target blob doesn't exist",
+        )),
+        RefWrite::BlobOffloadable => Err(blob_offloadable(
+            "The target blob is offloadable, so a ref can't point to it",
         )),
     }
 }

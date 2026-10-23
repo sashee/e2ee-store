@@ -1,7 +1,7 @@
 // Stand-ins for what surrounds the SDK in a browser, so the flows run under `node --test`:
 //
 // - the backend behind `fetch`: blobs, refs, passkeys and a session, with the behaviour of backend/SPEC.md §7–§8
-//   that the SDK relies on (compare-and-swap refs, hash-checked uploads, ranges, step-up). Passkeys belong to ALICE unless
+//   that the SDK relies on (compare-and-swap refs, hash-checked uploads, ranges, step-up, offloadable blobs). Passkeys belong to ALICE unless
 //   they name another user; the storage is ALICE's whoever logs in.
 // - a platform authenticator with PRF behind `navigator.credentials`
 //
@@ -28,7 +28,7 @@ export function fakeServer() {
     /** { user (ALICE if not set), passkey: credential ID or null for a setup-token session, fresh: within the step-up window } */
     session: null,
     passkeys: new Map(), // credential ID → { name, user (ALICE if not set) }
-    blobs: new Map(), // blob ID → { bytes, created_at }
+    blobs: new Map(), // blob ID → { bytes, created_at, offloadable }
     refs: new Map(), // ref name → blob ID
     challenges: new Set(),
     /** Every request: { method, path, json, range, signal }. */
@@ -43,11 +43,13 @@ export function fakeServer() {
     beforeRefWrite: (_name) => {},
     /** Blob IDs whose deletion fails with a 500. */
     failingDeletes: new Set(),
+    /** Blob IDs whose content the server has lost: reads get 410 `blob_lost`. */
+    lost: new Set(),
 
-    /** Stores a blob as if uploaded now; returns its ID. */
-    put(bytes) {
+    /** Stores a blob as if uploaded now; returns its ID. An existing blob keeps its flag. */
+    put(bytes, { offloadable = false } = {}) {
       const id = sha256Hex(bytes);
-      if (!server.blobs.has(id)) server.blobs.set(id, { bytes: new Uint8Array(bytes), created_at: server.now });
+      if (!server.blobs.has(id)) server.blobs.set(id, { bytes: new Uint8Array(bytes), created_at: server.now, offloadable });
       return id;
     },
     /** The bytes a ref points to. */
@@ -89,6 +91,7 @@ export function fakeServer() {
   function getBlob({ match, headers, signal }) {
     const blob = server.blobs.get(match[1]);
     if (!blob) return error(404, "not_found");
+    if (server.lost.has(match[1])) return error(410, "blob_lost");
     const size = blob.bytes.length;
     const range = server.ignoresRanges ? "full" : byteRange(headers.Range, size);
     const date = server.sendsDate ? { date: new Date(server.now).toUTCString() } : {};
@@ -105,6 +108,12 @@ export function fakeServer() {
       headers: { ...date, "content-length": String(end + 1 - start), ...(partial ? { "content-range": `bytes ${start}-${end}/${size}` } : {}) },
     });
   }
+
+  const meta = (id) => {
+    const { bytes, created_at, offloadable } = server.blobs.get(id);
+    return { id, size: bytes.length, created_at: iso(created_at), offloadable };
+  };
+  const referenced = (id) => [...server.refs.values()].includes(id);
 
   const authed = (handler) => (request) => (server.session ? handler(request) : error(401, "unauthenticated"));
   const fresh = (handler) => authed((request) => (server.session.fresh ? handler(request) : error(403, "reauth_required")));
@@ -206,28 +215,41 @@ export function fakeServer() {
         const after = query.get("after");
         const ids = [...server.blobs.keys()].sort().filter((id) => !after || id > after);
         const page = ids.slice(0, server.pageSize);
-        const meta = (id) => ({ id, size: server.blobs.get(id).bytes.length, created_at: iso(server.blobs.get(id).created_at) });
         return reply(200, { blobs: page.map(meta), next: ids.length > page.length ? page.at(-1) : null });
       }),
     ],
     [
       "PUT",
       /^\/blobs\/([0-9a-f]{64})$/,
-      authed(({ match, body }) => {
+      authed(({ match, body, headers }) => {
+        const flag = headers["Blob-Offloadable"];
+        if (![undefined, "true", "false"].includes(flag)) return error(400, "bad_request");
         if (body.length > server.maxBlobSize) return error(413, "blob_too_large");
         if (sha256Hex(body) !== match[1]) return error(400, "hash_mismatch");
         const created = !server.blobs.has(match[1]);
-        server.put(body);
-        return reply(created ? 201 : 200, { id: match[1], size: body.length, created_at: iso(server.blobs.get(match[1]).created_at) });
+        server.put(body, { offloadable: flag === "true" });
+        return reply(created ? 201 : 200, meta(match[1]));
       }),
     ],
     ["GET", /^\/blobs\/([0-9a-f]{64})$/, authed(getBlob)],
+    [
+      "PATCH",
+      /^\/blobs\/([0-9a-f]{64})$/,
+      authed(({ match, json }) => {
+        const blob = server.blobs.get(match[1]);
+        if (typeof json?.offloadable !== "boolean") return error(400, "bad_request");
+        if (!blob) return error(404, "not_found");
+        if (json.offloadable && referenced(match[1])) return error(409, "blob_offloadable");
+        blob.offloadable = json.offloadable;
+        return reply(200, meta(match[1]));
+      }),
+    ],
     [
       "DELETE",
       /^\/blobs\/([0-9a-f]{64})$/,
       authed(({ match }) => {
         const id = match[1];
-        if ([...server.refs.values()].includes(id)) return error(409, "blob_referenced");
+        if (referenced(id)) return error(409, "blob_referenced");
         if (server.failingDeletes.has(id)) return error(500, "internal");
         return server.blobs.delete(id) ? reply(204) : error(404, "not_found");
       }),
@@ -244,6 +266,7 @@ export function fakeServer() {
         const holds = headers["If-None-Match"] === "*" ? current === null : ifMatch === undefined || ifMatch === `"${current}"`;
         if (!holds) return reply(412, { error: "precondition_failed", message: "server says: precondition_failed", current });
         if (!server.blobs.has(json.blob)) return error(409, "blob_not_found");
+        if (server.blobs.get(json.blob).offloadable) return error(409, "blob_offloadable");
         server.refs.set(name, json.blob);
         return reply(current === null ? 201 : 200, { name, blob: json.blob });
       }),

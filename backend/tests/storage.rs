@@ -8,14 +8,43 @@ use common::*;
 use serde_json::json;
 
 async fn put_blob(h: &Harness, cookie: &str, content: &[u8]) -> common::Reply {
+    put_blob_with(h, cookie, content, vec![]).await
+}
+
+async fn put_blob_with<'a>(
+    h: &Harness,
+    cookie: &'a str,
+    content: &[u8],
+    headers: Vec<(&'a str, String)>,
+) -> common::Reply {
     let id = BlobId::of(content);
     h.send(common::Call {
         cookie: Some(cookie),
         body: content.to_vec(),
         content_type: Some("application/octet-stream"),
+        headers,
         ..h.call(Method::PUT, PHONE, format!("/api/v1/blobs/{id}"))
     })
     .await
+}
+
+async fn patch_blob(
+    h: &Harness,
+    cookie: &str,
+    id: &BlobId,
+    flags: serde_json::Value,
+) -> common::Reply {
+    h.send(common::Call {
+        cookie: Some(cookie),
+        body: flags.to_string().into_bytes(),
+        content_type: Some("application/json"),
+        ..h.call(Method::PATCH, PHONE, format!("/api/v1/blobs/{id}"))
+    })
+    .await
+}
+
+fn offloadable(value: &str) -> Vec<(&'static str, String)> {
+    vec![("blob-offloadable", value.to_owned())]
 }
 
 async fn put_ref(
@@ -50,7 +79,7 @@ async fn blobs_round_trip_with_ranges() {
     assert_eq!(created.status, StatusCode::CREATED);
     assert_eq!(
         created.json(),
-        json!({ "id": id.to_string(), "size": 10, "created_at": "2026-10-09T20:57:00.000Z" })
+        json!({ "id": id.to_string(), "size": 10, "created_at": "2026-10-09T20:57:00.000Z", "offloadable": false })
     );
     h.advance(1000);
     let again = put_blob(&h, &cookie, content).await;
@@ -217,6 +246,171 @@ async fn blobs_are_listed_in_pages() {
         .json();
     assert_eq!(last["blobs"].as_array().unwrap().len(), 1);
     assert_eq!(last["next"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn blobs_are_flagged_offloadable_on_upload_or_later() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let a = BlobId::of(b"a");
+    let b = BlobId::of(b"b");
+
+    let flagged = put_blob_with(&h, &cookie, b"a", offloadable("true")).await;
+    assert_eq!(flagged.status, StatusCode::CREATED);
+    assert_eq!(flagged.json()["offloadable"], true);
+    let again = put_blob_with(&h, &cookie, b"a", offloadable("false")).await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(
+        again.json()["offloadable"],
+        true,
+        "an upload doesn't change an existing blob's flag"
+    );
+    assert_eq!(
+        put_blob(&h, &cookie, b"b").await.json()["offloadable"],
+        false
+    );
+
+    let unflagged = patch_blob(&h, &cookie, &a, json!({ "offloadable": false })).await;
+    assert_eq!(unflagged.status, StatusCode::OK);
+    assert_eq!(
+        unflagged.json(),
+        json!({ "id": a.to_string(), "size": 1, "created_at": "2026-10-09T20:57:00.000Z", "offloadable": false })
+    );
+    for _ in 0..2 {
+        let flag = patch_blob(&h, &cookie, &b, json!({ "offloadable": true })).await;
+        assert_eq!(flag.status, StatusCode::OK);
+        assert_eq!(flag.json()["offloadable"], true);
+    }
+    let listed = h.get(PHONE, "/api/v1/blobs", &cookie).await.json();
+    let flags: std::collections::HashMap<String, bool> = listed["blobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| {
+            (
+                blob["id"].as_str().unwrap().to_owned(),
+                blob["offloadable"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [(a.to_string(), false), (b.to_string(), true)].into()
+    );
+
+    // Offloadable blobs are read like any other.
+    assert_eq!(
+        h.get(PHONE, &format!("/api/v1/blobs/{b}"), &cookie)
+            .await
+            .body,
+        b"b"
+    );
+
+    let missing = patch_blob(
+        &h,
+        &cookie,
+        &BlobId::of(b"c"),
+        json!({ "offloadable": true }),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    let bob = h.signed_up("bob", PHONE).await;
+    assert_eq!(
+        patch_blob(&h, &bob, &a, json!({ "offloadable": true }))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn offloadable_flags_are_checked() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let a = BlobId::of(b"a");
+    for value in ["yes", "True", "1", ""] {
+        let reply = put_blob_with(&h, &cookie, b"a", offloadable(value)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{value:?}");
+    }
+    put_blob(&h, &cookie, b"a").await;
+    for body in [
+        json!({}),
+        json!({ "offloadable": "true" }),
+        json!({ "offloadable": null }),
+    ] {
+        let reply = patch_blob(&h, &cookie, &a, body.clone()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let wrong_type = h
+        .send(common::Call {
+            cookie: Some(&cookie),
+            body: b"offloadable=true".to_vec(),
+            content_type: Some("application/x-www-form-urlencoded"),
+            ..h.call(Method::PATCH, PHONE, format!("/api/v1/blobs/{a}"))
+        })
+        .await;
+    assert_eq!(wrong_type.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let other_origin = h
+        .send(common::Call {
+            cookie: Some(&cookie),
+            body: json!({ "offloadable": true }).to_string().into_bytes(),
+            content_type: Some("application/json"),
+            origin: Some("http://evil.localhost:24038".to_owned()),
+            ..h.call(Method::PATCH, PHONE, format!("/api/v1/blobs/{a}"))
+        })
+        .await;
+    assert_eq!(other_origin.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h.get(PHONE, "/api/v1/blobs", &cookie).await.json()["blobs"][0]["offloadable"],
+        false,
+        "nothing changed"
+    );
+}
+
+#[tokio::test]
+async fn refs_never_point_to_offloadable_blobs() {
+    let h = Harness::new();
+    let cookie = h.signed_up("alice", PHONE).await;
+    let a = BlobId::of(b"a");
+    let b = BlobId::of(b"b");
+    put_blob_with(&h, &cookie, b"a", offloadable("true")).await;
+    put_blob(&h, &cookie, b"b").await;
+
+    let refused = put_ref(&h, &cookie, "root", &a, None).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.json()["error"], "blob_offloadable");
+    assert_eq!(
+        h.get(PHONE, "/api/v1/refs/root", &cookie).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        put_ref(&h, &cookie, "root", &b, None).await.status,
+        StatusCode::CREATED
+    );
+    let flag = patch_blob(&h, &cookie, &b, json!({ "offloadable": true })).await;
+    assert_eq!(flag.status, StatusCode::CONFLICT);
+    assert_eq!(flag.json()["error"], "blob_offloadable");
+    assert_eq!(
+        patch_blob(&h, &cookie, &b, json!({ "offloadable": false }))
+            .await
+            .status,
+        StatusCode::OK,
+        "unflagging is always allowed"
+    );
+
+    // Once the ref points elsewhere, the blob can be flagged.
+    patch_blob(&h, &cookie, &a, json!({ "offloadable": false })).await;
+    assert_eq!(
+        put_ref(&h, &cookie, "root", &a, None).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        patch_blob(&h, &cookie, &b, json!({ "offloadable": true }))
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

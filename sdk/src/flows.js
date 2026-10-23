@@ -49,12 +49,12 @@ function limiter(max) {
     });
 }
 
-/** A save's progress: what is uploaded of `sources`, in files and bytes. */
-function progressOf(sources, finished) {
-  const size = (source) => (source instanceof Uint8Array ? source.length : source.size);
-  const done = sources.filter((source) => finished.has(source));
-  const sum = (list) => list.reduce((total, source) => total + size(source), 0);
-  return { files: done.length, bytes: sum(done), totalFiles: sources.length, totalBytes: sum(sources) };
+/** A save's progress: what is uploaded of `planned` ({ source, offloadable }, from tree.uploads), in files and bytes. */
+function progressOf(planned, finished) {
+  const size = ({ source }) => (source instanceof Uint8Array ? source.length : source.size);
+  const done = planned.filter(({ source, offloadable }) => finished.get(source)?.has(offloadable));
+  const sum = (list) => list.reduce((total, upload) => total + size(upload), 0);
+  return { files: done.length, bytes: sum(done), totalFiles: planned.length, totalBytes: sum(planned) };
 }
 
 const rootDoc = ({ blobId: _blobId, writable: _writable, ...doc }) => doc;
@@ -121,24 +121,24 @@ export function makeFlows({ labels }) {
     }
   }
 
-  /** What tree.js needs, for one session. `onUploaded(source)` follows a save's uploads, which `uploads` keeps across its attempts. */
+  /**
+   * What tree.js needs, for one session. `onUploaded({ source, offloadable })` follows a save's uploads, which
+   * `uploads` keeps across its attempts.
+   */
   function treeIO(session, { signal, uploads = new Map(), onUploaded = () => {} } = {}) {
     const { contentKey } = session;
     const limit = limiter(PARALLEL_UPLOADS);
-    const upload = async (source) => {
+    const upload = async (source, offloadable) => {
       const plaintext = source instanceof Uint8Array ? source : new Uint8Array(await source.arrayBuffer());
-      const done = await encrypted.putBlob(contentKey, labels.file, plaintext, { signal });
-      onUploaded(source);
+      const done = await encrypted.putBlob(contentKey, labels.file, plaintext, { offloadable, signal });
+      onUploaded({ source, offloadable });
       return done;
     };
     return {
       loadDir: (id) => loadDir(contentKey, id),
       readFile: (entry) => encrypted.openBlob(contentKey, labels.file, entry.id),
       known: (id) => cacheOf(contentKey).known.get(id),
-      upload: (source) => {
-        if (!uploads.has(source)) uploads.set(source, limit(() => upload(source)));
-        return uploads.get(source);
-      },
+      upload: (source, { offloadable }) => tree.perUpload(uploads, { source, offloadable }, () => limit(() => upload(source, offloadable))),
       writeDir: async (doc) => {
         const sealed = await sealDir(contentKey, doc);
         const id = await api.putBlob(sealed, { signal });
@@ -398,13 +398,13 @@ export function makeFlows({ labels }) {
     checkSteps(steps);
     if (!session.root.writable) throw new UserFacingError("This vault was written by a newer version of the app; it's read-only here.");
     signal?.throwIfAborted();
-    const finished = new Set();
-    let sources = [];
-    const report = () => onProgress(progressOf(sources, finished));
+    const finished = new Map();
+    let planned = [];
+    const report = () => onProgress(progressOf(planned, finished));
     const treeIo = treeIO(session, {
       signal,
-      onUploaded: (source) => {
-        finished.add(source);
+      onUploaded: (upload) => {
+        tree.perUpload(finished, upload, () => true);
         report();
       },
     });
@@ -416,7 +416,7 @@ export function makeFlows({ labels }) {
         apply: async (root) => {
           // Each step takes a tx and returns the next (SPEC §6.4).
           const final = await steps.reduce(async (tx, step) => step(await tx), Promise.resolve(tree.begin(root, treeIo, now())));
-          sources = await tree.uploads(final);
+          planned = await tree.uploads(final);
           report();
           const doc = await tree.commit(final, treeIo);
           signal?.throwIfAborted();
@@ -451,6 +451,20 @@ export function makeFlows({ labels }) {
     return encrypted.readBlob(session.contentKey, labels.file, ref.id, { ...options, salt: ref.salt });
   }
 
+  /**
+   * Sets whether the files with these blob IDs are offloadable (SPEC §6.13), one request each. Entries don't record
+   * the flag, so the tree doesn't change. Only files can be: the server refuses the root, and this refuses the
+   * directories the session knows.
+   */
+  async function setOffloadable(session, ids, offloadable) {
+    if (!Array.isArray(ids) || typeof offloadable !== "boolean") throw new TypeError("setOffloadable takes an array of blob IDs and true or false");
+    const { known } = cacheOf(session.contentKey);
+    const dir = offloadable && ids.find((id) => known.get(id)?.kind === "dir");
+    if (dir) throw new TypeError(`Only files can be offloadable, and ${dir} is a directory`);
+    const limit = limiter(PARALLEL_UPLOADS);
+    await Promise.all(ids.map((id) => limit(() => api.setOffloadable(id, offloadable))));
+  }
+
   return {
     loadKeys,
     open,
@@ -469,5 +483,6 @@ export function makeFlows({ labels }) {
     save,
     list,
     read,
+    setOffloadable,
   };
 }

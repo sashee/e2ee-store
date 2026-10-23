@@ -164,6 +164,7 @@ An app's data is a tree of directories and files. The `vault` ref points to its 
 - **Unknown fields:** a directory's unknown top-level fields are kept when it is rewritten, and entries a save doesn't change are kept as they are.
 - **History** is up to the app, e.g. a copy of an entry under another name (`vault@41`) before it is replaced. Copies share their blobs, so a kept version costs only what changed.
 - **Reachability:** a blob stays only while the root reaches it (§6.11). A blob referenced only from inside a file's content isn't kept.
+- **Offloadable files** (§6.13) may be kept outside the server's database. Entries don't record it.
 
 ## 6. Flows
 
@@ -221,13 +222,13 @@ When the app starts with a fragment:
 | `put(path, content) → tx` | Places `content` at `path`, replacing what is there and making missing directories. `content` is what `upload` returned, or an entry read from `tx`: an existing file or directory is re-pointed, not uploaded again. An entry may come back with a new `modified` and `app`, but otherwise as it was read. |
 | `remove(path) → tx` | Removes a file, or a directory with everything in it. Nothing at `path` is no change. |
 | `mkdir(path) → tx` | Makes an empty directory, and missing parents. An existing directory is no change. |
-| `upload(bytes, { modified, app }) → content` | New file content: a `Uint8Array`, or a `Blob` that is read only when it's uploaded. `modified` defaults to the save's time. |
+| `upload(bytes, { modified, app, offloadable }) → content` | New file content: a `Uint8Array`, or a `Blob` that is read only when it's uploaded. `modified` defaults to the save's time; `offloadable` (§6.13) to false. |
 | `entry(path) → Promise<entry \| null>` | What is at `path` now. |
 | `list(path) → Promise<[entry]>` | A directory's entries now, sorted by name. |
 | `read(path) → Promise<Uint8Array \| null>` | A file's content now, whole and checked. |
 
 - **`tx` never changes:** writes return a new one, and reads see the writes before them. Writes are only recorded; reads load the directories they need.
-- **Moves and copies:** a move is `put(to, await tx.entry(from))` then `remove(from)`, and a copy is the `put` alone. Content made in this save (an upload, or a directory made or changed) can be put at more than one path, and is written once.
+- **Moves and copies:** a move is `put(to, await tx.entry(from))` then `remove(from)`, and a copy is the `put` alone. Content made in this save (an upload, or a directory made or changed) can be put at more than one path, and is written once. The same bytes uploaded offloadable and not are two uploads.
 
 A save:
 
@@ -344,9 +345,19 @@ An automatic run that failed is due again at the next unlock.
   - **All of it** (neither `from` nor `to`): one request. The blob is checked against its ID before the stream closes (§3.2), so whatever must be verified before use is read to the end first.
   - **A range:** `to` past the end is cut to the end, `from` at the end gives nothing, and `from` after it is a `RangeError`. Only the chunks the range touches are fetched, in one `Range` request, plus the 40-byte header if the range starts after the first chunk. A range aligned to `CHUNK_SIZE` fetches nothing it doesn't use. A server that ignores `Range` still works, at the cost of the whole download.
   - **Aborting:** `signal`, or cancelling the stream, aborts the requests, and nothing more comes out of the stream. An abort fails with the signal's reason, unchanged, so the app can tell it from a failure.
-  - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `read` or from the stream where they are read.
+  - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `read` or from the stream where they are read. A file whose content the server lost is a `BlobLostError` (§6.13).
 - **`CHUNK_SIZE`** (64 KiB, from `blobs.js`) is the plaintext in a chunk: the unit worth fetching.
 - **Caching:** directories never change, so a session keeps the ones it has read or written in memory, by ID. Browsing doesn't fetch a directory twice, and a save that runs again after a conflict doesn't either.
+
+### 6.13 Offloadable files
+
+An app can let the server keep a file's content outside its database (backend/SPEC.md §7.1), e.g. in cheaper storage for large media. That content may read more slowly, and can be lost with that storage: it suits files the app can do without or get back, like a track that is also in the user's music library.
+
+- **Uploading:** `tx.upload(bytes, { offloadable: true })` (§6.4). Only files can be offloadable. Directories and the root never are, so the tree itself always stays readable.
+- **Changing:** `setOffloadable(session, ids, offloadable)` sets the flag of the files with these blob IDs, one request each; the tree doesn't change. Flagging a directory the session has read or written is a `TypeError`, before anything is sent. The server refuses to flag the root (`blob_offloadable`).
+- **Entries don't record the flag:** the server keeps it per blob. An app that needs to know keeps it itself, e.g. in the entry's `app`. A copy of a file elsewhere in the tree is the same blob, so it has the same flag.
+- **Lost content:** reading a file whose content is lost (`410 blob_lost`) fails with `BlobLostError` from `api.js`: an `ApiError` with code `blob_lost` and the blob's `id`. Its entry stays, and cleanup keeps the blob (§6.11); what to do, e.g. upload the file again, is up to the app.
+- For now, the server keeps all content in its database, so nothing is lost yet.
 
 ## 7. Modules
 
@@ -355,11 +366,11 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | Module            | Contents |
 |-------------------|----------|
 | `labels.js`       | `labels(namespace)` (§2) |
-| `flows.js`        | `makeFlows({ labels })` (§6): unlock, create, `save`, `list`, `read`, passkey slots, recovery key, maintenance |
+| `flows.js`        | `makeFlows({ labels })` (§6): unlock, create, `save`, `list`, `read`, `setOffloadable`, passkey slots, recovery key, maintenance |
 | `tree.js`         | The tree (§5, §6.4): its formats and names, transactions, commits, `TreeError`, `validName`, and what a root reaches |
 | `blobs.js`        | Uploading and reading encrypted blobs over the API, and `CHUNK_SIZE` (§6.12) |
 | `stream.js`       | The blob format (§3.2): sealing, opening, and its layout |
-| `api.js`          | The backend client: errors with fixed messages, hash-checked blobs, ranges, compare-and-swap refs, the 401 handler |
+| `api.js`          | The backend client: errors with fixed messages and `BlobLostError`, hash-checked blobs, ranges, offloadable blobs, compare-and-swap refs, the 401 handler |
 | `passkeys.js`     | WebAuthn ceremonies with PRF; `UserFacingError` |
 | `crypto.js`       | HKDF, AES-GCM, SHA-256, base64url, hex |
 | `envelope.js`     | The content key (§3.1) |
@@ -399,14 +410,14 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 - **Unit tests** (`node --test`; Node has WebCrypto) for the pure modules:
   - **Crypto:** wrap/unwrap round trips; a tampered nonce, ciphertext or AAD fails; keys of another kind or another namespace fail.
   - **Labels:** derived from the namespace; invalid namespaces are refused.
-  - **Tree:** transactions (writes return new ones, reads see earlier writes), commits (only what changed, bottom-up, each directory and upload once), what `put` accepts back, names, read-only directories, errors, malformed directories, and what a root reaches.
+  - **Tree:** transactions (writes return new ones, reads see earlier writes), commits (only what changed, bottom-up, each directory and upload once, offloadable uploads apart), what `put` accepts back, names, read-only directories, errors, malformed directories, and what a root reaches.
   - **Blobs:** sizes, padding and chunks; round trips across chunk boundaries; damaged, reordered, shortened and lengthened blobs; another writer's padding; ranges and what they fetch, salts, a server that ignores ranges, aborting.
   - **Keys documents:** validation; every operation; `version > 1` is read-only; another app's keys document is refused.
   - **Saving:** retries on conflict, gives up after 5, sync and async operations, rollback.
   - **Recovery key, setup links, maintenance:** parsing, the plan with its grace period, the report, the schedule.
-- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, cleanup by reachability, and a server that misbehaves.
+- **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, offloadable and lost files, cleanup by reachability, and a server that misbehaves.
 - **Format vectors:** `test/vectors.json` holds a keys blob of version 1, and a root directory listing a file blob of two chunks (the file's recipe and ID). `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
-- **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows and a file in the tree with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
+- **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows, a file in the tree and an offloadable one with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
   - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.
   - `Backend` runs admin commands (`setup_token(...)`) and reads the stored blobs.

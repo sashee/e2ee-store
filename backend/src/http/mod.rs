@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
             "/blobs/{id}",
             get(storage::get_blob)
                 .put(storage::put_blob)
+                .patch(storage::patch_blob)
                 .delete(storage::delete_blob),
         )
         .route("/refs", get(storage::list_refs))

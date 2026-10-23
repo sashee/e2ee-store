@@ -148,6 +148,7 @@ CREATE TABLE blobs (
   size        INTEGER NOT NULL,                 -- kept so content can move to another store later
   content     BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
+  offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),  -- §7.1; added in 1.1
   PRIMARY KEY (user_id, id)
 );
 
@@ -178,6 +179,32 @@ Every row that can expire stores its `expires_at`, which is set when the row is 
 | Ceremony    | `created_at + 5 min` |
 
 Step-up (§6.5) is a separate rule based on the session's age. It doesn't change when the session expires.
+
+### 5.2 Schema versions
+
+The schema is migrated with plain SQL when the server starts. Its version is `major.minor`, stored in `PRAGMA user_version` as `major * 1000 + minor`, with `N.0` as the bare `N`: the databases from before versions had a minor hold `1`, which is `1.0`.
+
+The split lets an older binary keep running against a database a newer one has migrated. That happens routinely: the host's nightly upgrade replaces a generation switched to by hand with the one the pipeline last delivered.
+
+| The database is…                  | At startup |
+|-----------------------------------|------------|
+| older                             | Every pending migration runs, in one transaction |
+| at this binary's version          | Nothing; the database isn't written to |
+| a newer minor of the same major   | A warning, then the server runs |
+| a newer major                     | The server refuses to start |
+
+- **A minor migration may only:**
+  - create a table or an index;
+  - add a column that is nullable or has a default, so an older binary's `INSERT`, which doesn't name it, still works;
+  - rebuild a table to change only how it is stored, keeping every column and refusing exactly the rows it refused before.
+- **Everything else is a major:** dropping or renaming a table or column, changing a column's type, a constraint an older binary's writes could break, or a new meaning for existing data. The test is whether the previous binary would still behave correctly against the database.
+- **A new major stops every older binary from starting.** Deliver a binary that no longer depends on what the major changes first, through the pipeline, and only then the major. The binary pins its major at compile time, so changing it is a deliberate edit.
+- Binaries from before this scheme refuse anything above `1`, so the first one to migrate to `1.1` can't be reverted to them; the server just doesn't start until the newer binary is back.
+
+| Version | Change |
+|---------|--------|
+| 1.0     | The tables above, without `blobs.offloadable` |
+| 1.1     | `blobs.offloadable` |
 
 ## 6. Authentication
 
@@ -285,6 +312,11 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 - Uploading is idempotent. Uploading an ID that already exists does nothing, and `created_at` stays the same.
 - A blob can't be deleted while a ref points to it (409).
 - Each upload is limited by `max_blob_size` (16 MiB by default). There are no per-user quotas.
+- **Offloadable blobs.** A client can flag a blob as offloadable: the server may then keep its content outside the database (e.g. in S3, §13), where reads are slower and the content may be lost along with that storage.
+  - The flag is set when the blob is uploaded, and only then: re-uploading an existing blob keeps its flag. It can be changed any time afterwards.
+  - A ref can't point to an offloadable blob, and a blob a ref points to can't be flagged (409 `blob_offloadable`). What refs point to stays in the database, so a client can always find its way in.
+  - For now, every blob's content is in the database; the flag is only stored. A read of a blob whose content is lost returns 410 `blob_lost`, which nothing can produce yet.
+  - Binaries before 1.1 (§5.2) upload blobs that aren't offloadable and don't check refs against the flag. Nothing is offloaded yet, so that's harmless.
 - Reads use SQLite's incremental BLOB I/O, so a `Range` read holds only the requested bytes in memory. SQLite still reads every page up to the range's end, which makes ranges near the start cheap and ranges near the end of a large blob cost about as much I/O as a full read.
 
 ### 7.2 Refs
@@ -346,6 +378,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 | GET       | `/blobs`                       | session           | List blobs |
 | PUT       | `/blobs/{id}`                  | session           | Upload a blob |
 | GET, HEAD | `/blobs/{id}`                  | session           | Read a blob (supports Range) |
+| PATCH     | `/blobs/{id}`                  | session           | Change whether a blob is offloadable |
 | DELETE    | `/blobs/{id}`                  | session           | Delete a blob |
 | GET       | `/refs`                        | session           | List refs |
 | GET       | `/refs/{name}`                 | session           | Read a ref |
@@ -413,9 +446,9 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 
 ### 8.4 Blobs
 
-`PUT /blobs/{id}` takes the raw bytes as the body, with `Content-Type: application/octet-stream`:
-- **201** if the blob is new, **200** if it already existed. Body: `{"id", "size", "created_at"}`.
-- **400** `hash_mismatch`.
+`PUT /blobs/{id}` takes the raw bytes as the body, with `Content-Type: application/octet-stream`, and an optional `Blob-Offloadable: true` or `false` (the default) for a new blob (§7.1):
+- **201** if the blob is new, **200** if it already existed. Body: `{"id", "size", "created_at", "offloadable"}`.
+- **400** `hash_mismatch`; `bad_request` for any other `Blob-Offloadable` value.
 - **413** `blob_too_large`.
 - **415** `unsupported_media_type`.
 
@@ -432,6 +465,12 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
   - `Content-Security-Policy: default-src 'none'; sandbox`
 - **HEAD:** same headers, no body.
 - **404** `not_found`.
+- **410** `blob_lost`: the blob was offloadable and its content is gone (§7.1).
+
+`PATCH /blobs/{id}`, body `{"offloadable": true | false}`:
+- **200** with `{"id", "size", "created_at", "offloadable"}`, also when the flag already had that value.
+- **404** `not_found`.
+- **409** `blob_offloadable`: a ref points to the blob.
 
 `DELETE /blobs/{id}`:
 - **204**.
@@ -440,7 +479,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 
 `GET /blobs?after=<id>&limit=<n>` returns:
 ```json
-{ "blobs": [ { "id": "…", "size": 123, "created_at": "…" } ], "next": "<id>" }
+{ "blobs": [ { "id": "…", "size": 123, "created_at": "…", "offloadable": false } ], "next": "<id>" }
 ```
 - Blobs are sorted by ID.
 - `limit` defaults to 1000, which is also the maximum.
@@ -456,7 +495,7 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 
 `PUT /refs/{name}`, body `{"blob": "<id>"}`, plus optional precondition headers (§7.2):
 - **201** if the ref was created, **200** if it was updated. Body: `{"name", "blob", "updated_at"}`.
-- **409** `blob_not_found`.
+- **409** `blob_not_found`; `blob_offloadable` when the target blob is offloadable.
 - **412** `precondition_failed`, with body `{"error": "precondition_failed", "message": "…", "current": "<id>" | null}`.
 
 `DELETE /refs/{name}`, with an optional `If-Match` header:
@@ -504,8 +543,10 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 | 405  | `method_not_allowed`     | The route doesn't have this method; `Allow` lists the ones it has |
 | 409  | `blob_referenced`        | A ref still points to the blob |
 | 409  | `blob_not_found`         | The ref target doesn't exist |
+| 409  | `blob_offloadable`       | A ref would point to an offloadable blob |
 | 409  | `last_passkey`           | The user tried to delete their only passkey |
 | 409  | `passkey_exists`         | The credential is already registered |
+| 410  | `blob_lost`              | The offloadable blob's content is gone |
 | 412  | `precondition_failed`    | The expect check failed |
 | 413  | `blob_too_large`         | The blob is larger than `max_blob_size`, or a JSON body is over 64 KiB |
 | 415  | `unsupported_media_type` | Wrong `Content-Type` |
@@ -576,6 +617,7 @@ The setup-token lifetime (15 min) and the ceremony lifetime (5 min) are fixed.
     - a ceremony can't be finished from another host or port
   - **Cookies:** `Secure` is present on public hosts and absent on loopback hosts.
   - **PRF:** responses carrying unrequested `prf` client results and `hmac-secret` authenticator data are accepted, and the server neither stores nor returns them.
+- **Schema versions:** the stored form of a version, migrating a new and a `1.0` database, and a newer minor accepted and a newer major refused, both left as they are.
 - **Smoke test:** the server serves requests over the Unix socket and cleans the socket up on shutdown.
 - **Concurrency test:** several writers compare-and-swap the same ref in parallel. Exactly one must win in each round.
 - **Manual checks:** register and log in with PRF through:
@@ -587,5 +629,5 @@ The setup-token lifetime (15 min) and the ceremony lifetime (5 min) are fixed.
 
 - List and revoke sessions; rename passkeys.
 - Atomic transactions across several refs.
-- A pluggable store for blob content (filesystem or S3) to support large blobs.
+- Moving the content of offloadable blobs to S3 (§7.1), to support large blobs.
 - Fetching several blobs in one request.

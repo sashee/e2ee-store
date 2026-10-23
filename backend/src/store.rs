@@ -328,6 +328,8 @@ pub struct BlobMeta {
     pub id: BlobId,
     pub size: u64,
     pub created_at: i64,
+    /// The client allows the server to move the content out of the database (SPEC §7.1).
+    pub offloadable: bool,
 }
 
 fn blob_meta_row(row: &Row) -> rusqlite::Result<BlobMeta> {
@@ -335,20 +337,24 @@ fn blob_meta_row(row: &Row) -> rusqlite::Result<BlobMeta> {
         id: BlobId(row.get(0)?),
         size: row.get::<_, i64>(1)?.try_into().unwrap_or(0),
         created_at: row.get(2)?,
+        offloadable: row.get(3)?,
     })
 }
 
-/// Stores a blob unless it already exists. Returns whether it was new, and its metadata.
+/// Stores a blob unless it already exists; an existing one keeps its flag. Returns whether it was new, and its
+/// metadata.
 pub fn put_blob(
     conn: &Connection,
     user_id: &UserId,
     id: BlobId,
     content: &[u8],
+    offloadable: bool,
     now: i64,
 ) -> rusqlite::Result<(bool, BlobMeta)> {
     let inserted = conn.execute(
-        "INSERT INTO blobs (user_id, id, size, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
-        params![user_id, id.0, i64::try_from(content.len()).unwrap_or(i64::MAX), content, now],
+        "INSERT INTO blobs (user_id, id, size, content, created_at, offloadable) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT DO NOTHING",
+        params![user_id, id.0, i64::try_from(content.len()).unwrap_or(i64::MAX), content, now, offloadable],
     )?;
     let meta = blob_meta(conn, user_id, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     Ok((inserted == 1, meta))
@@ -360,7 +366,7 @@ pub fn blob_meta(
     id: BlobId,
 ) -> rusqlite::Result<Option<BlobMeta>> {
     conn.query_row(
-        "SELECT id, size, created_at FROM blobs WHERE user_id = ?1 AND id = ?2",
+        "SELECT id, size, created_at, offloadable FROM blobs WHERE user_id = ?1 AND id = ?2",
         params![user_id, id.0],
         blob_meta_row,
     )
@@ -380,9 +386,9 @@ pub fn blob_content(
     let tx = conn.transaction()?;
     let Some((meta, rowid)) = tx
         .query_row(
-            "SELECT id, size, created_at, rowid FROM blobs WHERE user_id = ?1 AND id = ?2",
+            "SELECT id, size, created_at, offloadable, rowid FROM blobs WHERE user_id = ?1 AND id = ?2",
             params![user_id, id.0],
-            |r| Ok((blob_meta_row(r)?, r.get::<_, i64>(3)?)),
+            |r| Ok((blob_meta_row(r)?, r.get::<_, i64>(4)?)),
         )
         .optional()?
     else {
@@ -418,12 +424,7 @@ pub fn delete_blob(
     id: BlobId,
 ) -> rusqlite::Result<BlobDeletion> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let referenced: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM refs WHERE user_id = ?1 AND blob_id = ?2)",
-        params![user_id, id.0],
-        |r| r.get(0),
-    )?;
-    let outcome = if referenced {
+    let outcome = if referenced(&tx, user_id, id)? {
         BlobDeletion::Referenced
     } else if tx.execute(
         "DELETE FROM blobs WHERE user_id = ?1 AND id = ?2",
@@ -438,6 +439,47 @@ pub fn delete_blob(
     Ok(outcome)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagWrite {
+    Written(BlobMeta),
+    NotFound,
+    Referenced,
+}
+
+fn referenced(conn: &Connection, user_id: &UserId, id: BlobId) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM refs WHERE user_id = ?1 AND blob_id = ?2)",
+        params![user_id, id.0],
+        |r| r.get(0),
+    )
+}
+
+/// Sets whether the blob is offloadable. A blob a ref points to can't be (SPEC §7.1).
+pub fn set_offloadable(
+    conn: &mut Connection,
+    user_id: &UserId,
+    id: BlobId,
+    offloadable: bool,
+) -> rusqlite::Result<FlagWrite> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = match blob_meta(&tx, user_id, id)? {
+        None => FlagWrite::NotFound,
+        Some(_) if offloadable && referenced(&tx, user_id, id)? => FlagWrite::Referenced,
+        Some(meta) => {
+            tx.execute(
+                "UPDATE blobs SET offloadable = ?3 WHERE user_id = ?1 AND id = ?2",
+                params![user_id, id.0, offloadable],
+            )?;
+            FlagWrite::Written(BlobMeta {
+                offloadable,
+                ..meta
+            })
+        }
+    };
+    tx.commit()?;
+    Ok(outcome)
+}
+
 /// Up to `limit + 1` blobs after `after`, by ID; the extra one tells the caller there is a next page.
 pub fn list_blobs(
     conn: &Connection,
@@ -446,7 +488,7 @@ pub fn list_blobs(
     limit: usize,
 ) -> rusqlite::Result<Vec<BlobMeta>> {
     let after: Vec<u8> = after.map(|a| a.0.to_vec()).unwrap_or_default();
-    conn.prepare("SELECT id, size, created_at FROM blobs WHERE user_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3")?
+    conn.prepare("SELECT id, size, created_at, offloadable FROM blobs WHERE user_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3")?
         .query_map(params![user_id, after, limit as i64 + 1], blob_meta_row)?
         .collect()
 }
@@ -487,6 +529,7 @@ pub enum RefWrite {
     Updated(RefRow),
     PreconditionFailed(Option<BlobId>),
     BlobNotFound,
+    BlobOffloadable,
 }
 
 /// Compare-and-swap on one ref, under a write lock (SPEC §7.2).
@@ -500,25 +543,26 @@ pub fn put_ref(
 ) -> rusqlite::Result<RefWrite> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = get_ref(&tx, user_id, name)?.map(|r| r.blob);
-    let outcome = if !precondition_holds(precondition, current) {
-        RefWrite::PreconditionFailed(current)
-    } else if blob_meta(&tx, user_id, blob)?.is_none() {
-        RefWrite::BlobNotFound
-    } else {
-        tx.execute(
-            "INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (user_id, name) DO UPDATE SET blob_id = excluded.blob_id, updated_at = excluded.updated_at",
-            params![user_id, name, blob.0, now],
-        )?;
-        let row = RefRow {
-            name: name.to_owned(),
-            blob,
-            updated_at: now,
-        };
-        if current.is_some() {
-            RefWrite::Updated(row)
-        } else {
-            RefWrite::Created(row)
+    let outcome = match blob_meta(&tx, user_id, blob)? {
+        _ if !precondition_holds(precondition, current) => RefWrite::PreconditionFailed(current),
+        None => RefWrite::BlobNotFound,
+        Some(target) if target.offloadable => RefWrite::BlobOffloadable,
+        Some(_) => {
+            tx.execute(
+                "INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (user_id, name) DO UPDATE SET blob_id = excluded.blob_id, updated_at = excluded.updated_at",
+                params![user_id, name, blob.0, now],
+            )?;
+            let row = RefRow {
+                name: name.to_owned(),
+                blob,
+                updated_at: now,
+            };
+            if current.is_some() {
+                RefWrite::Updated(row)
+            } else {
+                RefWrite::Created(row)
+            }
         }
     };
     tx.commit()?;

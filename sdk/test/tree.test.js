@@ -18,6 +18,7 @@ function store() {
   const files = new Map();
   const known = new Map();
   const calls = { loadDir: [], upload: [], writeDir: [] };
+  const flags = new Map(); // file ID → whether it was uploaded offloadable
   const remember = (doc) => doc.entries.forEach((entry) => known.set(entry.id, entry));
   const io = {
     loadDir: async (id) => {
@@ -27,12 +28,13 @@ function store() {
     },
     readFile: async (entry) => files.get(entry.id),
     known: (id) => known.get(id),
-    upload: async (source) => {
+    upload: async (source, { offloadable }) => {
       const content = source instanceof Uint8Array ? source : new Uint8Array(await source.arrayBuffer());
       calls.upload.push(content);
       if (io.tooLarge) throw Object.assign(new Error("too large"), { code: "blob_too_large" });
       const id = hex(randomBytes(32));
       files.set(id, content);
+      flags.set(id, offloadable);
       return { id, salt: hex(randomBytes(16)), size: content.length, sha256: sha(content) };
     },
     writeDir: async (doc) => {
@@ -61,7 +63,7 @@ function store() {
     remember(doc);
     return doc;
   };
-  return { io, calls, dirs, files, file, dir, root };
+  return { io, calls, flags, dirs, files, file, dir, root };
 }
 
 /** Music/a.flac and notes.txt under a root at revision 5. */
@@ -157,7 +159,7 @@ test("content made in a save can be put elsewhere in it, and is written once", a
     async (t) => t.put(["s2.txt"], { ...(await t.entry(["New", "s.txt"])), app: { copy: true } }),
     (t) => t.put(["s3.txt"], t.upload(source)),
   );
-  assert.deepEqual(await uploads(saved), [source]);
+  assert.deepEqual(await uploads(saved), [{ source, offloadable: false }]);
   const root = await commit(saved, io);
   assert.equal(calls.upload.length, 1, "the same source is uploaded once");
   assert.equal(calls.writeDir.length, 1, "the same new directory is written once");
@@ -165,6 +167,28 @@ test("content made in a save can be put elsewhere in it, and is written once", a
   assert.equal(byName.Copy.id, byName.New.id);
   assert.equal(byName["s2.txt"].id, byName["s3.txt"].id);
   assert.deepEqual(byName["s2.txt"].app, { copy: true });
+});
+
+test("uploads can be offloadable, and the same source with the other flag is another upload", async () => {
+  const { tx, io, calls, flags } = library();
+  const source = bytes("track");
+  const saved = await steps(
+    tx,
+    (t) => t.put(["a.flac"], t.upload(source, { offloadable: true })).put(["b.flac"], t.upload(source)),
+    async (t) => t.put(["c.flac"], { ...(await t.entry(["a.flac"])), app: { copy: true } }),
+    (t) => t.put(["d.flac"], t.upload(source, { offloadable: true })),
+  );
+  assert.deepEqual(await uploads(saved), [{ source, offloadable: true }, { source, offloadable: false }]);
+  assert.equal("offloadable" in (await saved.entry(["a.flac"])), false, "entries don't record the flag");
+  const root = await commit(saved, io);
+  assert.equal(calls.upload.length, 2);
+  const byName = Object.fromEntries(root.entries.map((e) => [e.name, e]));
+  assert.equal(byName["c.flac"].id, byName["a.flac"].id, "put elsewhere, an upload keeps its flag");
+  assert.equal(byName["d.flac"].id, byName["a.flac"].id);
+  assert.notEqual(byName["b.flac"].id, byName["a.flac"].id);
+  assert.deepEqual([flags.get(byName["a.flac"].id), flags.get(byName["b.flac"].id)], [true, false]);
+  assert.ok(root.entries.every((e) => !("offloadable" in e)));
+  assert.throws(() => tx.upload(source, { offloadable: "yes" }), TypeError);
 });
 
 test("names are checked and normalised to NFC", async () => {

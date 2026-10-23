@@ -5,7 +5,7 @@
 //   io.loadDir(id) → doc                  a stored directory, parsed and checked
 //   io.readFile(entry) → Uint8Array       a stored file, whole and checked against its ID
 //   io.known(id) → entry | undefined      a stored entry the caller has seen, to vet entries an app puts back
-//   io.upload(source) → { id, salt, size, sha256 }
+//   io.upload(source, { offloadable }) → { id, salt, size, sha256 }
 //   io.writeDir(doc) → { id, salt }
 
 import { te } from "./crypto.js";
@@ -90,7 +90,7 @@ export const emptyRoot = (revision) => ({ version: VERSION, revision, entries: [
 //   { file: entry }                          a stored file
 //   { dir: entry }                           a stored directory, not loaded
 //   { node }                                 a directory changed (or made) in this save
-//   { upload: { source, modified, app } }    a file put in this save
+//   { upload: { source, offloadable, modified, app } }    a file put in this save
 
 const childOf = (entry) => (entry.kind === "dir" ? { dir: entry } : { file: entry });
 const nodeOf = ({ entries, ...meta }) => ({ meta, children: new Map(entries.map((entry) => [entry.name, childOf(entry)])) });
@@ -208,11 +208,13 @@ function txOf(compute, revision, io, now) {
       if (existing.file || existing.upload) throw new TreeError("not_a_directory", full);
       return existing;
     }),
-    upload: (source, { modified, app } = {}) => {
+    upload: (source, { modified, app, offloadable = false } = {}) => {
       if (!(source instanceof Uint8Array || source instanceof Blob)) throw new TypeError("An upload is a Uint8Array or a Blob");
       if (!(app === undefined || isObject(app))) throw new TypeError("`app` is a plain object");
-      const upload = { source, modified: toTime(modified, now), ...(app === undefined ? {} : { app }) };
-      return Object.freeze({ kind: "file", size: sizeOf(source), ...upload, [PENDING]: { upload } });
+      if (typeof offloadable !== "boolean") throw new TypeError("`offloadable` is true or false");
+      const fields = { modified: toTime(modified, now), ...(app === undefined ? {} : { app }) };
+      const upload = { source, offloadable, ...fields };
+      return Object.freeze({ kind: "file", size: sizeOf(source), source, ...fields, [PENDING]: { upload } });
     },
     entry: async (path) => {
       const full = checkPath(path);
@@ -245,13 +247,24 @@ const byName = ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0);
 // ---------------------------------------------------------------- committing
 
 /**
+ * What `make` returns for `source` uploaded with this `offloadable`, made the first time it's asked for and kept in
+ * `cache` (a Map or a WeakMap). An upload is the same one only with the same source and the same flag.
+ */
+export function perUpload(cache, { source, offloadable }, make) {
+  if (!cache.has(source)) cache.set(source, new Map());
+  const byFlag = cache.get(source);
+  if (!byFlag.has(offloadable)) byFlag.set(offloadable, make());
+  return byFlag.get(offloadable);
+}
+
+/**
  * The root document a transaction leads to, revision + 1. Its new files are uploaded and its changed directories
  * written first, bottom-up; a directory or upload that appears twice is written once.
  */
 export async function commit(tx, io) {
   const root = await materialized(tx);
   if (!writable(root.meta)) throw new TreeError("read_only", []);
-  const written = new WeakMap();
+  const written = { dirs: new WeakMap(), uploads: new WeakMap() };
   return { ...root.meta, version: VERSION, revision: tx.revision + 1, entries: await committed(root, io, [], written) };
 }
 
@@ -260,36 +273,36 @@ async function committed(node, io, path, written) {
     const at = [...path, name];
     if (child.file || child.dir) return { name, ...withoutName(child.file ?? child.dir) };
     if (child.upload) {
-      const { source, modified, app } = child.upload;
-      if (!written.has(source)) written.set(source, uploaded(io, source, at));
-      return { name, kind: "file", ...(await written.get(source)), modified, ...(app === undefined ? {} : { app }) };
+      const { modified, app } = child.upload;
+      const blob = await perUpload(written.uploads, child.upload, () => uploaded(io, child.upload, at));
+      return { name, kind: "file", ...blob, modified, ...(app === undefined ? {} : { app }) };
     }
-    if (!written.has(child.node)) {
-      written.set(child.node, committed(child.node, io, at, written).then((sub) => io.writeDir({ ...child.node.meta, version: VERSION, entries: sub })));
+    if (!written.dirs.has(child.node)) {
+      written.dirs.set(child.node, committed(child.node, io, at, written).then((sub) => io.writeDir({ ...child.node.meta, version: VERSION, entries: sub })));
     }
-    return { name, kind: "dir", ...(await written.get(child.node)) };
+    return { name, kind: "dir", ...(await written.dirs.get(child.node)) };
   });
   return Promise.all(entries);
 }
 
-async function uploaded(io, source, path) {
+async function uploaded(io, { source, offloadable }, path) {
   try {
-    return await io.upload(source);
+    return await io.upload(source, { offloadable });
   } catch (error) {
     throw error?.code === "blob_too_large" ? new TreeError("too_large", path) : error;
   }
 }
 
-/** The sources a transaction will upload when committed: for progress, before anything is uploaded. */
+/** What a transaction will upload when committed, as { source, offloadable }: for progress, before anything is uploaded. */
 export async function uploads(tx) {
-  const sources = new Set();
+  const found = new Map();
   const walk = (node) =>
     node.children.forEach((child) => {
-      if (child.upload) sources.add(child.upload.source);
+      if (child.upload) perUpload(found, child.upload, () => ({ source: child.upload.source, offloadable: child.upload.offloadable }));
       if (child.node) walk(child.node);
     });
   walk(await materialized(tx));
-  return [...sources];
+  return [...found.values()].flatMap((byFlag) => [...byFlag.values()]);
 }
 
 function materialized(tx) {

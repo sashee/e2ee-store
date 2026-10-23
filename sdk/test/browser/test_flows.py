@@ -71,6 +71,15 @@ def run(browser, backend, port: int) -> None:
     file = call(laptop, "file")
     assert file == {"ranges": [True] * 5, "entry": {"name": "track.bin", "size": 3 * 65536 + 5000, "sha256": True}, "aborted": "next track"}, file
 
+    # An offloadable file: the backend stores the flag, never for a directory or the root, and it changes later.
+    offloadable = call(laptop, "offloadable")
+    assert offloadable == {
+        "uploaded": {"file": True, "dir": False, "root": False},
+        "unflagged": {"file": False, "dir": False, "root": False},
+        "root": "blob_offloadable",
+        "read": 100_000,
+    }, offloadable
+
     # What the server saw: no plaintext, and no PRF output.
     assert all(b"from the laptop" not in blob for blob in backend.blob_contents())
     assert all(b'"results"' not in body for body in laptop.sent + phone.sent)

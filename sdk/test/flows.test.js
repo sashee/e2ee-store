@@ -336,6 +336,59 @@ test("a Blob is read only when it's uploaded, and counts in the progress by its 
   assert.deepEqual(await collect(flows.read(saved, entry)), content);
 });
 
+test("files can be offloadable, their directories and the root never are, and the flag changes by blob ID", async () => {
+  const { server, session } = await newAccount();
+  const content = encode("a song");
+  const { session: saved } = await flows.save(session, [(tx) => tx.put(["Music", "a.flac"], tx.upload(content, { offloadable: true })).put(NOTES, tx.upload(encode([])))]);
+  const flag = (id) => server.blobs.get(id).offloadable;
+  const [song] = await flows.list(saved, ["Music"]);
+  const [music, notes] = await flows.list(saved, []);
+  assert.deepEqual([flag(song.id), flag(notes.id), flag(music.id), flag(saved.root.blobId)], [true, false, false, false]);
+  assert.equal("offloadable" in song, false, "entries don't record the flag");
+  assert.deepEqual(await collect(flows.read(saved, song)), content, "an offloadable file reads like any other");
+
+  await flows.setOffloadable(saved, [song.id], false);
+  await flows.setOffloadable(saved, [notes.id, song.id], true);
+  assert.deepEqual([flag(song.id), flag(notes.id)], [true, true]);
+  const patches = () => server.requests.filter((r) => r.method === "PATCH").length;
+  const sent = patches();
+  await assert.rejects(flows.setOffloadable(saved, [song.id, music.id], true), TypeError, "a directory the session knows");
+  assert.equal(patches(), sent, "nothing is sent then");
+  await assert.rejects(flows.setOffloadable(saved, [saved.root.blobId], true), (e) => e.code === "blob_offloadable" && e.message === "The vault's root has to stay in the server's database.");
+  assert.equal(flag(saved.root.blobId), false);
+  await flows.setOffloadable(saved, [music.id], false);
+  await assert.rejects(flows.setOffloadable(saved, song.id, true), TypeError);
+  await assert.rejects(flows.setOffloadable(saved, [song.id], "true"), TypeError);
+});
+
+test("the same content uploaded offloadable and not is two files, each uploaded once", async () => {
+  const { server, session } = await newAccount();
+  const source = encode("same");
+  const progress = [];
+  const step = (tx) => tx.put(["a"], tx.upload(source, { offloadable: true })).put(["b"], tx.upload(source)).put(["c"], tx.upload(source, { offloadable: true }));
+  server.requests = [];
+  const { session: saved } = await flows.save(session, [step], { onProgress: (p) => progress.push(p) });
+  const uploads = server.requests.filter((r) => r.method === "PUT" && r.path.startsWith("/blobs/"));
+  assert.equal(uploads.length, 3, "two files and the root");
+  const [a, b, c] = await flows.list(saved, []);
+  assert.equal(c.id, a.id);
+  assert.notEqual(b.id, a.id);
+  assert.deepEqual([server.blobs.get(a.id).offloadable, server.blobs.get(b.id).offloadable], [true, false]);
+  assert.deepEqual(progress.at(-1), { files: 2, bytes: 12, totalFiles: 2, totalBytes: 12 });
+});
+
+test("a file the server has lost is a BlobLostError naming its blob", async () => {
+  const { server, session } = await newAccount();
+  const { session: saved } = await flows.save(session, [(tx) => tx.put(["a.flac"], tx.upload(new Uint8Array(100_000), { offloadable: true }))]);
+  const [entry] = await flows.list(saved, []);
+  server.lost.add(entry.id);
+  const isLost = (e) => e instanceof api.BlobLostError && e instanceof api.ApiError && e.id === entry.id && e.code === "blob_lost" && e.status === 410;
+  for (const range of [{}, { from: 0, to: 10 }, { from: 70_000, to: 70_010 }]) {
+    await assert.rejects(collect(flows.read(saved, entry, range)), isLost, JSON.stringify(range));
+  }
+  await assert.rejects(flows.save(saved, [async (tx) => (await tx.read(["a.flac"])) && tx]), isLost);
+});
+
 test("a save takes an array of step functions", async () => {
   const { server, session } = await newAccount();
   const vault = server.refs.get("vault");

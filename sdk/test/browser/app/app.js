@@ -84,4 +84,21 @@ window.app = {
       ),
     };
   },
+  /** An offloadable file: flagged on the server, unlike its directory and the root, and the flag changes by blob ID. */
+  async offloadable() {
+    const content = new Uint8Array(100_000).fill(1);
+    ({ session } = await flows.save(session, [(tx) => tx.put(["Music", "big.bin"], tx.upload(content, { offloadable: true }))]));
+    const music = (await flows.list(session, [])).find((e) => e.name === "Music");
+    const file = (await flows.list(session, ["Music"])).find((e) => e.name === "big.bin");
+    const flags = async () => {
+      const { blobs } = await api.listBlobs();
+      const of = (id) => blobs.find((b) => b.id === id).offloadable;
+      return { file: of(file.id), dir: of(music.id), root: of(session.root.blobId) };
+    };
+    const uploaded = await flags();
+    await flows.setOffloadable(session, [file.id], false);
+    const unflagged = await flags();
+    const root = await flows.setOffloadable(session, [session.root.blobId], true).then(() => "flagged", (e) => e.code);
+    return { uploaded, unflagged, root, read: (await collect(flows.read(session, file))).length };
+  },
 };

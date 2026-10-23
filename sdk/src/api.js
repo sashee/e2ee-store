@@ -16,6 +16,8 @@ const MESSAGES = {
   not_found: "Not found.",
   blob_not_found: "The data the vault points to is missing on the server.",
   blob_referenced: "This data is still in use.",
+  blob_offloadable: "The vault's root has to stay in the server's database.",
+  blob_lost: "This file was stored outside the server's database, and that storage lost it.",
   precondition_failed: "Someone else changed this at the same time.",
   blob_too_large: "This is too large to store.",
   unknown_host: "This address isn't served by the server.",
@@ -45,6 +47,19 @@ export class IntegrityError extends Error {
     this.name = "IntegrityError";
   }
 }
+
+/** A read of an offloadable blob whose content the server has lost (SPEC §6.13); `id` is the blob's. */
+export class BlobLostError extends ApiError {
+  constructor(id, body) {
+    super(410, body);
+    this.name = "BlobLostError";
+    this.id = id;
+  }
+}
+
+const lost = (id) => (error) => {
+  throw error?.code === "blob_lost" ? new BlobLostError(id, error.body) : error;
+};
 
 /** Called with every 401 from an authenticated endpoint, so the app can lock. */
 let onUnauthenticated = () => {};
@@ -99,16 +114,21 @@ export async function putRef(name, blobId, expected) {
   return { ok: true };
 }
 
-/** Uploads a blob under its SHA-256 and returns the ID. */
-export async function putBlob(bytes, { signal } = {}) {
+/** Uploads a blob under its SHA-256 and returns the ID. `offloadable` (SPEC §6.13) only applies to a new blob. */
+export async function putBlob(bytes, { offloadable = false, signal } = {}) {
   const id = await sha256Hex(bytes);
-  await call("PUT", `/blobs/${id}`, { body: bytes, signal });
+  await call("PUT", `/blobs/${id}`, { body: bytes, headers: offloadable ? { "Blob-Offloadable": "true" } : {}, signal });
   return id;
+}
+
+/** Sets whether a blob is offloadable (SPEC §6.13). */
+export async function setOffloadable(id, offloadable) {
+  await call("PATCH", `/blobs/${checkBlobId(id)}`, { json: { offloadable } });
 }
 
 /** Downloads a blob and checks that it hashes to its ID. */
 export async function getBlob(id) {
-  const data = new Uint8Array(await (await call("GET", `/blobs/${checkBlobId(id)}`)).arrayBuffer());
+  const data = new Uint8Array(await (await call("GET", `/blobs/${checkBlobId(id)}`).catch(lost(id))).arrayBuffer());
   if ((await sha256Hex(data)) !== id) throw new IntegrityError(`blob ${id}`);
   return data;
 }
@@ -120,7 +140,7 @@ export async function getBlob(id) {
  */
 export async function getBlobStream(id, { range = null, signal } = {}) {
   const headers = range === null ? {} : { Range: `bytes=${range.from}-${range.to === null ? "" : range.to - 1}` };
-  const response = await call("GET", `/blobs/${checkBlobId(id)}`, { headers, signal });
+  const response = await call("GET", `/blobs/${checkBlobId(id)}`, { headers, signal }).catch(lost(id));
   if (response.status !== 206) return { start: 0, total: null, body: response.body };
   const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
   const [start, end, total] = (match ?? []).slice(1).map(Number);
