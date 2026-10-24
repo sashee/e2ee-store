@@ -6,7 +6,7 @@
 #   nix-build -A checks.sdk-unit    # one check: lint, sdk-unit, browser, vm, vm-s3
 #
 # No flake: the packages are callPackage functions and take the caller's nixpkgs, so an app builds them with
-# its own pin (./nix/pkgs.nix is only this repository's). An app imports this file with its `pkgs`, or calls
+# its own nixpkgs (./nix/pkgs.nix is only this repository's). An app imports this file with its `pkgs`, or calls
 # the package files directly; the NixOS module is ./nix/module.nix and its VM test ./nix/tests/lib.nix.
 {
   pkgs ? import ./nix/pkgs.nix { },

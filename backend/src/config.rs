@@ -1,4 +1,4 @@
-//! Configuration (SPEC §10): a TOML file, every key overridable with `BACKEND_<KEY>`.
+//! Configuration (SPEC §10): a TOML file, every key but `backends` overridable with `BACKEND_<KEY>`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ pub struct Config {
     pub max_blob_size: u64,
     /// Where offloadable blobs belong (SPEC §7.4).
     pub blob_target: Target,
-    /// The storage backends offloadable blobs can be in, by name (SPEC §10.1).
+    /// The storage backends offloadable blobs can be in, by name (SPEC §7.4, §10).
     pub backends: BTreeMap<String, Backend>,
     /// What the database's file system keeps free: writes into the database that would take it below are refused.
     pub min_free_space: u64,

@@ -46,6 +46,6 @@ jobs:
 
       # Both packages and every check, in the Nix sandbox: lint (rustfmt, clippy), the Rust suite (in the
       # backend's build), the SDK's unit tests, the SDK in Chromium against the backend, and the NixOS module
-      # in a VM. The same as `make check` locally.
+      # in VMs, alone and with S3 backends. The same as `make check` locally.
       - name: Build and test
         run: make check

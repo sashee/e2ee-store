@@ -2,7 +2,7 @@ SHELL := bash
 
 # Two kinds of targets:
 # - hermetic ones (check, package) go through nix-build (default.nix), in the Nix sandbox;
-# - the development loop (test, lint, …) runs inside the pinned nix shell (shell.nix). Already inside
+# - the development loop (test, lint, …) runs inside the nix shell (shell.nix). Already inside
 #   `nix-shell`? Then the commands run directly.
 ifdef IN_NIX_SHELL
 RUN := bash -c
@@ -13,8 +13,8 @@ NIX_BUILD := nix-build --max-jobs auto
 
 .PHONY: all check package test test-backend test-sdk test-browser lint fmt build clean
 
-# Everything, hermetic: both packages, lint, the Rust suite, the SDK's unit tests and the VM test, in the Nix
-# sandbox. This is what CI runs.
+# Everything, hermetic: both packages, lint, the Rust suite, the SDK's unit tests, the browser test and the VM tests
+# (`vm`, `vm-s3`), in the Nix sandbox. This is what CI runs.
 all: check
 
 check:

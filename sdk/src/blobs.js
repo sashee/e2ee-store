@@ -21,7 +21,7 @@ export async function putBlob(rootKey, label, data, { offloadable = false, signa
 
 /**
  * All of blob `id`'s plaintext, returned only once the whole blob is checked against its ID: for code that acts on what
- * it reads, e.g. `keep` walking a tree of blobs (SPEC §5).
+ * it reads, e.g. `tree.reachable` walking the directories for cleanup's keep set (SPEC §6.11).
  */
 export async function openBlob(rootKey, label, id) {
   checkLabel(label);
@@ -34,7 +34,7 @@ export async function openBlob(rootKey, label, id) {
 }
 
 function checkLabel(label) {
-  if (typeof label !== "string" || label.length === 0) throw new TypeError("A blob's label is a non-empty string, e.g. `<namespace>/track/v1`");
+  if (typeof label !== "string" || label.length === 0) throw new TypeError("A blob's label is a non-empty string, e.g. `<namespace>/file/v1`");
 }
 
 function saltBytes(salt) {

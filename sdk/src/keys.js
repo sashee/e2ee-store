@@ -1,5 +1,5 @@
 // The keys document (SPEC §3.3): the master key wrapped once per passkey and once for the recovery key.
-// Operations are pure: (doc, now) → doc. `labels` (labels.js) are the app's.
+// Operations are pure: doc → doc. `labels` (labels.js) are the app's.
 
 import { aesGcmDecrypt, aesGcmEncrypt, b64urlDecode, b64urlEncode, hkdfAesKey, td, te } from "./crypto.js";
 

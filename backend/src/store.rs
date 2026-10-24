@@ -776,7 +776,7 @@ pub fn put_ref(
     let outcome = match blob_meta(&tx, user_id, blob)? {
         _ if !precondition_holds(precondition, current) => RefWrite::PreconditionFailed(current),
         None => RefWrite::BlobNotFound,
-        // Not offloadable but in a backend is only left behind by an older binary (SPEC §5.2); it comes back soon.
+        // Not offloadable but in a backend is only left behind by an older binary (SPEC §7.4); it comes back soon.
         Some(target) if target.offloadable || target.location != Location::Local => {
             RefWrite::BlobOffloadable
         }

@@ -14,7 +14,7 @@ use backend::{db, disk, offload, server, store};
 #[derive(Parser)]
 #[command(version, about = "Passkey users and git-like per-user storage")]
 struct Cli {
-    /// The configuration file. Every key can be overridden with BACKEND_<KEY>.
+    /// The configuration file. Every key but `backends` can be overridden with BACKEND_<KEY>.
     #[arg(long, global = true, default_value = "./config.toml")]
     config: PathBuf,
     #[command(subcommand)]

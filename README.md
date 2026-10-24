@@ -79,7 +79,8 @@ in
 
 ## Development
 
-nixpkgs is pinned in `nix/pkgs.nix`, for this repository's own builds and checks only.
+nixpkgs comes from `nix/pkgs.nix`, for this repository's own builds and checks only: the `nixos-26.05` branch, not a
+pinned commit, which hosts follow too, so CI here sees roughly what they will build with next.
 
 ```sh
 make check               # both packages and every check in the Nix sandbox (what CI runs)
@@ -90,6 +91,6 @@ make lint                # rustfmt and clippy
 make build               # backend/target/debug/backend
 ```
 
-`nix-build -A checks.<name>` runs one check: `lint`, `sdk-unit`, `browser`, `vm`. The Rust suite runs as part of
+`nix-build -A checks.<name>` runs one check: `lint`, `sdk-unit`, `browser`, `vm`, `vm-s3`. The Rust suite runs as part of
 building the backend. The SDK's flows run against a fake backend and authenticator (`sdk-unit`), and in Chromium
 against the real backend with a stand-in app (`browser`, `sdk/test/browser`).

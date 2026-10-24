@@ -282,7 +282,7 @@ pub async fn patch_blob(
     let id = blob_id(&id)?;
     let BlobFlags { offloadable } = json_body(&headers, body).await?;
     let user_id = authed.session.user_id;
-    // A blob in S3 comes back before it stops being offloadable. A pass can move it out again in between, so
+    // A blob in a backend comes back before it stops being offloadable. A pass can move it out again in between, so
     // a few rounds; each ends with the flag set or an error.
     for _ in 0..3 {
         match state
@@ -296,7 +296,7 @@ pub async fn patch_blob(
                     .and_then(|name| remotes.get(name))
                     && let Err(e) = offload::to_backend(&state, remote, user_id, &meta).await
                 {
-                    tracing::warn!("blob {id} stays in the database for now: {e:?}");
+                    tracing::warn!("blob {id} stays where it is for now: {e:?}");
                 }
                 return Ok(Json(blob_json(&meta)));
             }

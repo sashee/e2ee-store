@@ -50,7 +50,7 @@ pub struct AppState {
     pub remotes: Arc<Remotes>,
     /// The free space on the database's file system (SPEC §7.5).
     pub free_space: FreeSpace,
-    /// One writer at a time per S3 object (offload.rs).
+    /// One writer at a time per object, by backend and key (offload.rs).
     pub moving: Arc<KeyLocks>,
 }
 

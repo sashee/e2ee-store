@@ -73,14 +73,15 @@ impl ApiError {
         )
     }
 
-    /// An offloadable blob whose content S3 has lost (SPEC §7.4).
+    /// An offloadable blob whose content its storage backend has lost (SPEC §7.4).
     pub fn blob_lost() -> Self {
         Self::new(StatusCode::GONE, "blob_lost", "The blob's content is lost")
     }
 
-    /// S3 can't be reached; logged in full, reported without detail.
+    /// A storage backend can't be reached or answered wrongly, or a move can't go ahead; logged in full, reported
+    /// without detail.
     pub fn storage_unavailable(detail: impl Display) -> Self {
-        tracing::warn!("S3 is unavailable: {detail}");
+        tracing::warn!("storage unavailable: {detail}");
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "storage_unavailable",

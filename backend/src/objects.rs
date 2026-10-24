@@ -105,7 +105,13 @@ impl Objects {
     }
 
     pub fn with_timeouts(text: &str, timeouts: Timeouts) -> anyhow::Result<Self> {
-        let file: S3File = toml::from_str(text)?;
+        // A parse error quotes the line it stopped at, which can be a secret's: only its message and line number.
+        let file: S3File = toml::from_str(text).map_err(|e| {
+            let line = e
+                .span()
+                .map_or(0, |span| text[..span.start].matches('\n').count() + 1);
+            anyhow!("{} (line {line})", e.message().trim_end())
+        })?;
         let url_style = match file.url_style.as_deref() {
             None | Some("path") => UrlStyle::Path,
             Some("virtual-host") => UrlStyle::VirtualHost,
@@ -325,6 +331,26 @@ secret_access_key = "secret"
             Objects::from_file(&FILE.replace("https://s3.example.com", "s3.example.com")).is_err()
         );
         assert!(Objects::from_file(&FILE.replace("access_key_id = \"id\"\n", "")).is_err());
+    }
+
+    #[test]
+    fn a_broken_file_is_reported_without_its_contents() {
+        for broken in [
+            FILE.replace("secret_access_key", "secret_acess_key")
+                .replace("secret\"", "TOPSECRET\""),
+            FILE.replace("\"secret\"", "\"TOPSECRET"),
+            FILE.replace("\"secret\"", "TOPSECRET"),
+        ] {
+            let error = format!("{:#}", Objects::from_file(&broken).unwrap_err());
+            assert!(!error.contains("TOPSECRET"), "{error}");
+            assert!(error.contains("line "), "{error}");
+        }
+        let typo = FILE.replace("secret_access_key", "secret_acess_key");
+        let error = format!("{:#}", Objects::from_file(&typo).unwrap_err());
+        assert!(
+            error.contains("secret_acess_key"),
+            "the key's name helps: {error}"
+        );
     }
 
     #[test]

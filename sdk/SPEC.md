@@ -49,7 +49,7 @@ Every HKDF info, AAD, the PRF input and the keys format start with the app's nam
 
 ### 3.1 Keys
 
-All derivations use HKDF-SHA256 with an empty salt.
+All derivations use HKDF-SHA256, with an empty salt except for blob keys, which use the blob's own salt (§3.2).
 
 | Key             | Origin | Purpose |
 |-----------------|--------|---------|
@@ -103,7 +103,7 @@ The keys blob is plaintext JSON. Its secret parts are the wrapped keys.
   - The AAD is `UTF-8(labels.slot[kind])`, where `kind` is `recovery` or `passkey`.
   - Nonces and wrapped keys are base64url. A wrapped key is the 32-byte MK plus the 16-byte tag.
 - **Slot names:** passkey slots are named by the credential ID as the browser returns it in `credential.id` (base64url).
-- **Wrong keys:** a wrong key fails GCM authentication. For example, a mistyped recovery key produces "wrong recovery key".
+- **Wrong keys:** a wrong key fails GCM authentication. For example, a mistyped recovery key produces "Wrong recovery key".
 - **Versioning:**
   - `version` covers both this document and the tree's formats (§5).
   - Unknown fields are preserved when the document is rewritten.
@@ -158,7 +158,7 @@ An app's data is a tree of directories and files. The `vault` ref points to its 
   | `modified` | Files: the file's own time, as an ISO 8601 string. |
   | `app` | Files, optional: the app's own data, which the SDK keeps as it is. |
 
-- **Names:** not empty, not `.` or `..`, no `/` and no control characters, at most 255 UTF-8 bytes, and stored in NFC (`validName` checks one). A directory's entries are sorted by name (UTF-16 code units) and unique.
+- **Names:** not empty, not `.` or `..`, no `/`, no C0 control characters and no DEL, at most 255 UTF-8 bytes, and stored in NFC (`validName` checks one). A directory's entries are sorted by name (UTF-16 code units) and unique.
 - **Paths** are arrays of names; `[]` is the root.
 - **Checks:** a directory that isn't shaped like this is an integrity error. One of a higher `version` than the SDK knows can be read but not changed. A root of a higher version makes the whole tree read-only, as newer keys do (§3.3).
 - **Unknown fields:** a directory's unknown top-level fields are kept when it is rewritten, and entries a save doesn't change are kept as they are.
@@ -173,7 +173,7 @@ An app's data is a tree of directories and files. The `vault` ref points to its 
 ### 6.1 Unlock with a passkey
 
 1. `POST /auth/login/start`. The client adds `extensions.prf.eval.first = UTF-8(labels.prf)` to the options and calls `navigator.credentials.get()`. This is the only prompt.
-2. It reads the PRF output from `getClientExtensionResults().prf.results.first`. If there is none, it stops: "This passkey can't unlock the vault (no PRF support)".
+2. It reads the PRF output from `getClientExtensionResults().prf.results.first`. If there is none, it stops: "This passkey can't unlock the vault: it doesn't support the PRF extension."
 3. It deletes `clientExtensionResults.prf` from the credential JSON and calls `POST /auth/login/finish`, which creates the session.
 4. It loads the keys blob (`GET /refs/keys`, then the blob) and unwraps the MK from `passkeys[credential.id]`.
    - If there is no `keys` ref, the result is `no-vault`, or `keys-missing` if a `vault` ref exists (§6.2, step 3).
@@ -192,16 +192,16 @@ A setup link has the form `<origin>/#setup=<token>`, where the token is the back
 When the app starts with a fragment:
 
 1. It reads the token and immediately removes the fragment with `history.replaceState`, so it doesn't stay in history or on screen.
-2. `POST /auth/setup-token`. A 401 means "This link has expired or was already used".
+2. `POST /auth/setup-token`. A 401 means "This setup link has expired or was already used."
 3. `GET /refs/keys`:
    - **No `keys` ref and no `vault` ref:** create the vault (§6.3).
    - **No `keys` ref but a `vault` ref:** stop and tell the user to restore the server's data. A new vault would come with new keys, and the existing vault could never be opened again. `unlockWithPasskey` and `createVault` report this as `keys-missing`.
    - **`keys` exists:** ask for the recovery key and unwrap the MK from `recovery`.
-4. With the MK in memory, it registers a passkey on this host and sets it up (§6.6, steps 2–6). The setup-token session is fresh, so no step-up is needed. The user can skip this step, but then the next unlock on this host needs the recovery key again.
+4. With the MK in memory, it registers a passkey on this host and sets it up (§6.6, steps 1–6). The setup-token session is fresh, so step 1 needs no step-up. The user can skip this step, but then the next unlock on this host needs the recovery key again.
 
 ### 6.3 Creating the vault
 
-1. Register a passkey on this host and get its PRF output (§6.6, steps 2–5).
+1. Register a passkey on this host and get its PRF output (§6.6, steps 1–5).
 2. Generate the MK and the recovery key.
 3. Show the recovery key. The user has to confirm they saved it before continuing. Nothing has been stored yet, so closing the tab here leaves no trace.
 4. Check that there is a `keys` ref or no `vault` ref. A `vault` ref without a `keys` ref stops the creation before anything is written (`keys-missing`, §6.2).
@@ -212,14 +212,14 @@ When the app starts with a fragment:
 
 ### 6.4 Saving changes
 
-**The keys document** changes through operations, pure functions of the form `(document, now) → document`: `setPasskey(credentialId, slot)`, `removePasskey(credentialId)`, `setRecovery(slot)` and `prune(existingCredentialIds)`. A save applies the operation, uploads the result, and writes `PUT keys` with `If-Match: "<loaded blob id>"`. On a 412, it reads the current keys, checks their version (§3.3), and applies the operation to them again, at most 5 times.
+**The keys document** changes through operations, pure functions of the form `document → document`: `setPasskey(credentialId, slot)`, `removePasskey(credentialId)`, `setRecovery(slot)` and `prune(existingCredentialIds)`. A save applies the operation, uploads the result, and writes `PUT keys` with `If-Match: "<loaded blob id>"`. On a 412, it reads the current keys, checks their version (§3.3), and applies the operation to them again; at most 5 attempts in all.
 
 **The tree** changes through `save(session, steps, { signal, onProgress }) → { session }`. Each step is a function `(tx) => tx`, or a promise of one: it takes a transaction and returns the next.
 
 | On `tx` | |
 |---------|---|
 | `revision` | The revision the save is based on. The root it writes has the next one. |
-| `put(path, content) → tx` | Places `content` at `path`, replacing what is there and making missing directories. `content` is what `upload` returned, or an entry read from `tx`: an existing file or directory is re-pointed, not uploaded again. An entry may come back with a new `modified` and `app`, but otherwise as it was read. |
+| `put(path, content) → tx` | Places `content` at `path`, replacing what is there and making missing directories. `content` is what `upload` returned, or an entry read from `tx` or from `list`: an existing file or directory is re-pointed, not uploaded again. An entry may come back with a new `modified` and `app`, but otherwise as it was read. |
 | `remove(path) → tx` | Removes a file, or a directory with everything in it. Nothing at `path` is no change. |
 | `mkdir(path) → tx` | Makes an empty directory, and missing parents. An existing directory is no change. |
 | `upload(bytes, { modified, app, offloadable }) → content` | New file content: a `Uint8Array`, or a `Blob` that is read only when it's uploaded. `modified` defaults to the save's time; `offloadable` (§6.13) to false. |
@@ -233,12 +233,12 @@ When the app starts with a fragment:
 A save:
 
 1. Runs the steps on the loaded root.
-2. Uploads the new files, three at a time, then writes each changed directory once, bottom-up, and a new root with the next revision.
+2. Uploads the new files, three at a time, and writes each changed directory once, as soon as what it lists is written (bottom-up), then a new root with the next revision.
 3. `PUT vault` with `If-Match: "<loaded root's blob id>"`.
-4. On a 412, it reads the current root, checks it (§6.5), and runs the steps on it again from the start. Uploads of the same content object are reused, so only directories are written again. The client tries at most 5 times, then reports an error.
+4. On a 412, it reads the current root, checks it (§6.5), and runs the steps on it again from the start. Uploads of the same source (the same `Uint8Array` or `Blob`, with the same `offloadable`) are reused, so only directories are written again. The client tries at most 5 times, then reports an error.
 
 - **Steps must be pure functions of `tx`.** They may run more than once, and only what they write to `tx` takes effect.
-- **Errors** are `TreeError`s, with a `code` and the `path` concerned: `invalid_name`, `not_found`, `not_a_directory`, `is_a_directory`, `no_content`, `invalid_content`, `read_only` and `too_large`. Any error, or a step that doesn't return a tx, fails the save, and the ref doesn't move.
+- **Errors** are `TreeError`s, with a `code` and the `path` concerned: `invalid_name`, `not_found`, `not_a_directory`, `is_a_directory`, `no_content`, `invalid_content`, `read_only` and `too_large`. Invalid arguments (a path that isn't an array, `[]` where only `list` takes it, a bad `upload`, steps that aren't an array of functions) are `TypeError`s. Any error, or a step that doesn't return a tx, fails the save, and the ref doesn't move.
 - **Progress and abort:** `onProgress({ files, bytes, totalFiles, totalBytes })` follows the uploads. `signal` aborts them, and the save, until the ref moves; after that, the save is done. Blobs uploaded by a save that didn't finish are orphans that cleanup removes.
 - **Size limit:** a file over the backend's `max_blob_size` fails the save with `too_large`, naming its path. The SDK doesn't know the limit in advance.
 - **Large imports:** upload in several saves (e.g. one per album), so a failure costs one part, and each save finishes well within cleanup's 24-hour grace period.
@@ -266,7 +266,7 @@ A save:
 ### 6.7 Removing a passkey
 
 1. The app asks for confirmation. If this is the last passkey with a slot, it warns that the recovery key will be needed afterwards. The backend refuses to delete a user's very last passkey (409 `last_passkey`).
-2. `DELETE /me/passkeys/{id}`. On `reauth_required`, unlock again and retry.
+2. `DELETE /me/passkeys/{id}`. On `reauth_required`, log in again with a passkey (`reauthenticate(session)`) and retry.
 3. If the session still exists, save the keys document with `removePasskey`. Deleting the passkey that created the current session ends that session. In that case the app locks, and maintenance removes the slot later.
 
 ### 6.8 Adding a device
@@ -310,15 +310,14 @@ The server never cleans anything up, so the client does. The app runs `maintain`
 
 **Steps:**
 
-0. **Check before deleting anything.** Stop, deleting nothing, if:
+0. **Check before changing anything.** Stop, deleting nothing, if:
    - either ref is missing
    - the server's current root or keys document is from a newer version
    - the server's root is older than this session's (the app also doesn't run it while a rollback warning is shown)
-   - any listed blob ID isn't 64 hex characters (IDs go into URLs)
 1. **Prune the keys document:** remove passkey slots whose credential ID is not in `GET /me/passkeys`. Nothing is saved if nothing changed. Only the slots found stale are removed, also when the save is re-applied after a conflict, so a slot another device just added is never pruned.
 2. **Build the keep set:** the current `keys` blob, the root, and every directory and file the root reaches. Each directory is read once; ones this session has already read or written come from memory. A directory that can't be read stops the run here.
 3. **Delete old blobs:**
-   - List all blobs.
+   - List all blobs. Stop, deleting nothing, if any listed blob ID isn't 64 hex characters (IDs go into URLs), or the list has no `Date` header (below).
    - Delete every blob that is not in the keep set and whose `created_at` is more than 24 hours before the server's time (taken from the `Date` header of the list response). Without that header, nothing is deleted: this device's clock is no substitute, as it can be days off.
    - The grace period protects blobs that another device has uploaded but not yet referenced. It also applies to manual runs.
    - Blobs uploaded by saves that lost a compare-and-swap race (§6.4) were never committed, so they are deleted too.
@@ -347,17 +346,17 @@ An automatic run that failed is due again at the next unlock.
   - **Aborting:** `signal`, or cancelling the stream, aborts the requests, and nothing more comes out of the stream. An abort fails with the signal's reason, unchanged, so the app can tell it from a failure.
   - **Errors:** a blob that doesn't open, a chunk that fails and a range the server answers wrongly are integrity errors, from `read` or from the stream where they are read. A file whose content the server lost is a `BlobLostError` (§6.13).
 - **`CHUNK_SIZE`** (64 KiB, from `blobs.js`) is the plaintext in a chunk: the unit worth fetching.
-- **Caching:** directories never change, so a session keeps the ones it has read or written in memory, by ID. Browsing doesn't fetch a directory twice, and a save that runs again after a conflict doesn't either.
+- **Caching:** directories never change, so a session keeps the ones it has read or written in memory, by ID, up to 4096 (`CACHED_DIRS`), dropping the one kept longest. Browsing doesn't fetch a directory twice, and a save that runs again after a conflict doesn't either, while they stay in the cache.
 
 ### 6.13 Offloadable files
 
 An app can let the server keep a file's content outside its database (backend/SPEC.md §7.1), e.g. in cheaper storage for large media. That content may read more slowly, and can be lost with that storage: it suits files the app can do without or get back, like a track that is also in the user's music library.
 
 - **Uploading:** `tx.upload(bytes, { offloadable: true })` (§6.4). Only files can be offloadable. Directories and the root never are, so the tree itself always stays readable.
-- **Changing:** `setOffloadable(session, ids, offloadable)` sets the flag of the files with these blob IDs, one request each; the tree doesn't change. Flagging a directory the session has read or written is a `TypeError`, before anything is sent. The server refuses to flag the root (`blob_offloadable`).
+- **Changing:** `setOffloadable(session, ids, offloadable)` sets the flag of the files with these blob IDs, one request each; the tree doesn't change. Flagging a directory listed in one the session has read or written is a `TypeError`, before anything is sent. The server refuses to flag the root (`blob_offloadable`).
 - **Entries don't record the flag:** the server keeps it per blob. An app that needs to know keeps it itself, e.g. in the entry's `app`. A copy of a file elsewhere in the tree is the same blob, so it has the same flag.
 - **Lost content:** reading a file whose content is lost (`410 blob_lost`) fails with `BlobLostError` from `api.js`: an `ApiError` with code `blob_lost` and the blob's `id`. Its entry stays, and cleanup keeps the blob (§6.11); what to do, e.g. upload the file again, is up to the app.
-- **Where the content is** is the server's business (backend/SPEC.md §7.4): its configuration decides which storage backend, if any, offloadable files go to. While the backend can't be reached, reading a file there, or making it not offloadable, fails with `storage_unavailable`; uploading and flagging still work. Making a file not offloadable brings it into the server's database, and fails with `storage_full` if it hasn't the room.
+- **Where the content is** is the server's business (backend/SPEC.md §7.4): its configuration decides which storage backend, if any, offloadable files go to. While the backend can't be reached, reading a file there, or making it not offloadable, fails with `storage_unavailable`. Flagging still works, and so does uploading, as long as the server's database has the room to take the file instead (otherwise `storage_unavailable` too). Making a lost file not offloadable fails with an `ApiError` with code `blob_lost`. Making a file not offloadable brings it into the server's database, and fails with `storage_full` if it hasn't the room.
 
 ## 7. Modules
 
@@ -380,7 +379,7 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | `recovery-key.js` | Generating, formatting and parsing recovery keys (§3.4) |
 | `setup-link.js`   | Parsing and building setup fragments (§6.2) |
 
-Messages shown to the user come from the SDK, never from the server, so a misbehaving server can't put its own text in front of the user (e.g. asking for the recovery key).
+Messages shown to the user come from the SDK, never from the server, so a misbehaving server can't put its own text in front of the user (e.g. asking for the recovery key). A code without a message of its own (e.g. `bad_request`, `internal`) gets "The server refused the request (<code>, HTTP <status>)", with the code limited to `[a-z_]`, at most 40 characters.
 
 ## 8. Security notes
 
@@ -407,7 +406,8 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 
 ## 9. Testing
 
-- **Unit tests** (`node --test`; Node has WebCrypto) for the pure modules:
+- **Unit tests** (`node --test`; Node has WebCrypto), for the pure modules and, against the stand-ins of `test/fakes.js`, for the API client and the blobs:
+  - **API client:** fixed messages, the 401 handler, hash checks of downloaded blobs, blob ID checks, refs with compare-and-swap, deletes that count a missing blob as deleted, and the server's clock.
   - **Crypto:** wrap/unwrap round trips; a tampered nonce, ciphertext or AAD fails; keys of another kind or another namespace fail.
   - **Labels:** derived from the namespace; invalid namespaces are refused.
   - **Tree:** transactions (writes return new ones, reads see earlier writes), commits (only what changed, bottom-up, each directory and upload once, offloadable uploads apart), what `put` accepts back, names, read-only directories, errors, malformed directories, and what a root reaches.
@@ -418,7 +418,7 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 - **Flow tests** (`node --test`) run the flows and the backend client against stand-ins for the browser (`test/fakes.js`): an in-memory backend behind `fetch` and an authenticator with PRF behind `navigator.credentials`. They cover creating and unlocking, setup and recovery, saving (steps run again after a conflict, with uploads reused), progress and abort, rollback, newer versions, step-up, files read whole and in ranges, offloadable and lost files, cleanup by reachability, and a server that misbehaves.
 - **Format vectors:** `test/vectors.json` holds a keys blob of version 1, and a root directory listing a file blob of two chunks (the file's recipe and ID). `test/make-vectors.mjs` made them from this spec with `node:crypto` alone (`test/reference.mjs`). The SDK must keep opening them (§2).
 - **Browser tests:** real WebAuthn, `fetch` and ranges against the real backend. This repository runs the flows, a file in the tree and an offloadable one with a stand-in app (`test/browser`); each app runs its own UI with `testing/e2ee_store_harness.py`:
-  - `harness(run, static_dir)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium.
+  - `harness(run, static_dir, extra_env=None)` starts the backend (`BACKEND_BIN`) serving the app's static files behind `socat`, the way the iroh shim reaches it, and Chromium, then calls `run(browser, backend, port)`.
   - `new_device(browser, base)` is a browser profile with a virtual authenticator that supports PRF (CDP `WebAuthn.addVirtualAuthenticator`, `hasPrf: true`). With `prf_at_create=False` it behaves like authenticators that give the PRF output only at sign-in.
   - `Backend` runs admin commands (`setup_token(...)`) and reads the stored blobs.
 - **An app should test:** that data written by its earlier versions still opens with its labels (§2).

@@ -42,7 +42,8 @@ Non-goals for v1:
   - `webauthn_rp` with the features `serde_relaxed` and `serializable_server_state`, for WebAuthn. It is pure Rust on RustCrypto; `webauthn-rs` would bring in OpenSSL.
   - `rusqlite` for SQLite in WAL mode.
   - `sha2`, `getrandom`, `base64`, `serde` + `serde_json`, `toml`, `humantime`, `clap`, `tracing`.
-  - For S3: `rusty-s3`, which only signs requests, and `reqwest` with rustls on `ring` to send them. reqwest's default, aws-lc-rs, takes much longer to build on the host.
+  - For S3: `rusty-s3`, which only signs requests, and `reqwest` with rustls on `ring` to send them, trusting the system's CA certificates through `rustls-native-certs`. reqwest's default, aws-lc-rs, takes much longer to build on the host. Also `md-5` (`Content-MD5`) and `url`.
+  - `rustix` for the free space on the database's file system (`statvfs`), without `unsafe`.
 - One crate, with a module for each responsibility:
   - `domain`: pure types and rules. This covers validating IDs, names and hosts, parsing ranges, evaluating preconditions and computing expiry times. It does no I/O, and the current time is always passed in as an argument.
   - `store`: plain functions over a SQLite connection, one per query or transaction; the caller passes the time.
@@ -84,7 +85,7 @@ direct:       browser → https://app.example.com → reverse proxy (TLS) → ba
 ```
 backend/   the Rust backend (this spec), no app-specific code
 sdk/       the browser side: keys, encryption, flows (../sdk/SPEC.md)
-nix/       the NixOS module (one instance per app) and its VM test
+nix/       the NixOS module (one instance per app) and its VM tests: the instance alone, and with S3 backends
 ```
 
 ## 4. Identifiers & formats
@@ -101,6 +102,8 @@ nix/       the NixOS module (one instance per app) and its VM test
 | Secret tokens | 32 bytes from a CSPRNG, encoded as base64url. Only their SHA-256 hash is stored. |
 
 ## 5. Data model
+
+Every table is `STRICT`.
 
 ```sql
 CREATE TABLE users (
@@ -119,6 +122,7 @@ CREATE TABLE passkeys (
   created_at    INTEGER NOT NULL,
   last_used_at  INTEGER
 );
+CREATE INDEX passkeys_by_user ON passkeys(user_id);
 
 CREATE TABLE sessions (
   token_hash  BLOB PRIMARY KEY,                 -- SHA-256(token)
@@ -128,6 +132,7 @@ CREATE TABLE sessions (
   expires_at  INTEGER NOT NULL
 );
 CREATE INDEX sessions_by_expiry ON sessions(expires_at);
+CREATE INDEX sessions_by_passkey ON sessions(passkey_id);
 
 CREATE TABLE setup_tokens (
   token_hash  BLOB PRIMARY KEY,
@@ -204,7 +209,7 @@ Step-up (§6.5) is a separate rule based on the session's age. It doesn't change
 
 ### 5.2 Schema versions
 
-The schema is migrated with plain SQL when the server starts. Its version is `major.minor`, stored in `PRAGMA user_version` as `major * 1000 + minor`, with `N.0` as the bare `N`: the databases from before versions had a minor hold `1`, which is `1.0`.
+The schema is migrated with plain SQL when the server or an admin command starts. Its version is `major.minor`, stored in `PRAGMA user_version` as `major * 1000 + minor`, with `N.0` as the bare `N`: the databases from before versions had a minor hold `1`, which is `1.0`.
 
 The split lets an older binary keep running against a database a newer one has migrated. That happens routinely: the host's nightly upgrade replaces a generation switched to by hand with the one the pipeline last delivered.
 
@@ -228,7 +233,7 @@ The split lets an older binary keep running against a database a newer one has m
 
 | Version | Change |
 |---------|--------|
-| 1.0     | The tables above, without `blobs.offloadable` |
+| 1.0     | The tables above, without `blobs.offloadable`, `blobs.location` and its index, `backends` and `s3_location`; `content` before `created_at` |
 | 1.1     | `blobs.offloadable` |
 | 1.2     | `blobs.location`, its index, `s3_location` |
 | 1.3     | `blobs` rebuilt: `location` holds `local` or any backend's name; `backends`, with 1.2's S3 as the backend `s3` |
@@ -283,7 +288,7 @@ The client handles PRF for end-to-end encryption; the server takes no part in it
   - It accepts responses that contain extensions it didn't ask for. This covers `prf` in the client results and `hmac-secret` in the authenticator data.
   - `webauthn_rp` still records at registration whether a credential supports `hmac-secret`, and checks later logins against that.
   - The server never stores or logs client extension results.
-- **Per-passkey keys:** passkeys are tied to one host and PRF output is different for every passkey. Wrapping the data key once per passkey, and moving keys to a new host, is the SDK's job (`../sdk/SPEC.md` §3).
+- **Per-passkey keys:** passkeys are tied to one host and PRF output is different for every passkey. Wrapping the master key once per passkey, and moving to a new host, is the SDK's job (`../sdk/SPEC.md` §3.1, §6.8).
 
 ### 6.4 Sessions
 
@@ -390,7 +395,7 @@ Offloadable blobs can live in storage backends. Each has a name, a type and a cr
   - **Unflagging** a blob in a backend brings it into the database first, in the same step as the flag changes, room permitting. Otherwise the flag doesn't change: 507 `storage_full`, 503 `storage_unavailable`, or 410 `blob_lost` if its object is gone or damaged. A blob that isn't offloadable is always in the database, so refs only point to blobs there.
   - **The pass**, at startup and every hour, moves every blob that isn't where it belongs: from the database to the target, from one backend to the target, or into the database. Changing `blob_target` and restarting moves them all.
   - **Between backends**, a blob goes through memory: fetched whole, checked against its ID, stored in the target, and deleted where it was. The database never holds it, so this needs no room on the host.
-  - **Checks:** content going to S3 carries `Content-MD5`, so S3 refuses it if damaged. Content coming from a backend must hash to the blob ID. A row only changes if the blob is still where it was when the move started.
+  - **Checks:** content going to S3 carries `Content-MD5`, so S3 refuses it if damaged. Requests to S3 time out after 10 s without a connection and 60 s without a byte of the response. Content coming from a backend must hash to the blob ID. A row only changes if the blob is still where it was when the move started.
 - **Reads** of a blob in a backend stream from there, with the same `Range` handling: the server asks for exactly the bytes the client asked for, and checks that it gets them. HEAD and unsatisfiable ranges don't ask. An object that is gone is 410 `blob_lost`; a backend that can't be reached, 503 `storage_unavailable`. A blob that moves while it is read is looked up again.
 - **Deleting** a blob deletes its object after its row.
 - **The sweep** runs in each pass, for every configured backend, and deletes the objects no blob in that backend owns: left by a crash in the middle of a move, by deleted users, or by an older binary. It doesn't touch keys that don't have the form above, so each server needs a prefix of its own in each bucket.
@@ -417,7 +422,7 @@ Writes into the database keep `min_free_space` (1 GiB by default) free on its fi
 
 - **Base path:** `/api/v1`. Requests and responses are JSON unless noted.
 - **Errors:** `{"error": "<code>", "message": "<human readable>"}`, for every API error, including a query string that doesn't parse or a method a route doesn't have.
-- **Response headers:** every API response has `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+- **Response headers:** every response from an API route has `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The host and Origin checks (§6.1) answer before the routes, so their 400 `unknown_host` and 403 `forbidden` don't carry them; browsers don't cache those statuses.
 - **Request limits:** JSON request bodies are limited to 64 KiB.
 - **Authentication:** session-authenticated endpoints return 401 `unauthenticated` when there is no valid session.
 
@@ -428,7 +433,7 @@ Writes into the database keep `min_free_space` (1 GiB by default) free on its fi
 | POST      | `/auth/login/start`            | –                 | Begin passkey login |
 | POST      | `/auth/login/finish`           | –                 | Complete login and set the session cookie |
 | POST      | `/auth/setup-token`            | –                 | Exchange a setup token for a session |
-| POST      | `/auth/logout`                 | session           | End the current session |
+| POST      | `/auth/logout`                 | –                 | End the current session, if there is one |
 | GET       | `/me`                          | session           | Current user |
 | POST      | `/me/setup-tokens`             | session + step-up | Create a setup token for yourself |
 | GET       | `/me/passkeys`                 | session           | List passkeys |
@@ -511,6 +516,8 @@ Writes into the database keep `min_free_space` (1 GiB by default) free on its fi
 - **400** `hash_mismatch`; `bad_request` for any other `Blob-Offloadable` value.
 - **413** `blob_too_large`.
 - **415** `unsupported_media_type`.
+- **503** `storage_unavailable`: an offloadable blob couldn't go to the target backend, and the database hasn't the room for it either (§7.4).
+- **507** `storage_full`: the blob goes into the database, and it hasn't the room (§7.5).
 
 `GET /blobs/{id}`:
 - **Response:** 200 with the full body. With a single satisfiable `Range: bytes=…` header (forms `a-b`, `a-`, `-n`) it returns 206 with `Content-Range`.
@@ -575,7 +582,7 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 
 ### 8.6 Static files
 
-- **What is served:** GET and HEAD for any path outside `/api/` and `/healthz` are served from `static_dir`.
+- **What is served:** GET and HEAD for any path outside `/api/v1/` and `/healthz` are served from `static_dir`.
   - `/` serves `index.html`.
   - There is no fallback to `index.html` for unknown paths, and no directory listing. Missing files return 404.
   - Paths that try to escape `static_dir` are refused.
@@ -605,17 +612,17 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 | 405  | `method_not_allowed`     | The route doesn't have this method; `Allow` lists the ones it has |
 | 409  | `blob_referenced`        | A ref still points to the blob |
 | 409  | `blob_not_found`         | The ref target doesn't exist |
-| 409  | `blob_offloadable`       | A ref would point to an offloadable blob |
+| 409  | `blob_offloadable`       | A ref would point to an offloadable blob, or to one still in a backend; or a blob a ref points to would be flagged offloadable |
 | 409  | `last_passkey`           | The user tried to delete their only passkey |
 | 409  | `passkey_exists`         | The credential is already registered |
-| 410  | `blob_lost`              | The offloadable blob's content is gone |
-| 503  | `storage_unavailable`    | A storage backend can't be reached, or answered wrongly; the details are only logged |
-| 507  | `storage_full`           | Writing into the database would take its file system below `min_free_space` (§7.5) |
+| 410  | `blob_lost`              | The offloadable blob's content is gone or damaged |
 | 412  | `precondition_failed`    | The expect check failed |
 | 413  | `blob_too_large`         | The blob is larger than `max_blob_size`, or a JSON body is over 64 KiB |
 | 415  | `unsupported_media_type` | Wrong `Content-Type` |
 | 416  | `range_not_satisfiable`  | The range is outside the blob |
 | 500  | `internal`               | Anything else; the details are only logged |
+| 503  | `storage_unavailable`    | A storage backend can't be reached or answered wrongly, an upload to it failed and the database hasn't the room, the free space can't be read, or the blob kept moving; the details are only logged |
+| 507  | `storage_full`           | Writing into the database would take its file system below `min_free_space` (§7.5) |
 
 ## 9. Admin CLI
 
@@ -641,9 +648,9 @@ Settings come from a TOML file. Any key can be overridden with an environment va
 |-----------------|--------------------------|---------|
 | `socket`        | `./data/backend.sock`    | Path of the Unix domain socket the server listens on |
 | `database`      | `./data/backend.sqlite3` | Path of the SQLite file |
-| `static_dir`    | (required)               | Frontend files, served for every path outside `/api/` and `/healthz` |
+| `static_dir`    | (required)               | Frontend files, served for every path outside `/api/v1/` and `/healthz` |
 | `static_csp`    | see §8.6                 | `Content-Security-Policy` header sent with static files |
-| `public_hosts`  | `[]`                     | Hosts reached over HTTPS, e.g. `["app.example.com", "other.example.com:8443"]`. Empty means the iroh path only. An entry that could never match a request is refused at startup: anything but a DNS name with an optional port, a loopback name, or port 443 (browsers leave the default port out of `Host`). |
+| `public_hosts`  | `[]`                     | Hosts reached over HTTPS, e.g. `["app.example.com", "other.example.com:8443"]`. Empty means the iroh path only. From the environment, a comma-separated list. An entry that could never match a request is refused at startup: anything but a DNS name with an optional port, a loopback name, or port 443 (browsers leave the default port out of `Host`). |
 | `rp_name`       | `"Backend"`              | WebAuthn RP display name |
 | `session_ttl`   | `4h`                     | How long a session lasts after login |
 | `reauth_window` | `5m`                     | Step-up window |
@@ -676,13 +683,13 @@ For S3:
 endpoint = "https://s3.eu-central-003.backblazeb2.com"
 region = "eu-central-003"
 bucket = "music-blobs"
-prefix = "music/"              # required; one per server, as the sweep owns everything under it
+prefix = "music/"              # required; one per server, as the sweep deletes the keys of its form under it
 access_key_id = "…"
 secret_access_key = "…"
 # url_style = "virtual-host"   # default "path"
 ```
 
-- Unknown keys, an empty prefix or one starting with `/` are refused at startup.
+- Unknown keys, an empty prefix or one starting with `/` are refused at startup. A file that doesn't parse is reported by line and message only, never with the line itself, which could hold a secret.
 - TLS uses the system's CA certificates (`SSL_CERT_FILE` when set).
 
 ## 11. Security notes
@@ -708,7 +715,7 @@ secret_access_key = "…"
   - validation of names, IDs and hosts
   - the expected origin and RP ID for a given host
   - expiry computation
-- **HTTP integration tests** call the router directly against an in-memory SQLite database, so they don't need a socket. They use a software authenticator.
+- **HTTP integration tests** call the router directly against a SQLite database in a temporary directory, so they don't need a socket. They use a software authenticator.
   - **End-to-end flows:** registration, login, step-up, self-service and CLI setup tokens, and expiry.
   - **Hosts and origins:**
     - unknown hosts and IP addresses are refused
@@ -717,16 +724,17 @@ secret_access_key = "…"
     - a ceremony can't be finished from another host or port
   - **Cookies:** `Secure` is present on public hosts and absent on loopback hosts.
   - **PRF:** responses carrying unrequested `prf` client results and `hmac-secret` authenticator data are accepted, and the server neither stores nor returns them.
-- **Schema versions:** the stored form of a version, migrating a new and a `1.0` database, and a newer minor accepted and a newer major refused, both left as they are.
 - **Offloading:** against a stand-in S3 per backend on 127.0.0.1 (`tests/common/s3.rs`): uploads and reads through S3, every range form, S3 answering errors, refusing connections or never answering (bounded by the timeouts), lost and damaged objects, flag changes both ways, the target at each pass, moves between backends with no room on the host, the sweep and what it leaves alone, a deleted user's objects, refs, races between moves and passes, the space returned, the backend guard, and errors that don't name the location or carry a signed URL.
 - **Free space** (with the free space a test sets): uploads keep the reserve, a blob is unflagged only if it fits, and blobs come home all together or not at all.
-- **Migrations:** the stored form of versions, a new and a 1.0 database, newer minors and majors, the 1.3 rebuild of a 1.2 database with rows, refs and an S3 location (rows, foreign keys, the index, and a 1.2 binary's reads and writes afterwards), and several processes starting at once.
+- **Migrations:** the stored form of versions, a new and a 1.0 database, a newer minor accepted and a newer major refused (both left as they are), the 1.3 rebuild of a 1.2 database with rows, refs and an S3 location (rows, foreign keys, the column order, the index, and a 1.2 binary's reads and writes afterwards), and many connections starting at once on new, 1.0 and 1.2 databases.
 - **VM test with S3** (`nix/tests/s3.nix`): the NixOS module with two backends, each a systemd-encrypted credential file and a bucket in Garage, behind nginx for TLS with a test CA.
   - Blobs go to S3, are read back through the API, whole and in a range, come back when the target changes, and move from one backend to the other and back.
   - The credentials are encrypted at rest, and only the service user can read the decrypted copies.
   - Against a real S3: the sweep deletes an orphan and leaves keys that aren't its own; while S3 is down, uploads still work and reads fail with 503, and the next pass moves what waited; an object deleted in S3 reads as 410.
   - Nothing of the credential file reaches the journal, failures included.
-- **Smoke test:** the server serves requests over the Unix socket and cleans the socket up on shutdown.
+- **Smoke test:** the server serves requests over the Unix socket and cleans the socket up on shutdown; the socket is its group's alone, and a stale one is replaced but a live one isn't.
+- **Admin commands:** `user create`, `list` and `delete`, `setup-token create` and `storage`, against the binary.
+- **VM test of the NixOS module** (`nix/tests/lib.nix`): the socket's access control, the admin wrapper running as the service user, a restart, and the sandbox. Apps and hosts run it on their own instance and machine.
 - **Concurrency test:** several writers compare-and-swap the same ref in parallel. Exactly one must win in each round.
 - **Manual checks:** register and log in with PRF through:
   - the iroh path on a laptop (Chrome and Firefox)

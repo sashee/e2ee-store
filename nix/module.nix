@@ -50,8 +50,8 @@ let
             rp_name = "Notes";
           };
           description = ''
-            The backend's configuration file (backend SPEC §10). `socket`, `database` and `static_dir`
-            are set by this module.
+            The backend's configuration file (backend SPEC §10). `socket`, `database`, `static_dir` and,
+            from `storageBackends`, `backends` are set by this module.
           '';
         };
 
@@ -67,7 +67,8 @@ let
                   type = lib.types.str;
                   example = "/etc/credentials/notes/backblaze";
                   description = ''
-                    The backend's credential file (backend SPEC §10.1): for S3, endpoint, bucket, prefix and keys.
+                    The backend's credential file (backend SPEC §10.1): for S3, endpoint, region, bucket, prefix and
+                    keys, and optionally `url_style`.
                     Encrypted with `systemd-creds encrypt --name=<backend's name> - <file>`.
                   '';
                 };

@@ -1,5 +1,5 @@
 //! A stand-in for S3 on 127.0.0.1, path-style, with what the backend uses: PUT (checking Content-MD5), GET with
-//! ranges, DELETE and ListObjectsV2 in pages. Signatures aren't checked; the VM test runs against MinIO for that.
+//! ranges, DELETE and ListObjectsV2 in pages. Signatures aren't checked; the VM test runs against Garage for that.
 //! The objects are plain state the tests read and change, e.g. to lose one or to take S3 down.
 
 use std::collections::BTreeMap;

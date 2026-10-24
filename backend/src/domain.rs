@@ -156,7 +156,7 @@ pub fn public_host_problem(entry: &str) -> Option<&'static str> {
     }
 }
 
-/// Dot-separated labels of `[a-z0-9-]`, not starting or ending with `-`, and not all digits (no IPs).
+/// Dot-separated labels of `[a-z0-9-]`, not starting or ending with `-`, the last one not all digits (no IPs).
 fn valid_dns_name(name: &str) -> bool {
     let labels_ok = name.split('.').all(|label| {
         (1..=63).contains(&label.len())

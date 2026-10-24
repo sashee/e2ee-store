@@ -86,8 +86,8 @@ export function makeFlows({ labels }) {
   const sealDir = (contentKey, doc) => stream.seal(contentKey, labels.dir, te.encode(JSON.stringify(doc)));
 
   /**
-   * Directories never change, so each is read and checked once per content key. The entries they list are the ones
-   * `put` accepts back (tree.js).
+   * Directories never change, so each is read and checked once per content key, while it stays among the last
+   * CACHED_DIRS. The entries they list are the ones `put` accepts back (tree.js).
    */
   const caches = new WeakMap();
   const cacheOf = (contentKey) => {
