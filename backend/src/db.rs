@@ -239,11 +239,14 @@ INSERT INTO backends (name, type, identity)
     },
 ];
 
+/// How long a statement waits for another connection's lock.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A connection with the per-connection settings every caller needs. Foreign keys in particular are off
 /// by default in SQLite and must be enabled on each connection.
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
     Ok(conn)
 }
@@ -254,7 +257,7 @@ pub fn open_and_migrate(path: &Path) -> anyhow::Result<Connection> {
         std::fs::create_dir_all(dir)?;
     }
     let mut conn = open(path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    use_wal(&conn)?;
     // Off around the migration, as a rebuild drops a table others point to; outside its transaction, as SQLite
     // ignores the pragma inside one. `foreign_key_check` stands in for it.
     conn.pragma_update(None, "foreign_keys", false)?;
@@ -262,6 +265,24 @@ pub fn open_and_migrate(path: &Path) -> anyhow::Result<Connection> {
     conn.pragma_update(None, "foreign_keys", true)?;
     migrated?;
     Ok(conn)
+}
+
+/// Switches the database to WAL. A new one starts in rollback-journal mode, and there two processes switching at
+/// once could each wait for the other: SQLite answers "busy" right away instead of waiting out the busy timeout. So
+/// this tries again, for as long as that timeout.
+fn use_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Brings an older schema to `SCHEMA_VERSION` in one transaction. A newer minor is left as it is, with a warning; a
@@ -567,26 +588,45 @@ mod tests {
         .unwrap();
     }
 
+    /// Several processes starting at once, on a new, a 1.0 and a 1.2 database: one migrates, the others find it
+    /// done. Switching a database to WAL is where they collide (`use_wal`).
     #[test]
-    fn starting_twice_at_once_migrates_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("backend.sqlite3");
-        drop(at_1_2(&path));
-        let starts: Vec<_> = (0..4)
-            .map(|_| {
-                let path = path.clone();
-                std::thread::spawn(move || open_and_migrate(&path).map(|_| ()))
-            })
-            .collect();
-        for start in starts {
-            start.join().unwrap().unwrap();
+    fn many_starts_at_once_migrate_once() {
+        for round in 0..60 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("backend.sqlite3");
+            let blobs = match round % 3 {
+                0 => 0,
+                1 => {
+                    let conn = open(&path).unwrap();
+                    conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+                    conn.pragma_update(None, "user_version", 1).unwrap();
+                    0
+                }
+                _ => {
+                    drop(at_1_2(&path));
+                    2
+                }
+            };
+            let starts: Vec<_> = (0..16)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || open_and_migrate(&path).map(|_| ()))
+                })
+                .collect();
+            for start in starts {
+                start
+                    .join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+            }
+            let conn = open(&path).unwrap();
+            assert_eq!(stored(&conn), 1003);
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, blobs);
         }
-        let conn = open(&path).unwrap();
-        assert_eq!(stored(&conn), 1003);
-        let blobs: i64 = conn
-            .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(blobs, 2);
     }
 
     #[test]

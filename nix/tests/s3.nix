@@ -146,6 +146,9 @@ import ./lib.nix {
 
 
     def restart():
+        # This test restarts more often than systemd's start limit allows (5 in 10 s); `reset-failed` resets the
+        # count. A service restarting by itself waits 5 s, so it can't reach the limit.
+        machine.systemctl(f"reset-failed {NAME}.service")
         machine.systemctl(f"restart {NAME}.service")
         wait_until_serving()
 
