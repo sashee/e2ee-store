@@ -27,7 +27,7 @@ Non-goals for v1:
 | D3  | Expect / CAS       | Sent as HTTP preconditions: `If-Match: "<id>"` (the ref points to that blob), `If-None-Match: *` (the ref does not exist), `If-Match: *` (the ref exists). |
 | D4  | Provisioning       | Users can only be created with the admin CLI. Setup tokens can be created by the CLI, or by a logged-in user for their own account. |
 | D5  | Setup token        | Single-use, expires 15 minutes after creation, gives a normal session. |
-| D6  | Storage            | SQLite for metadata and blob bytes; offloadable blobs optionally in S3 (§7.4). Maximum blob size 16 MiB. No quotas. |
+| D6  | Storage            | SQLite for metadata and blob bytes; offloadable blobs optionally in named storage backends, such as S3 (§7.4). Maximum blob size 16 MiB. No quotas; writes into the database keep a reserve free (§7.5). |
 | D7  | Sessions           | `HttpOnly` cookie, expires 4 hours after login, `Secure` only when served over HTTPS. |
 | D8  | Network            | The server listens on a Unix domain socket. Browsers reach it through an iroh tunnel (plain HTTP on a loopback name) or through an HTTPS reverse proxy. The backend serves the frontend on both paths. |
 | D9  | Hosts              | Only loopback names and the configured public hosts are accepted. The WebAuthn RP ID is the request's host, so each passkey belongs to one host. |
@@ -52,7 +52,9 @@ Non-goals for v1:
   - `secret`: session and setup tokens, of which only hashes are stored.
   - `http`: routes, extractors, the host/origin checks and the mapping from errors to responses.
   - `objects`: the S3 client: its credential file, object keys and requests.
-  - `offload`: moving blobs between the database and S3 (§7.4).
+  - `remotes`: the storage backends, by name and type, over the clients of their types (S3 so far).
+  - `offload`: moving blobs between the database and the backends, and between backends (§7.4).
+  - `disk`: free space on the database's file system (§7.5).
   - `server`: the Unix socket, the background cleanup and the offloading pass.
   - `config`: the configuration file and the environment.
   - `main.rs`: the binary's subcommands, the admin commands among them.
@@ -152,12 +154,18 @@ CREATE TABLE blobs (
   content     BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
   offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),  -- §7.1; added in 1.1
-  location    TEXT NOT NULL DEFAULT 'local' CHECK (location IN ('local', 's3')),  -- §7.4; added in 1.2
+  location    TEXT NOT NULL DEFAULT 'local' CHECK (location <> ''),  -- 'local' or a backend's name (§7.4); 1.2, 1.3
   PRIMARY KEY (user_id, id)
 );
 CREATE INDEX blobs_by_location ON blobs(location, offloadable);
 
-CREATE TABLE s3_location (                      -- where blobs in S3 are (§7.4); one row
+CREATE TABLE backends (                         -- the backends blobs went to (§7.4); added in 1.3
+  name      TEXT PRIMARY KEY,
+  type      TEXT NOT NULL,                      -- 's3'
+  identity  TEXT NOT NULL                       -- JSON: where it keeps blobs, nothing secret
+);
+
+CREATE TABLE s3_location (                      -- 1.2's record of its one S3; unused since 1.3, kept for 1.2 binaries
   id        INTEGER PRIMARY KEY CHECK (id = 1),
   endpoint  TEXT NOT NULL,
   bucket    TEXT NOT NULL,
@@ -208,9 +216,11 @@ The split lets an older binary keep running against a database a newer one has m
 - **A minor migration may only:**
   - create a table or an index;
   - add a column that is nullable or has a default, so an older binary's `INSERT`, which doesn't name it, still works;
-  - rebuild a table to change only how it is stored, keeping every column and refusing exactly the rows it refused before.
+  - rebuild a table to change only how it is stored, keeping every column and refusing exactly the rows it refused before; or to relax a constraint that only a newer configuration's data needs relaxed (1.3).
 - **Everything else is a major:** dropping or renaming a table or column, changing a column's type, a constraint an older binary's writes could break, or a new meaning for existing data. The test is whether the previous binary would still behave correctly against the database.
-- **One exception:** data that only a newer binary's configuration creates may make an older binary fail loudly, never quietly wrong. 1.2 is the case: a 1.1 binary answers 500 for blobs in S3, as it reads past their empty content.
+- **One exception:** data that only a newer binary's configuration creates may make an older binary fail loudly, never quietly wrong. 1.2 is the case: a 1.1 binary answers 500 for blobs in S3, as it reads past their empty content. So is 1.3: a 1.2 binary takes a blob in a backend of another name than `s3` for one in the database, and answers 500 for it the same way.
+- **Running a migration:** in one transaction, which takes the write lock before reading the version, so a server and an admin command starting together migrate once. Foreign keys are off around it, as a rebuild drops a table others point to, and `PRAGMA foreign_key_check` must find nothing before it commits. A rebuild first checks that the file system has twice the database's size free, and refuses to start otherwise.
+- **How a rebuild goes:** create the new table under another name, copy the rows, drop the old table, rename the new one, recreate its indexes. Never rename the old table away: other tables' foreign keys would follow it.
 - **A new major stops every older binary from starting.** Deliver a binary that no longer depends on what the major changes first, through the pipeline, and only then the major. The binary pins its major at compile time, so changing it is a deliberate edit.
 - Binaries from before this scheme refuse anything above `1`, so the first one to migrate to `1.1` can't be reverted to them; the server just doesn't start until the newer binary is back.
 
@@ -219,6 +229,7 @@ The split lets an older binary keep running against a database a newer one has m
 | 1.0     | The tables above, without `blobs.offloadable` |
 | 1.1     | `blobs.offloadable` |
 | 1.2     | `blobs.location`, its index, `s3_location` |
+| 1.3     | `blobs` rebuilt: `location` holds `local` or any backend's name; `backends`, with 1.2's S3 as the backend `s3` |
 
 ## 6. Authentication
 
@@ -326,7 +337,7 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 - Uploading is idempotent. Uploading an ID that already exists does nothing, and `created_at` stays the same.
 - A blob can't be deleted while a ref points to it (409).
 - Each upload is limited by `max_blob_size` (16 MiB by default). There are no per-user quotas.
-- **Offloadable blobs.** A client can flag a blob as offloadable: the server may then keep its content outside the database, in S3 (§7.4), where reads are slower and the content may be lost along with that storage.
+- **Offloadable blobs.** A client can flag a blob as offloadable: the server may then keep its content outside the database, in a storage backend such as S3 (§7.4), where reads are slower and the content may be lost along with that storage.
   - The flag is set when the blob is uploaded, and only then: re-uploading an existing blob keeps its flag. It can be changed any time afterwards.
   - A ref can't point to an offloadable blob, and a blob a ref points to can't be flagged (409 `blob_offloadable`). What refs point to stays in the database, so a client can always find its way in.
   - Binaries before 1.1 (§5.2) upload blobs that aren't offloadable and don't check refs against the flag.
@@ -366,25 +377,39 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
 - **Metadata the server sees:** ref names, blob sizes, counts and timing. Don't put secrets in ref names.
 - **Ref names from credential IDs:** credential IDs can be up to 1023 bytes. Hash them before using them in a ref name (e.g. a per-passkey key ref).
 
-### 7.4 Offloading to S3
+### 7.4 Storage backends
 
-With an S3 credential file (`s3_file`, §10.1), offloadable blobs can live in S3. `blob_target` (§10) says where they belong: `local` keeps everything in the database, `s3` puts offloadable blobs in S3. Every other blob is always in the database. Clients can't tell where a blob is.
+Offloadable blobs can live in storage backends. Each has a name, a type and a credential file (§10.1); S3 is the one type so far. `blob_target` (§10) says where offloadable blobs belong: `local`, the database, or a backend's name. Every other blob is always in the database. Clients can't tell where a blob is.
 
-- **Where a blob is** is in its row (`location`). A blob in S3 keeps its row, with empty `content`, under the key `<prefix><user ID>/<blob ID>`.
+- **Where a blob is** is in its row (`location`): `local`, or the backend's name. A blob in a backend keeps its row, with empty `content`. In S3 its key is `<prefix><user ID>/<blob ID>`.
 - **Moves:**
-  - **Upload:** a new offloadable blob goes straight to S3 when the target is `s3`. If S3 fails, it is stored in the database and the upload still succeeds.
-  - **Flagging** (`PATCH`, `true`) moves the blob to S3 before answering, if the target is `s3`. If S3 fails, it stays in the database and the request still succeeds.
-  - **Unflagging** a blob in S3 brings it back first, in the same step as the flag changes. If S3 fails, the flag doesn't change: 503 `storage_unavailable`, or 410 `blob_lost` if its object is gone or damaged. A blob that isn't offloadable is always in the database, so refs only point to blobs there.
-  - **The pass**, at startup and every hour, moves every blob that isn't where it belongs. Changing `blob_target` and restarting moves them all in or out.
-  - **Checks:** content going to S3 carries `Content-MD5`, so S3 refuses it if damaged. Content coming back must hash to the blob ID. A row only changes if the blob is still as it was when the move started.
-- **Reads** of a blob in S3 stream from S3, with the same `Range` handling: the server asks S3 for exactly the bytes the client asked for, and checks that it gets them. HEAD and unsatisfiable ranges don't ask S3. An object that is gone is 410 `blob_lost`; an S3 that can't be reached, 503 `storage_unavailable`.
+  - **Upload:** a new offloadable blob goes straight to the target backend. If that fails, it is stored in the database, room permitting (§7.5), and the upload still succeeds; without the room, 503 `storage_unavailable`.
+  - **Flagging** (`PATCH`, `true`) moves the blob to the target backend before answering. If that fails, the blob stays where it is and the request still succeeds.
+  - **Unflagging** a blob in a backend brings it into the database first, in the same step as the flag changes, room permitting. Otherwise the flag doesn't change: 507 `storage_full`, 503 `storage_unavailable`, or 410 `blob_lost` if its object is gone or damaged. A blob that isn't offloadable is always in the database, so refs only point to blobs there.
+  - **The pass**, at startup and every hour, moves every blob that isn't where it belongs: from the database to the target, from one backend to the target, or into the database. Changing `blob_target` and restarting moves them all.
+  - **Between backends**, a blob goes through memory: fetched whole, checked against its ID, stored in the target, and deleted where it was. The database never holds it, so this needs no room on the host.
+  - **Checks:** content going to S3 carries `Content-MD5`, so S3 refuses it if damaged. Content coming from a backend must hash to the blob ID. A row only changes if the blob is still where it was when the move started.
+- **Reads** of a blob in a backend stream from there, with the same `Range` handling: the server asks for exactly the bytes the client asked for, and checks that it gets them. HEAD and unsatisfiable ranges don't ask. An object that is gone is 410 `blob_lost`; a backend that can't be reached, 503 `storage_unavailable`. A blob that moves while it is read is looked up again.
 - **Deleting** a blob deletes its object after its row.
-- **The sweep** runs in each pass and deletes the objects under the prefix that no blob owns: left by a crash in the middle of a move, by deleted users, or by an older binary. It doesn't touch keys that don't have the form above, so each server needs a prefix of its own.
-- **Races:** whatever writes or deletes an object holds a lock on its key, and deletes it only if the database, read under that lock, says no blob owns it. A read that finds the object gone just after a move back reads the database instead.
-- **The location guard:** the database records where its blobs in S3 are (`s3_location`: endpoint, bucket and prefix, nothing secret). If blobs are in S3, `serve` refuses to start without an `s3_file`, or with one that names another location. Otherwise those blobs would read as lost, and nothing could bring them back.
-- **Free space:** the database uses incremental auto-vacuum, and each pass returns its free pages to the file system, 1024 at a time. Before 1.2's binary, databases didn't do this; at its first start, `serve` switches the database over with one `VACUUM`. That is a file setting, not a schema change.
-- **Older binaries** (before 1.2) answer 500 for blobs in S3. They leave the objects of blobs they delete for the sweep, and may unflag a blob in S3 without bringing it back: the next pass does.
-- **Backups:** blobs in S3 aren't in the database's backups. That is what offloadable means: the content may be lost.
+- **The sweep** runs in each pass, for every configured backend, and deletes the objects no blob in that backend owns: left by a crash in the middle of a move, by deleted users, or by an older binary. It doesn't touch keys that don't have the form above, so each server needs a prefix of its own in each bucket.
+- **Races:** whatever writes or deletes an object holds a lock on its key in its backend (a move between backends holds both, always in the same order), and deletes it only if the database, read under that lock, says no blob owns it there. A read that finds the object gone just after a move reads the database again.
+- **The backend guard:** the database records each backend blobs went to (`backends`: name, type and identity, nothing secret). `serve` refuses to start if blobs are in a backend that isn't configured, or one whose configuration names another type or location (compared as JSON). Otherwise those blobs would read as lost, and nothing could move them. So a backend stays configured until it is empty.
+- **Migrating between providers:** configure both, set the target to the new one, restart. Each pass moves what is left; once the old backend is empty, remove it.
+- **Free pages:** the database uses incremental auto-vacuum, and each pass returns its free pages to the file system, 1024 at a time. Before 1.2's binary, databases didn't do this; at its first start, `serve` switches the database over with one `VACUUM`. That is a file setting, not a schema change.
+- **Older binaries** (before 1.2) answer 500 for blobs in a backend, and so do 1.2 binaries for backends not named `s3` (§5.2). They leave the objects of blobs they delete for the sweep, and may unflag a blob in a backend without bringing it back: the next pass does.
+- **Backups:** blobs in backends aren't in the database's backups. That is what offloadable means: the content may be lost.
+
+### 7.5 Free space
+
+Writes into the database keep `min_free_space` (1 GiB by default) free on its file system. A write passes through the WAL before it reaches the database, so while it is in flight its bytes are there twice: a write of `n` bytes needs `2n` above the reserve, and a series of them their total plus the largest.
+
+- **Uploads into the database** that wouldn't fit are refused: 507 `storage_full`. Uploading a blob that is already there writes nothing, so it always succeeds.
+- **Moves into the database:**
+  - The pass adds up every blob that belongs here and isn't. If they don't all fit, it moves none of them and logs how much is missing. They stay readable where they are, and the next pass tries again. All or nothing, as some of them would fill the disk and still leave the rest out.
+  - Each move checks again, as other writes use the space too.
+  - Unflagging a blob in a backend: 507 `storage_full` if it doesn't fit.
+- **Moves out of the database and between backends** need no room.
+- `backend storage` (§9) shows where the blobs are and whether bringing them all into the database would fit.
 
 ## 8. HTTP API
 
@@ -498,14 +523,14 @@ With an S3 credential file (`s3_file`, §10.1), offloadable blobs can live in S3
   - `Content-Security-Policy: default-src 'none'; sandbox`
 - **HEAD:** same headers, no body.
 - **404** `not_found`.
-- **410** `blob_lost`: the blob is in S3 and its object is gone (§7.4).
-- **503** `storage_unavailable`: the blob is in S3, and S3 can't be reached or answered wrongly.
+- **410** `blob_lost`: the blob is in a backend and its object is gone (§7.4).
+- **503** `storage_unavailable`: the blob is in a backend, and it can't be reached or answered wrongly.
 
 `PATCH /blobs/{id}`, body `{"offloadable": true | false}`:
 - **200** with `{"id", "size", "created_at", "offloadable"}`, also when the flag already had that value.
 - **404** `not_found`.
 - **409** `blob_offloadable`: a ref points to the blob.
-- When unflagging a blob in S3 (§7.4): **410** `blob_lost`, **503** `storage_unavailable`.
+- When unflagging a blob in a backend (§7.4): **410** `blob_lost`, **503** `storage_unavailable`, **507** `storage_full` (§7.5).
 
 `DELETE /blobs/{id}`:
 - **204**.
@@ -582,7 +607,8 @@ The ref name is the raw path after `/refs/`. Slashes stay as they are; no percen
 | 409  | `last_passkey`           | The user tried to delete their only passkey |
 | 409  | `passkey_exists`         | The credential is already registered |
 | 410  | `blob_lost`              | The offloadable blob's content is gone |
-| 503  | `storage_unavailable`    | S3 can't be reached, or answered wrongly; the details are only logged |
+| 503  | `storage_unavailable`    | A storage backend can't be reached, or answered wrongly; the details are only logged |
+| 507  | `storage_full`           | Writing into the database would take its file system below `min_free_space` (§7.5) |
 | 412  | `precondition_failed`    | The expect check failed |
 | 413  | `blob_too_large`         | The blob is larger than `max_blob_size`, or a JSON body is over 64 KiB |
 | 415  | `unsupported_media_type` | Wrong `Content-Type` |
@@ -595,6 +621,7 @@ The CLI works directly on the database. This is safe while the server is running
 
 ```
 backend serve                            run the server on the Unix socket
+backend storage                          blobs and bytes per location, free space, and whether all would fit here
 backend user create <username>           create a user; print a setup token (+ links)
 backend user list                        username, id, created_at, passkeys per host, storage used
 backend user delete <username> [--yes]   delete the user and all their data
@@ -619,14 +646,29 @@ Settings come from a TOML file. Any key can be overridden with an environment va
 | `session_ttl`   | `4h`                     | How long a session lasts after login |
 | `reauth_window` | `5m`                     | Step-up window |
 | `max_blob_size` | `16MiB`                  | Largest accepted upload |
-| `blob_target`   | `local`                  | Where offloadable blobs belong: `local` or `s3` (§7.4). `s3` needs `s3_file`. |
-| `s3_file`       | (none)                   | The S3 credential file (§10.1). Only `serve` reads it. |
+| `blob_target`   | `local`                  | Where offloadable blobs belong: `local` or the name of one of `backends` (§7.4) |
+| `backends`      | (none)                   | The storage backends, a table per name: `[backends.<name>]` with `type` (`"s3"`) and `file`, the credential file (§10.1). A name is 1–32 of `a-z`, `0-9` and `-`, not starting with `-`, and not `local`. Not overridable from the environment. |
+| `min_free_space` | `1GiB`                  | What writes into the database keep free on its file system (§7.5) |
 
 The setup-token lifetime (15 min) and the ceremony lifetime (5 min) are fixed.
 
-### 10.1 The S3 credential file
+```toml
+blob_target = "backblaze"
 
-Everything about S3 is in one TOML file, apart from the configuration, as all of it is secret: the bucket and its endpoint as much as the keys. On NixOS it is a systemd credential, decrypted for the service only (the module's `s3CredentialFile`).
+[backends.aws]
+type = "s3"
+file = "/run/credentials/music.service/aws"
+
+[backends.backblaze]
+type = "s3"
+file = "/run/credentials/music.service/backblaze"
+```
+
+### 10.1 A backend's credential file
+
+Everything about a backend is in its own file, apart from the configuration, as all of it is secret: the bucket and its endpoint as much as the keys. Only `serve` reads it. On NixOS it is a systemd credential, decrypted for the service only (the module's `storageBackends`).
+
+For S3:
 
 ```toml
 endpoint = "https://s3.eu-central-003.backblazeb2.com"
@@ -654,8 +696,8 @@ secret_access_key = "…"
 - **No user enumeration:** login doesn't take a username, and all setup-token errors look the same.
 - **Blob responses:** blobs are served with a `sandbox` CSP and `attachment` disposition. Stored content can never run on the app origin.
 - **Metadata:** the server sees ref names, sizes, counts, timestamps and access patterns. When clients encrypt their data, it never sees the content.
-- **Backups:** everything is in one SQLite file, except blobs in S3 (§7.4). Use `VACUUM INTO` or the SQLite online backup API to get a consistent copy while the server runs.
-- **S3** sees what the server sees of offloaded blobs: their bytes (end-to-end encrypted when clients encrypt), sizes and timing, and keys made of user IDs and blob IDs. The S3 credential file is never logged, and neither is the location it names.
+- **Backups:** everything is in one SQLite file, except blobs in storage backends (§7.4). Use `VACUUM INTO` or the SQLite online backup API to get a consistent copy while the server runs.
+- **Storage backends** see what the server sees of offloaded blobs: their bytes (end-to-end encrypted when clients encrypt), sizes and timing, and keys made of user IDs and blob IDs. Credential files are never logged, and neither are the locations they name.
 
 ## 12. Testing
 
@@ -674,10 +716,12 @@ secret_access_key = "…"
   - **Cookies:** `Secure` is present on public hosts and absent on loopback hosts.
   - **PRF:** responses carrying unrequested `prf` client results and `hmac-secret` authenticator data are accepted, and the server neither stores nor returns them.
 - **Schema versions:** the stored form of a version, migrating a new and a `1.0` database, and a newer minor accepted and a newer major refused, both left as they are.
-- **Offloading:** against a stand-in S3 on 127.0.0.1 (`tests/common/s3.rs`): uploads and reads through S3, every range form, S3 answering errors, refusing connections or never answering (bounded by the timeouts), lost and damaged objects, flag changes both ways, the target at each pass, the sweep and what it leaves alone, a deleted user's objects, refs, races between moves and passes, the space returned, the location guard, and errors that don't name the location or carry a signed URL.
-- **VM test with S3** (`nix/tests/s3.nix`): the NixOS module with a systemd-encrypted credential file, and Garage behind nginx for TLS with a test CA.
-  - Blobs go to S3, are read back through the API, whole and in a range, and come back when the target changes.
-  - The credential is encrypted at rest, and only the service user can read the decrypted copy.
+- **Offloading:** against a stand-in S3 per backend on 127.0.0.1 (`tests/common/s3.rs`): uploads and reads through S3, every range form, S3 answering errors, refusing connections or never answering (bounded by the timeouts), lost and damaged objects, flag changes both ways, the target at each pass, moves between backends with no room on the host, the sweep and what it leaves alone, a deleted user's objects, refs, races between moves and passes, the space returned, the backend guard, and errors that don't name the location or carry a signed URL.
+- **Free space** (with the free space a test sets): uploads keep the reserve, a blob is unflagged only if it fits, and blobs come home all together or not at all.
+- **Migrations:** the stored form of versions, a new and a 1.0 database, newer minors and majors, the 1.3 rebuild of a 1.2 database with rows, refs and an S3 location (rows, foreign keys, the index, and a 1.2 binary's reads and writes afterwards), and several processes starting at once.
+- **VM test with S3** (`nix/tests/s3.nix`): the NixOS module with two backends, each a systemd-encrypted credential file and a bucket in Garage, behind nginx for TLS with a test CA.
+  - Blobs go to S3, are read back through the API, whole and in a range, come back when the target changes, and move from one backend to the other and back.
+  - The credentials are encrypted at rest, and only the service user can read the decrypted copies.
   - Against a real S3: the sweep deletes an orphan and leaves keys that aren't its own; while S3 is down, uploads still work and reads fail with 503, and the next pass moves what waited; an object deleted in S3 reads as 410.
   - Nothing of the credential file reaches the journal, failures included.
 - **Smoke test:** the server serves requests over the Unix socket and cleans the socket up on shutdown.
@@ -691,5 +735,6 @@ secret_access_key = "…"
 
 - List and revoke sessions; rename passkeys.
 - Atomic transactions across several refs.
-- A larger size limit for offloadable blobs, with uploads streamed to S3 instead of held in memory.
+- A larger size limit for offloadable blobs, with uploads streamed to the backend instead of held in memory.
+- More backend types (e.g. a REST store): a variant in `remotes`, with its own credential file.
 - Fetching several blobs in one request.

@@ -14,7 +14,7 @@ use rusty_s3::{Bucket, Credentials, UrlStyle};
 use serde::Deserialize;
 
 use crate::domain::{BlobId, format_uuid, hex_decode};
-use crate::store::{S3Location, UserId};
+use crate::store::UserId;
 
 /// A signed request only has to start within this.
 const SIGNED_FOR: Duration = Duration::from_secs(15 * 60);
@@ -53,7 +53,9 @@ struct S3File {
 pub struct Objects {
     bucket: Bucket,
     credentials: Credentials,
-    location: S3Location,
+    /// The location's parts that aren't secret: what the database records (SPEC §7.4).
+    endpoint: String,
+    prefix: String,
     http: reqwest::Client,
 }
 
@@ -125,27 +127,25 @@ impl Objects {
         Ok(Self {
             bucket,
             credentials: Credentials::new(file.access_key_id, file.secret_access_key),
-            location: S3Location {
-                endpoint: file.endpoint,
-                bucket: file.bucket,
-                prefix: file.prefix,
-            },
+            endpoint: file.endpoint,
+            prefix: file.prefix,
             http,
         })
     }
 
-    pub fn location(&self) -> &S3Location {
-        &self.location
+    /// Which objects these are: the endpoint, the bucket and the prefix, none of them secret.
+    pub fn identity(&self) -> serde_json::Value {
+        serde_json::json!({ "endpoint": self.endpoint, "bucket": self.bucket.name(), "prefix": self.prefix })
     }
 
     /// `<prefix><user ID>/<blob ID>`.
     pub fn key(&self, user_id: &UserId, id: BlobId) -> String {
-        format!("{}{}/{id}", self.location.prefix, format_uuid(user_id))
+        format!("{}{}/{id}", self.prefix, format_uuid(user_id))
     }
 
     /// The user and blob of a key `key` makes; None for anything else.
     pub fn parse_key(&self, key: &str) -> Option<(UserId, BlobId)> {
-        let (user, id) = key.strip_prefix(&self.location.prefix)?.split_once('/')?;
+        let (user, id) = key.strip_prefix(&self.prefix)?.split_once('/')?;
         let user_id: UserId = hex_decode(&user.replace('-', ""))?.try_into().ok()?;
         let id = BlobId::parse(id)?;
         (format_uuid(&user_id) == user).then_some((user_id, id))
@@ -238,7 +238,7 @@ impl Objects {
         let mut token: Option<String> = None;
         loop {
             let mut action = ListObjectsV2::new(&self.bucket, Some(&self.credentials));
-            action.with_prefix(self.location.prefix.as_str());
+            action.with_prefix(self.prefix.as_str());
             if let Some(token) = &token {
                 action.with_continuation_token(token.as_str());
             }
@@ -312,12 +312,8 @@ secret_access_key = "secret"
     fn the_credential_file_is_checked() {
         let objects = Objects::from_file(FILE).unwrap();
         assert_eq!(
-            objects.location(),
-            &S3Location {
-                endpoint: "https://s3.example.com".into(),
-                bucket: "music".into(),
-                prefix: "music/".into(),
-            }
+            objects.identity(),
+            serde_json::json!({ "endpoint": "https://s3.example.com", "bucket": "music", "prefix": "music/" })
         );
         let with = |line: &str| Objects::from_file(&format!("{FILE}{line}"));
         assert!(with("url_style = \"virtual-host\"").is_ok());

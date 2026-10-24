@@ -1,6 +1,6 @@
 //! Configuration (SPEC §10): a TOML file, every key overridable with `BACKEND_<KEY>`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,15 +24,37 @@ pub struct Config {
     pub max_blob_size: u64,
     /// Where offloadable blobs belong (SPEC §7.4).
     pub blob_target: Target,
-    /// The S3 credential file (SPEC §10.1), read by `serve` only.
-    pub s3_file: Option<PathBuf>,
+    /// The storage backends offloadable blobs can be in, by name (SPEC §10.1).
+    pub backends: BTreeMap<String, Backend>,
+    /// What the database's file system keeps free: writes into the database that would take it below are refused.
+    pub min_free_space: u64,
 }
 
-/// Where offloadable blobs belong: in the database, or in S3. Every other blob is in the database.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where offloadable blobs belong: in the database, or in a backend. Every other blob is in the database.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Local,
+    Backend(String),
+}
+
+/// A storage backend: its type and the file with its location and credentials, which only `serve` reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Backend {
+    pub kind: Kind,
+    pub file: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
     S3,
+}
+
+/// A backend's name: what blobs' rows say they're in, so it can't be "local".
+pub fn valid_backend_name(name: &str) -> bool {
+    let chars_ok = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    (1..=32).contains(&name.len()) && chars_ok && !name.starts_with('-') && name != "local"
 }
 
 /// The file as written: every key optional, values still strings where they need parsing.
@@ -49,7 +71,15 @@ struct RawConfig {
     reauth_window: Option<String>,
     max_blob_size: Option<String>,
     blob_target: Option<String>,
-    s3_file: Option<String>,
+    backends: Option<BTreeMap<String, RawBackend>>,
+    min_free_space: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBackend {
+    r#type: String,
+    file: String,
 }
 
 /// Reads the file (a missing file counts as empty) and applies the environment.
@@ -95,15 +125,38 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
     let max_blob_size = get("max_blob_size", raw.max_blob_size).unwrap_or_else(|| "16MiB".into());
     let static_dir =
         get("static_dir", raw.static_dir).ok_or_else(|| anyhow!("static_dir is required"))?;
-    let blob_target = match get("blob_target", raw.blob_target).as_deref() {
-        None | Some("local") => Target::Local,
-        Some("s3") => Target::S3,
-        Some(other) => bail!("blob_target: {other:?} is neither \"local\" nor \"s3\""),
+    let backends = raw
+        .backends
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, backend)| {
+            if !valid_backend_name(&name) {
+                bail!(
+                    "backends: {name:?} can't be a name: 1-32 of a-z, 0-9 and -, and not \"local\""
+                );
+            }
+            let kind = match backend.r#type.as_str() {
+                "s3" => Kind::S3,
+                other => {
+                    bail!("backends.{name}: type {other:?} is unknown; the one there is is \"s3\"")
+                }
+            };
+            Ok((
+                name,
+                Backend {
+                    kind,
+                    file: backend.file.into(),
+                },
+            ))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    let blob_target = match get("blob_target", raw.blob_target) {
+        None => Target::Local,
+        Some(local) if local == "local" => Target::Local,
+        Some(name) if backends.contains_key(&name) => Target::Backend(name),
+        Some(other) => bail!("blob_target: {other:?} is neither \"local\" nor one of the backends"),
     };
-    let s3_file = get("s3_file", raw.s3_file).map(PathBuf::from);
-    if blob_target == Target::S3 && s3_file.is_none() {
-        bail!("blob_target = \"s3\" needs s3_file");
-    }
+    let min_free_space = get("min_free_space", raw.min_free_space).unwrap_or_else(|| "1GiB".into());
 
     Ok(Config {
         socket: get("socket", raw.socket)
@@ -121,7 +174,9 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
         max_blob_size: parse_size(&max_blob_size)
             .ok_or_else(|| anyhow!("max_blob_size: cannot parse {max_blob_size:?}"))?,
         blob_target,
-        s3_file,
+        backends,
+        min_free_space: parse_size(&min_free_space)
+            .ok_or_else(|| anyhow!("min_free_space: cannot parse {min_free_space:?}"))?,
     })
 }
 
@@ -145,23 +200,26 @@ mod tests {
         assert_eq!(config.max_blob_size, 16 << 20);
         assert!(config.public_hosts.is_empty());
         assert_eq!(config.blob_target, Target::Local);
-        assert_eq!(config.s3_file, None);
+        assert!(config.backends.is_empty());
+        assert_eq!(config.min_free_space, 1 << 30);
         assert!(resolve("", &env(&[])).is_err());
     }
 
+    const BACKENDS: &str = "static_dir = \"w\"\n[backends.aws]\ntype = \"s3\"\nfile = \"/run/credentials/x/aws\"\n[backends.b2]\ntype = \"s3\"\nfile = \"/run/credentials/x/b2\"\n";
+
     #[test]
-    fn the_s3_target_needs_the_s3_file() {
-        let s3 = resolve(
-            "static_dir = \"w\"\nblob_target = \"s3\"\ns3_file = \"/run/credentials/x/s3\"",
-            &env(&[]),
-        )
-        .unwrap();
-        assert_eq!(s3.blob_target, Target::S3);
-        assert_eq!(s3.s3_file, Some(PathBuf::from("/run/credentials/x/s3")));
-        assert!(resolve("static_dir = \"w\"\nblob_target = \"s3\"", &env(&[])).is_err());
-        assert!(resolve("static_dir = \"w\"\nblob_target = \"S3\"", &env(&[])).is_err());
+    fn backends_have_a_name_a_type_and_a_file_and_the_target_names_one() {
+        let config = resolve(&format!("blob_target = \"b2\"\n{BACKENDS}"), &env(&[])).unwrap();
+        assert_eq!(config.blob_target, Target::Backend("b2".into()));
+        assert_eq!(
+            config.backends["aws"],
+            Backend {
+                kind: Kind::S3,
+                file: "/run/credentials/x/aws".into()
+            }
+        );
         let back = resolve(
-            "static_dir = \"w\"\nblob_target = \"s3\"\ns3_file = \"f\"",
+            &format!("blob_target = \"b2\"\n{BACKENDS}"),
             &env(&[("BACKEND_BLOB_TARGET", "local")]),
         )
         .unwrap();
@@ -170,6 +228,32 @@ mod tests {
             Target::Local,
             "the environment overrides it too"
         );
+        let moved = resolve(BACKENDS, &env(&[("BACKEND_BLOB_TARGET", "aws")])).unwrap();
+        assert_eq!(moved.blob_target, Target::Backend("aws".into()));
+
+        for bad in [
+            format!("blob_target = \"gcs\"\n{BACKENDS}"),
+            "static_dir = \"w\"\nblob_target = \"s3\"".to_owned(),
+            BACKENDS.replace(
+                "type = \"s3\"\nfile = \"/run/credentials/x/aws\"",
+                "type = \"ftp\"\nfile = \"f\"",
+            ),
+            BACKENDS.replace("[backends.aws]", "[backends.local]"),
+            BACKENDS.replace("[backends.aws]", "[backends.AWS]"),
+            BACKENDS.replace("[backends.aws]", "[backends.-aws]"),
+            BACKENDS.replace(
+                "file = \"/run/credentials/x/aws\"",
+                "file = \"f\"\nkey = \"secret\"",
+            ),
+            format!("min_free_space = \"lots\"\n{BACKENDS}"),
+        ] {
+            assert!(resolve(&bad, &env(&[])).is_err(), "{bad}");
+        }
+        let reserve =
+            resolve("static_dir = \"w\"\nmin_free_space = \"200MiB\"", &env(&[])).unwrap();
+        assert_eq!(reserve.min_free_space, 200 << 20);
+        assert!(valid_backend_name("backblaze-eu1"));
+        assert!(!valid_backend_name(&"a".repeat(33)));
     }
 
     #[test]

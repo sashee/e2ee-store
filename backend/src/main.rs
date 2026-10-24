@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use backend::accounts::{CreateUserError, create_user, issue_setup_token, setup_links};
 use backend::config::{self, Config};
 use backend::domain::{format_timestamp, format_uuid};
-use backend::{db, server, store};
+use backend::{db, disk, offload, server, store};
 
 #[derive(Parser)]
 #[command(version, about = "Passkey users and git-like per-user storage")]
@@ -25,6 +25,8 @@ struct Cli {
 enum Command {
     /// Run the server on the Unix socket.
     Serve,
+    /// Where the blobs are, and whether bringing them all into the database would fit.
+    Storage,
     /// Manage users.
     User {
         #[command(subcommand)]
@@ -69,6 +71,7 @@ fn main() -> anyhow::Result<()> {
     let config = config::load(&cli.config, &std::env::vars().collect())?;
     match cli.command {
         Command::Serve => tokio::runtime::Runtime::new()?.block_on(server::serve(config)),
+        Command::Storage => storage(&config),
         Command::User {
             command: UserCommand::Create { username },
         } => user_create(&config, &username),
@@ -115,6 +118,22 @@ fn user_create(config: &Config, username: &str) -> anyhow::Result<()> {
     println!("Created user {username} ({})", format_uuid(&user.id));
     let (token, expires_at) = issue_setup_token(&conn, &user.id, now)?;
     print_setup_token(config, username, &token, expires_at);
+    Ok(())
+}
+
+fn storage(config: &Config) -> anyhow::Result<()> {
+    let conn = db::open_and_migrate(&config.database)?;
+    let free = disk::system_free_space()(&config.database)?;
+    print!(
+        "{}",
+        offload::storage_report(
+            &store::usage(&conn)?,
+            &config.blob_target,
+            free,
+            config.min_free_space,
+            config.max_blob_size
+        )
+    );
     Ok(())
 }
 

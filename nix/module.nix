@@ -4,9 +4,9 @@
 #   services.e2ee-store.instances.notes = {
 #     staticDir = "${notes-web}/share/notes/web";
 #     settings.public_hosts = [ "notes.example.com" ];   # optional; backend SPEC §10
-#     # optional: offloadable blobs in S3 (backend SPEC §7.4, §10.1)
-#     settings.blob_target = "s3";
-#     s3CredentialFile = "/etc/credentials/notes/s3";
+#     # optional: storage backends offloadable blobs can be in, and the one they go to (backend SPEC §7.4, §10.1)
+#     storageBackends.backblaze = { type = "s3"; credentialFile = "/etc/credentials/notes/backblaze"; };
+#     settings.blob_target = "backblaze";
 #   };
 #
 # Plain module, no flake: the packages are built with the host's own nixpkgs. Everything of an instance is
@@ -55,14 +55,37 @@ let
           '';
         };
 
-        s3CredentialFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "/etc/credentials/notes/s3";
+        storageBackends = lib.mkOption {
+          type = lib.types.attrsOf (
+            lib.types.submodule {
+              options = {
+                type = lib.mkOption {
+                  type = lib.types.enum [ "s3" ];
+                  description = "The kind of storage, which decides what the credential file holds.";
+                };
+                credentialFile = lib.mkOption {
+                  type = lib.types.str;
+                  example = "/etc/credentials/notes/backblaze";
+                  description = ''
+                    The backend's credential file (backend SPEC §10.1): for S3, endpoint, bucket, prefix and keys.
+                    Encrypted with `systemd-creds encrypt --name=<backend's name> - <file>`.
+                  '';
+                };
+              };
+            }
+          );
+          default = { };
+          example = lib.literalExpression ''
+            {
+              aws = { type = "s3"; credentialFile = "/etc/credentials/notes/aws"; };
+              backblaze = { type = "s3"; credentialFile = "/etc/credentials/notes/backblaze"; };
+            }
+          '';
           description = ''
-            The S3 credential file (backend SPEC §10.1): endpoint, bucket, prefix and keys, encrypted with
-            `systemd-creds encrypt --name=s3 - <file>`. The service gets it decrypted, as `s3_file`, and may
-            then reach the network. Needed for `settings.blob_target = "s3"`, and for as long as blobs are in S3.
+            The storage backends offloadable blobs can be in, by name (backend SPEC §7.4); `settings.blob_target`
+            names the one they go to, or "local". The service gets each credential decrypted, and may then reach the
+            network. A backend stays configured for as long as blobs are in it: the server refuses to start
+            otherwise.
           '';
         };
 
@@ -93,9 +116,12 @@ let
         database = "/var/lib/${name}/backend.sqlite3";
         static_dir = config.staticDir;
       }
-      // lib.optionalAttrs (config.s3CredentialFile != null) {
-        # Where systemd puts the decrypted credential for the unit.
-        s3_file = "/run/credentials/${name}.service/s3";
+      // lib.optionalAttrs (config.storageBackends != { }) {
+        backends = lib.mapAttrs (backend: settings: {
+          inherit (settings) type;
+          # Where systemd puts the decrypted credential for the unit.
+          file = "/run/credentials/${name}.service/${backend}";
+        }) config.storageBackends;
       };
     };
 
@@ -126,13 +152,13 @@ let
   service =
     name: instance:
     let
-      s3 = instance.s3CredentialFile != null;
+      remote = instance.storageBackends != { };
     in
     {
       description = "${name} backend (e2ee-store)";
       wantedBy = [ "multi-user.target" ];
       # The system CA bundle, as for restic: a CA added to security.pki is trusted too.
-      environment = lib.optionalAttrs s3 { SSL_CERT_FILE = config.security.pki.caBundle; };
+      environment = lib.optionalAttrs remote { SSL_CERT_FILE = config.security.pki.caBundle; };
       serviceConfig = {
         # The backend doesn't notify readiness. Nothing needs it: whatever forwards to the socket
         # connects per request.
@@ -172,19 +198,21 @@ let
         CapabilityBoundingSet = [ "" ];
         SystemCallFilter = [ "@system-service" ];
         SystemCallArchitectures = "native";
-        # Unix socket only (backend SPEC §3.1), enforced by the kernel; and IP for S3.
+        # Unix socket only (backend SPEC §3.1), enforced by the kernel; and IP for storage backends.
         RestrictAddressFamilies = [
           "AF_UNIX"
         ]
-        ++ lib.optionals s3 [
+        ++ lib.optionals remote [
           "AF_INET"
           "AF_INET6"
         ];
       }
-      // lib.optionalAttrs s3 {
+      // lib.optionalAttrs remote {
         # No ConditionPathExists, unlike restic's units: a missing credential fails the start instead of
         # skipping the service.
-        LoadCredentialEncrypted = [ "s3:${instance.s3CredentialFile}" ];
+        LoadCredentialEncrypted = lib.mapAttrsToList (
+          backend: settings: "${backend}:${settings.credentialFile}"
+        ) instance.storageBackends;
       };
     };
 in
@@ -196,10 +224,24 @@ in
   };
 
   config = lib.mkIf (instances != { }) {
-    assertions = lib.mapAttrsToList (name: instance: {
-      assertion = (instance.settings.blob_target or "local") != "s3" || instance.s3CredentialFile != null;
-      message = "services.e2ee-store.instances.${name}: settings.blob_target = \"s3\" needs s3CredentialFile";
-    }) instances;
+    assertions = lib.concatLists (
+      lib.mapAttrsToList (
+        name: instance:
+        let
+          target = instance.settings.blob_target or "local";
+        in
+        [
+          {
+            assertion = target == "local" || builtins.hasAttr target instance.storageBackends;
+            message = "services.e2ee-store.instances.${name}: settings.blob_target = \"${target}\" is neither \"local\" nor one of storageBackends";
+          }
+        ]
+        ++ map (backend: {
+          assertion = builtins.match "[a-z0-9][a-z0-9-]{0,31}" backend != null && backend != "local";
+          message = "services.e2ee-store.instances.${name}.storageBackends.${backend}: a name is 1-32 of a-z, 0-9 and -, not starting with -, and not \"local\"";
+        }) (lib.attrNames instance.storageBackends)
+      ) instances
+    );
 
     users.users = lib.mapAttrs' (
       name: instance:

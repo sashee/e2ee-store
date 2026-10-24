@@ -22,8 +22,9 @@ use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::db;
-use crate::objects::Objects;
+use crate::disk::{FreeSpace, system_free_space};
 use crate::offload::KeyLocks;
+use crate::remotes::Remotes;
 pub use error::ApiError;
 pub use guard::{cookie_value, session_cookie};
 
@@ -45,8 +46,10 @@ pub fn system_clock() -> Clock {
 pub struct AppState {
     pub config: Arc<Config>,
     pub clock: Clock,
-    /// S3, when the server has an `s3_file` (SPEC §7.4).
-    pub objects: Option<Arc<Objects>>,
+    /// The storage backends, by name (SPEC §7.4).
+    pub remotes: Arc<Remotes>,
+    /// The free space on the database's file system (SPEC §7.5).
+    pub free_space: FreeSpace,
     /// One writer at a time per S3 object (offload.rs).
     pub moving: Arc<KeyLocks>,
 }
@@ -56,16 +59,21 @@ impl AppState {
         Self {
             config: Arc::new(config),
             clock,
-            objects: None,
+            remotes: Arc::default(),
+            free_space: system_free_space(),
             moving: Arc::default(),
         }
     }
 
-    pub fn with_objects(self, objects: Option<Objects>) -> Self {
+    pub fn with_remotes(self, remotes: Remotes) -> Self {
         Self {
-            objects: objects.map(Arc::new),
+            remotes: Arc::new(remotes),
             ..self
         }
+    }
+
+    pub fn with_free_space(self, free_space: FreeSpace) -> Self {
+        Self { free_space, ..self }
     }
 
     pub fn now(&self) -> i64 {

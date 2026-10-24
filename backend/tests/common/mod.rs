@@ -1,16 +1,17 @@
 //! Test harness: the router over a temporary database, a movable clock, and a software authenticator.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
-use backend::config::{Config, DEFAULT_STATIC_CSP, Target};
+use backend::config::{Backend, Config, DEFAULT_STATIC_CSP, Kind, Target};
 use backend::domain::BlobId;
 use backend::http::{AppState, router};
-use backend::objects::Objects;
+use backend::remotes::Remote;
 use backend::{accounts, db, store};
 use http_body_util::BodyExt as _;
 use serde_json::json;
@@ -30,6 +31,8 @@ pub struct Harness {
     pub state: AppState,
     pub app: Router,
     clock: Arc<AtomicI64>,
+    /// The free space the server sees on the database's file system: 1 TiB unless a test makes it less.
+    pub free: Arc<AtomicU64>,
 }
 
 pub struct Reply {
@@ -80,38 +83,62 @@ impl Harness {
         Self::with(|_| {})
     }
 
-    /// A harness with S3 (the stand-in) and `target`.
-    pub async fn with_s3(target: Target) -> (Self, s3::FakeS3) {
-        Self::with_s3_and(target, |_| {}).await
+    /// A harness with one backend, "s3", a stand-in S3, and `target`: "local" or "s3".
+    pub async fn with_s3(target: &str) -> (Self, s3::FakeS3) {
+        let (harness, mut fakes) = Self::with_backends(target, &["s3"], |_| {}).await;
+        (harness, fakes.remove("s3").unwrap())
     }
 
-    pub async fn with_s3_and(
-        target: Target,
+    /// A harness with a stand-in S3 for each backend of `names`, and `target`: "local" or one of them.
+    pub async fn with_backends(
+        target: &str,
+        names: &[&str],
         adjust: impl FnOnce(&mut Config),
-    ) -> (Self, s3::FakeS3) {
-        let s3 = s3::FakeS3::start().await;
+    ) -> (Self, BTreeMap<String, s3::FakeS3>) {
+        let mut fakes = BTreeMap::new();
+        for name in names {
+            fakes.insert((*name).to_owned(), s3::FakeS3::start().await);
+        }
         let harness = Self::with(|config| {
-            config.blob_target = target;
-            config.s3_file = Some("s3".into());
+            config.backends = names
+                .iter()
+                .map(|name| {
+                    let file = format!("/run/credentials/test/{name}").into();
+                    (
+                        (*name).to_owned(),
+                        Backend {
+                            kind: Kind::S3,
+                            file,
+                        },
+                    )
+                })
+                .collect();
+            config.blob_target = target_of(target);
             adjust(config);
         });
-        let state = harness
-            .state
-            .clone()
-            .with_objects(Some(Objects::from_file(&s3.file()).unwrap()));
+        let remotes = fakes
+            .iter()
+            .map(|(name, fake)| {
+                let remote = Remote::open(name, Kind::S3, &fake.file()).unwrap();
+                (name.clone(), Arc::new(remote))
+            })
+            .collect();
+        let state = harness.state.clone().with_remotes(remotes);
         (
             Self {
                 app: router(state.clone()),
                 state,
                 ..harness
             },
-            s3,
+            fakes,
         )
     }
 
-    /// The same database and target, with another S3 client: e.g. one that can't reach S3.
-    pub fn with_objects(self, objects: Objects) -> Self {
-        let state = self.state.clone().with_objects(Some(objects));
+    /// The same database and target, with `remote` for the backend of its name: e.g. one that can't reach S3.
+    pub fn with_remote(self, remote: Remote) -> Self {
+        let mut remotes = (*self.state.remotes).clone();
+        remotes.insert(remote.name.clone(), Arc::new(remote));
+        let state = self.state.clone().with_remotes(remotes);
         Self {
             app: router(state.clone()),
             state,
@@ -119,10 +146,10 @@ impl Harness {
         }
     }
 
-    /// The same database and S3, with another target, as after a restart.
-    pub fn retarget(self, target: Target) -> Self {
+    /// The same database and backends, with another target, as after a restart.
+    pub fn retarget(self, target: &str) -> Self {
         let config = Config {
-            blob_target: target,
+            blob_target: target_of(target),
             ..(*self.state.config).clone()
         };
         let state = AppState {
@@ -158,18 +185,23 @@ impl Harness {
             reauth_window: std::time::Duration::from_secs(300),
             max_blob_size: 1024,
             blob_target: Target::Local,
-            s3_file: None,
+            backends: BTreeMap::new(),
+            min_free_space: 1 << 30,
         };
         adjust(&mut config);
         db::open_and_migrate(&config.database).unwrap();
         let clock = Arc::new(AtomicI64::new(START));
         let read = clock.clone();
-        let state = AppState::new(config, Arc::new(move || read.load(Ordering::SeqCst)));
+        let free = Arc::new(AtomicU64::new(1 << 40));
+        let reported = free.clone();
+        let state = AppState::new(config, Arc::new(move || read.load(Ordering::SeqCst)))
+            .with_free_space(Arc::new(move |_| Ok(reported.load(Ordering::SeqCst))));
         Self {
             app: router(state.clone()),
             state,
             dir,
             clock,
+            free,
         }
     }
 
@@ -440,6 +472,14 @@ pub async fn put_ref(
         ..h.call(Method::PUT, PHONE, format!("/api/v1/refs/{name}"))
     })
     .await
+}
+
+/// "local", or the backend of that name.
+pub fn target_of(target: &str) -> Target {
+    match target {
+        "local" => Target::Local,
+        name => Target::Backend(name.to_owned()),
+    }
 }
 
 pub fn origin_of(host: &str) -> String {

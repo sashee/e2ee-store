@@ -357,7 +357,7 @@ An app can let the server keep a file's content outside its database (backend/SP
 - **Changing:** `setOffloadable(session, ids, offloadable)` sets the flag of the files with these blob IDs, one request each; the tree doesn't change. Flagging a directory the session has read or written is a `TypeError`, before anything is sent. The server refuses to flag the root (`blob_offloadable`).
 - **Entries don't record the flag:** the server keeps it per blob. An app that needs to know keeps it itself, e.g. in the entry's `app`. A copy of a file elsewhere in the tree is the same blob, so it has the same flag.
 - **Lost content:** reading a file whose content is lost (`410 blob_lost`) fails with `BlobLostError` from `api.js`: an `ApiError` with code `blob_lost` and the blob's `id`. Its entry stays, and cleanup keeps the blob (§6.11); what to do, e.g. upload the file again, is up to the app.
-- **Where the content is** is the server's business (backend/SPEC.md §7.4): its configuration decides whether offloadable files go to S3. While S3 can't be reached, reading a file there, or making it not offloadable, fails with `storage_unavailable`; uploading and flagging still work.
+- **Where the content is** is the server's business (backend/SPEC.md §7.4): its configuration decides which storage backend, if any, offloadable files go to. While the backend can't be reached, reading a file there, or making it not offloadable, fails with `storage_unavailable`; uploading and flagging still work. Making a file not offloadable brings it into the server's database, and fails with `storage_full` if it hasn't the room.
 
 ## 7. Modules
 

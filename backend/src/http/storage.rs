@@ -17,7 +17,7 @@ use crate::domain::{
 };
 use crate::offload;
 use crate::store::{
-    self, BlobDeletion, BlobMeta, FlagWrite, RefDeletion, RefRow, RefWrite, Stored,
+    self, BlobDeletion, BlobMeta, FlagWrite, Location, RefDeletion, RefRow, RefWrite,
 };
 
 const PAGE_MAX: usize = 1000;
@@ -31,6 +31,14 @@ fn ref_name(name: &str) -> Result<String, ApiError> {
     valid_ref_name(name)
         .then(|| name.to_owned())
         .ok_or_else(|| ApiError::bad_request("Invalid ref name"))
+}
+
+/// The backend offloadable blobs go to; None when that is the database.
+fn target(state: &AppState) -> Option<&str> {
+    match &state.config.blob_target {
+        Target::Local => None,
+        Target::Backend(name) => Some(name),
+    }
 }
 
 fn blob_json(meta: &BlobMeta) -> Value {
@@ -134,14 +142,21 @@ pub async fn put_blob(
     }
     let user_id = authed.session.user_id;
     let now = state.now();
-    let to_s3 = offloadable && state.config.blob_target == Target::S3;
-    let (created, meta) = match state.objects.clone().filter(|_| to_s3) {
-        Some(objects) => offload::upload(&state, &objects, user_id, id, content, now).await?,
-        None => {
-            state
-                .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, None, now))
-                .await?
-        }
+    let remotes = state.remotes.clone();
+    let (created, meta) = match target(&state)
+        .filter(|_| offloadable)
+        .and_then(|name| remotes.get(name))
+    {
+        Some(remote) => offload::upload(&state, remote, user_id, id, content, now).await?,
+        None => match state.db(move |c| store::blob_meta(c, &user_id, id)).await? {
+            Some(existing) => (false, existing),
+            None => {
+                offload::room_for(&state, content.len() as u64)?;
+                state
+                    .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, None, now))
+                    .await?
+            }
+        },
     };
     let status = if created {
         StatusCode::CREATED
@@ -151,7 +166,7 @@ pub async fn put_blob(
     Ok((status, Json(blob_json(&meta))).into_response())
 }
 
-/// GET and HEAD (axum answers HEAD with the GET handler and drops the body). A blob in S3 streams from there
+/// GET and HEAD (axum answers HEAD with the GET handler and drops the body). A blob in a backend streams from there
 /// (SPEC §7.4); HEAD doesn't fetch it.
 pub async fn get_blob(
     State(state): State<AppState>,
@@ -163,33 +178,39 @@ pub async fn get_blob(
     let id = blob_id(&id)?;
     let user_id = authed.session.user_id;
     let range_header = header_str(&headers, header::RANGE).map(str::to_owned);
-    let read = || {
+    let remotes = state.remotes.clone();
+    // A blob that moves while it is read is looked up again.
+    for _ in 0..3 {
         let range_header = range_header.clone();
-        state.db(move |c| {
-            store::blob_content(c, &user_id, id, |size| {
-                parse_range(range_header.as_deref(), size)
+        let (meta, range, content) = state
+            .db(move |c| {
+                store::blob_content(c, &user_id, id, |size| {
+                    parse_range(range_header.as_deref(), size)
+                })
             })
-        })
-    };
-    let (meta, range, content) = read().await?.ok_or_else(ApiError::not_found)?;
-    let in_s3 =
-        meta.stored == Stored::S3 && range != ByteRange::Unsatisfiable && method != Method::HEAD;
-    let (meta, range, body) = match state.objects.clone().filter(|_| in_s3) {
-        _ if !in_s3 => (meta, range, Body::from(content)),
-        None => {
-            return Err(ApiError::storage_unavailable(
-                "a blob is in S3, but S3 isn't configured",
-            ));
-        }
-        Some(objects) => match offload::read(&state, &objects, user_id, meta, range).await? {
-            Some(response) => (meta, range, Body::from_stream(response.bytes_stream())),
-            // Back in the database since it was looked up.
-            None => {
-                let (meta, range, content) = read().await?.ok_or_else(ApiError::not_found)?;
-                (meta, range, Body::from(content))
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+        let name = match &meta.location {
+            Location::Backend(name)
+                if range != ByteRange::Unsatisfiable && method != Method::HEAD =>
+            {
+                name.clone()
             }
-        },
-    };
+            _ => return blob_response(meta, range, Body::from(content)),
+        };
+        let remote = remotes.get(&name).ok_or_else(|| {
+            ApiError::storage_unavailable(format!("backend {name:?} isn't configured"))
+        })?;
+        if let Some(response) = offload::read(&state, remote, user_id, &meta, range).await? {
+            return blob_response(meta, range, Body::from_stream(response.bytes_stream()));
+        }
+    }
+    Err(ApiError::storage_unavailable(format!(
+        "blob {id} kept moving while it was read"
+    )))
+}
+
+fn blob_response(meta: BlobMeta, range: ByteRange, body: Body) -> Result<Response, ApiError> {
     let size = meta.size;
     let (status, content_range) = match range {
         ByteRange::Full => (StatusCode::OK, None),
@@ -269,10 +290,11 @@ pub async fn patch_blob(
             .await?
         {
             FlagWrite::Written(meta) => {
-                let objects = state.objects.clone();
-                if let Some(objects) =
-                    objects.filter(|_| offloadable && state.config.blob_target == Target::S3)
-                    && let Err(e) = offload::to_s3(&state, &objects, user_id, id).await
+                let remotes = state.remotes.clone();
+                if let Some(remote) = target(&state)
+                    .filter(|_| offloadable)
+                    .and_then(|name| remotes.get(name))
+                    && let Err(e) = offload::to_backend(&state, remote, user_id, &meta).await
                 {
                     tracing::warn!("blob {id} stays in the database for now: {e:?}");
                 }
@@ -284,15 +306,15 @@ pub async fn patch_blob(
                     "A ref points to this blob, so it can't be offloadable",
                 ));
             }
-            FlagWrite::InS3 => {
-                let objects = state.objects.clone().ok_or_else(|| {
-                    ApiError::storage_unavailable("a blob is in S3, but S3 isn't configured")
+            FlagWrite::InBackend(meta) => {
+                let remotes = state.remotes.clone();
+                let remote = remotes.get(meta.location.as_str()).ok_or_else(|| {
+                    ApiError::storage_unavailable(format!(
+                        "backend {:?} isn't configured",
+                        meta.location.as_str()
+                    ))
                 })?;
-                let meta = state
-                    .db(move |c| store::blob_meta(c, &user_id, id))
-                    .await?
-                    .ok_or_else(ApiError::not_found)?;
-                if offload::to_local(&state, &objects, user_id, meta, true).await? {
+                if offload::to_local(&state, remote, user_id, &meta, true).await? {
                     let meta = state
                         .db(move |c| store::blob_meta(c, &user_id, id))
                         .await?
@@ -318,9 +340,12 @@ pub async fn delete_blob(
         .db(move |c| store::delete_blob(c, &user_id, id))
         .await?
     {
-        BlobDeletion::Deleted(stored) => {
-            if let Some(objects) = state.objects.clone().filter(|_| stored == Stored::S3) {
-                offload::forget(&state, &objects, user_id, id).await;
+        BlobDeletion::Deleted(location) => {
+            let remotes = state.remotes.clone();
+            if let Location::Backend(name) = location
+                && let Some(remote) = remotes.get(&name)
+            {
+                offload::forget(&state, remote, user_id, id).await;
             }
             Ok(StatusCode::NO_CONTENT.into_response())
         }

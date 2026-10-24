@@ -88,6 +88,16 @@ impl ApiError {
         )
     }
 
+    /// The database's file system would drop below `min_free_space` (SPEC §7.5); logged in full.
+    pub fn storage_full(needed: u64, free: u64) -> Self {
+        tracing::warn!("the disk is too full: {needed} bytes needed free, {free} are");
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "storage_full",
+            "The server's disk is too full for this",
+        )
+    }
+
     pub fn too_large(limit: u64) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

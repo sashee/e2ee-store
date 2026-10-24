@@ -3,6 +3,7 @@
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -11,7 +12,7 @@ use tokio::net::UnixListener;
 use crate::config::Config;
 use crate::db;
 use crate::http::{AppState, Clock, router, system_clock};
-use crate::objects::Objects;
+use crate::remotes::{Remote, Remotes};
 use crate::{offload, store};
 
 const PURGE_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -40,24 +41,27 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Everything before serving: S3 from `s3_file`, the migrated database, a refusal if blobs are in S3 the server can't
-/// reach (SPEC §7.4), and freed pages returnable to the file system.
-pub fn prepare(config: &Config) -> anyhow::Result<Option<Objects>> {
-    let objects = config
-        .s3_file
-        .as_ref()
-        .map(|path| {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading s3_file {}", path.display()))?;
-            Objects::from_file(&text).with_context(|| format!("in s3_file {}", path.display()))
+/// Everything before serving: the configured backends, the migrated database, a refusal if blobs are in a backend
+/// the server can't reach them in (SPEC §7.4), and freed pages returnable to the file system.
+pub fn prepare(config: &Config) -> anyhow::Result<Remotes> {
+    let remotes = config
+        .backends
+        .iter()
+        .map(|(name, backend)| {
+            let file = backend.file.display();
+            let text = std::fs::read_to_string(&backend.file)
+                .with_context(|| format!("reading backend {name:?}'s file {file}"))?;
+            let remote = Remote::open(name, backend.kind, &text)
+                .with_context(|| format!("in backend {name:?}'s file {file}"))?;
+            Ok((name.clone(), Arc::new(remote)))
         })
-        .transpose()?;
+        .collect::<anyhow::Result<Remotes>>()?;
     let conn = db::open_and_migrate(&config.database)?;
-    let (in_s3, recorded) = store::s3_usage(&conn)?;
-    offload::check_location(
-        in_s3,
-        recorded.as_ref(),
-        objects.as_ref().map(Objects::location),
+    let configured: Vec<_> = remotes.values().map(|remote| remote.record()).collect();
+    offload::check_backends(
+        &store::usage(&conn)?,
+        &store::recorded_backends(&conn)?,
+        &configured,
     )?;
     match db::enable_incremental_vacuum(&conn) {
         Ok(true) => tracing::info!("the database now returns freed pages to the file system"),
@@ -66,14 +70,14 @@ pub fn prepare(config: &Config) -> anyhow::Result<Option<Objects>> {
             "switching to incremental vacuum failed; trying again at the next start: {e}"
         ),
     }
-    Ok(objects)
+    Ok(remotes)
 }
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let objects = prepare(&config)?;
+    let remotes = prepare(&config)?;
     let socket = config.socket.clone();
     let listener = bind(&socket)?;
-    let state = AppState::new(config, system_clock()).with_objects(objects);
+    let state = AppState::new(config, system_clock()).with_remotes(remotes);
     tokio::spawn(purge_loop(state.clone(), state.clock.clone()));
     tokio::spawn(offload_loop(state.clone()));
     tracing::info!("listening on {}", socket.display());

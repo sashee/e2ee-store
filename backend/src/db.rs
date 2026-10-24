@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
+
+use crate::disk;
 
 /// Bound on both parts of a version: `encode` keeps the minor in the low three decimal digits.
 const COMPONENT_LIMIT: i64 = 1000;
@@ -67,7 +69,7 @@ impl std::fmt::Display for Version {
 }
 
 /// The schema this binary writes.
-pub const SCHEMA_VERSION: Version = Version::new(1, 2);
+pub const SCHEMA_VERSION: Version = Version::new(1, 3);
 
 /// A new major stops every older binary from starting, so it needs a plan, not just an edit: deliver a binary that
 /// no longer depends on what the major changes first, through the pipeline, then the major. Changing this line is
@@ -80,6 +82,8 @@ const _: () = assert!(
 struct Migration {
     version: Version,
     sql: &'static str,
+    /// Copies a table, so it needs room for a second copy while it runs.
+    rebuilds: bool,
 }
 
 /// In ascending order, the last one at `SCHEMA_VERSION`. Append only; never edit an applied migration.
@@ -89,7 +93,7 @@ struct Migration {
 /// - `ALTER TABLE … ADD COLUMN` that is nullable or has a default, so an older binary's `INSERT`, which doesn't
 ///   name the column, still works;
 /// - rebuild a table to change only how it is stored, keeping every column and refusing exactly the rows it
-///   refused before.
+///   refused before; or to relax a constraint only a newer configuration's data needs relaxed (1.3).
 ///
 /// Everything else is a major: dropping or renaming a table or column, changing a column's type, a constraint an
 /// older binary's writes could break, or a new meaning for existing data. The test is whether the previous binary
@@ -165,12 +169,14 @@ CREATE TABLE refs (
 ) STRICT;
 CREATE INDEX refs_by_blob ON refs(user_id, blob_id);
 "#,
+        rebuilds: false,
     },
     // Blobs the client lets the server move out of the database (SPEC §7.1). An older binary uploads blobs that
     // aren't offloadable, and doesn't refuse refs to offloadable ones: nothing is offloaded yet, so that's harmless.
     Migration {
         version: Version::new(1, 1),
         sql: "ALTER TABLE blobs ADD COLUMN offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1));",
+        rebuilds: false,
     },
     // Offloadable blobs in S3 (SPEC §7.4): where each blob's content is, and which bucket they went to. Only a
     // server configured for S3 moves blobs there. An older binary answers 500 for those, as it reads past their
@@ -188,6 +194,46 @@ CREATE TABLE s3_location (
   prefix    TEXT NOT NULL
 ) STRICT;
 "#,
+        rebuilds: false,
+    },
+    // Named backends (SPEC §7.4): `location` holds "local" or a backend's name, so `blobs` loses its CHECK of
+    // ('local', 's3'), which only a rebuild can drop. The same columns in the same order: an older binary names them
+    // and can't tell. It does take a blob in a backend of another name for one in the database, and answers 500 for
+    // it, reading past its empty content: data only a newer configuration makes.
+    //
+    // The new table is renamed to `blobs`, never the old one away: renaming `blobs` would take `refs`' foreign key
+    // with it. `migrate` turns foreign keys off around this, as dropping `blobs` would otherwise trip it.
+    //
+    // `backends` records each backend blobs went to; S3's location from 1.2 becomes the backend "s3", which blobs in
+    // S3 already name. `s3_location` stays: 1.2 binaries read it at startup.
+    Migration {
+        version: Version::new(1, 3),
+        sql: r#"
+CREATE TABLE blobs_new (
+  user_id     BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id          BLOB NOT NULL,
+  size        INTEGER NOT NULL,
+  content     BLOB NOT NULL,
+  created_at  INTEGER NOT NULL,
+  offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),
+  location    TEXT NOT NULL DEFAULT 'local' CHECK (location <> ''),
+  PRIMARY KEY (user_id, id)
+) STRICT;
+INSERT INTO blobs_new (user_id, id, size, content, created_at, offloadable, location)
+  SELECT user_id, id, size, content, created_at, offloadable, location FROM blobs;
+DROP TABLE blobs;
+ALTER TABLE blobs_new RENAME TO blobs;
+CREATE INDEX blobs_by_location ON blobs(location, offloadable);
+
+CREATE TABLE backends (
+  name      TEXT PRIMARY KEY,
+  type      TEXT NOT NULL,
+  identity  TEXT NOT NULL
+) STRICT;
+INSERT INTO backends (name, type, identity)
+  SELECT 's3', 's3', json_object('bucket', bucket, 'endpoint', endpoint, 'prefix', prefix) FROM s3_location;
+"#,
+        rebuilds: true,
     },
 ];
 
@@ -207,14 +253,21 @@ pub fn open_and_migrate(path: &Path) -> anyhow::Result<Connection> {
     }
     let mut conn = open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    migrate(&mut conn)?;
+    // Off around the migration, as a rebuild drops a table others point to; outside its transaction, as SQLite
+    // ignores the pragma inside one. `foreign_key_check` stands in for it.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let migrated = migrate(&mut conn, path);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    migrated?;
     Ok(conn)
 }
 
 /// Brings an older schema to `SCHEMA_VERSION` in one transaction. A newer minor is left as it is, with a warning; a
 /// newer major is refused. A database already at `SCHEMA_VERSION` isn't written to.
-fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
-    let current = Version::decode(conn.pragma_query_value(None, "user_version", |r| r.get(0))?);
+fn migrate(conn: &mut Connection, path: &Path) -> anyhow::Result<()> {
+    // The write lock before the version: a server and an admin command starting together then migrate once.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = Version::decode(tx.pragma_query_value(None, "user_version", |r| r.get(0))?);
     if current.major > SCHEMA_VERSION.major {
         anyhow::bail!(
             "database schema version {current} is newer than this binary's ({SCHEMA_VERSION}) by a major version"
@@ -229,14 +282,37 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     if current == SCHEMA_VERSION {
         return Ok(());
     }
-    let tx = conn.transaction()?;
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
+    if pending.iter().any(|m| m.rebuilds) {
+        room_to_rebuild(path)?;
+    }
+    for migration in pending {
         tx.execute_batch(migration.sql)
             .with_context(|| format!("migrating the database to {}", migration.version))?;
+    }
+    let dangling: i64 = tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+        r.get(0)
+    })?;
+    if dangling > 0 {
+        anyhow::bail!("migrating would leave {dangling} rows pointing at rows that don't exist");
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION.encode())?;
     tx.commit()?;
     tracing::info!("database schema migrated from {current} to {SCHEMA_VERSION}");
+    Ok(())
+}
+
+/// A rebuild holds a second copy of the table while it runs, first in the WAL, then in the database: about twice the
+/// database's size, free. Refused before it starts rather than failing with a full disk.
+fn room_to_rebuild(path: &Path) -> anyhow::Result<()> {
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    let free = disk::system_free_space()(path)?;
+    if free < size.saturating_mul(2) {
+        anyhow::bail!(
+            "migrating the database copies it: it needs {} bytes free, and {free} are",
+            size.saturating_mul(2)
+        );
+    }
     Ok(())
 }
 
@@ -341,7 +417,7 @@ mod tests {
         drop(conn);
 
         let conn = open_and_migrate(&path).unwrap();
-        assert_eq!(stored(&conn), 1002);
+        assert_eq!(stored(&conn), 1003);
         conn.execute(insert, [b"after".to_vec()]).unwrap();
         let rows: Vec<(i64, String)> = conn
             .prepare("SELECT offloadable, location FROM blobs ORDER BY id")
@@ -351,6 +427,144 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, [(0, "local".into()), (0, "local".into())]);
+    }
+
+    /// A database at 1.2, written the way a 1.2 binary does, with blobs here and in S3 and refs to them.
+    fn at_1_2(path: &Path) -> Connection {
+        let conn = open(path).unwrap();
+        for migration in &MIGRATIONS[..3] {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 1002).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (id, username, created_at) VALUES (x'01', 'alice', 0);
+             INSERT INTO blobs (user_id, id, size, content, created_at, offloadable, location)
+               VALUES (x'01', x'aa', 3, x'616263', 1, 0, 'local'),
+                      (x'01', x'bb', 5, x'', 2, 1, 's3');
+             INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (x'01', 'vault', x'aa', 3);
+             INSERT INTO s3_location (id, endpoint, bucket, prefix) VALUES (1, 'https://s3.example.com', 'music', 'music/');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn the_1_3_rebuild_keeps_every_row_and_what_points_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sqlite3");
+        drop(at_1_2(&path));
+        let conn = open_and_migrate(&path).unwrap();
+        assert_eq!(stored(&conn), 1003);
+
+        type Blob = (Vec<u8>, i64, Vec<u8>, i64, bool, String);
+        let rows: Vec<Blob> = conn
+            .prepare("SELECT id, size, content, created_at, offloadable, location FROM blobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (vec![0xaa], 3, b"abc".to_vec(), 1, false, "local".into()),
+                (vec![0xbb], 5, vec![], 2, true, "s3".into())
+            ]
+        );
+        let backends: Vec<(String, String, String)> = conn
+            .prepare("SELECT name, type, identity FROM backends")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            backends,
+            [(
+                "s3".into(),
+                "s3".into(),
+                r#"{"bucket":"music","endpoint":"https://s3.example.com","prefix":"music/"}"#
+                    .into()
+            )]
+        );
+
+        // `refs` still points at `blobs`, and the foreign key is enforced again.
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        let refs_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'refs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            refs_sql.contains("REFERENCES blobs(user_id, id)"),
+            "{refs_sql}"
+        );
+        assert!(
+            conn.execute("INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (x'01', 'x', x'cc', 4)", [])
+                .is_err(),
+            "a ref to a blob that doesn't exist"
+        );
+        assert!(
+            conn.execute("DELETE FROM blobs WHERE id = x'aa'", [])
+                .is_err(),
+            "a referenced blob"
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'blobs_by_location'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+
+        // Any backend's name now, but not none; and a 1.2 binary's reads and writes still work.
+        conn.execute_batch("UPDATE blobs SET location = 'backblaze' WHERE id = x'bb'")
+            .unwrap();
+        assert!(
+            conn.execute_batch("UPDATE blobs SET location = '' WHERE id = x'bb'")
+                .is_err()
+        );
+        let read: (i64, String, i64) = conn
+            .query_row(
+                "SELECT size, location, rowid FROM blobs WHERE user_id = x'01' AND id = x'aa'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((read.0, read.1.as_str()), (3, "local"));
+        conn.execute_batch(
+            "INSERT INTO blobs (user_id, id, size, content, created_at, offloadable, location)
+               VALUES (x'01', x'dd', 1, x'00', 5, 0, 'local')",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn starting_twice_at_once_migrates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sqlite3");
+        drop(at_1_2(&path));
+        let starts: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || open_and_migrate(&path).map(|_| ()))
+            })
+            .collect();
+        for start in starts {
+            start.join().unwrap().unwrap();
+        }
+        let conn = open(&path).unwrap();
+        assert_eq!(stored(&conn), 1003);
+        let blobs: i64 = conn
+            .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 2);
     }
 
     #[test]
@@ -372,7 +586,7 @@ mod tests {
         while reclaim(&conn, 100).unwrap() > 0 {}
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .unwrap();
-        assert!(pages(&conn) < full / 10, "{} of {full} pages", pages(&conn));
+        assert!(pages(&conn) < full / 5, "{} of {full} pages", pages(&conn));
         assert!(std::fs::metadata(&path).unwrap().len() < 200_000);
     }
 

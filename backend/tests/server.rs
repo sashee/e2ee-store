@@ -104,6 +104,14 @@ fn the_admin_commands_manage_users() {
         stderr(&taken)
     );
 
+    let storage = instance.ok(&["storage"]);
+    assert!(storage.starts_with("where"), "{storage}");
+    assert!(storage.contains("target: local"), "{storage}");
+    assert!(
+        storage.contains("bringing everything into the database: 0 B more; fits"),
+        "{storage}"
+    );
+
     let list = instance.ok(&["user", "list"]);
     assert!(list.starts_with("alice\t"), "{list}");
     assert!(

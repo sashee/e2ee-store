@@ -326,40 +326,52 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
 
 // ---------------------------------------------------------------- blobs
 
-/// Where a blob's content is (SPEC §7.4). A blob in S3 keeps its row, with empty `content`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stored {
+/// Where a blob's content is (SPEC §7.4): in the database, or in the backend of that name. A blob in a backend keeps
+/// its row, with empty `content`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Location {
     Local,
-    S3,
+    Backend(String),
 }
 
-impl Stored {
-    fn of(location: &str) -> Self {
-        if location == "s3" {
-            Self::S3
-        } else {
+impl Location {
+    fn of(location: String) -> Self {
+        if location == LOCAL {
             Self::Local
+        } else {
+            Self::Backend(location)
+        }
+    }
+
+    /// As the column holds it.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Local => LOCAL,
+            Self::Backend(name) => name,
         }
     }
 }
 
-/// The S3 location blobs were moved to: none of it secret. The database keeps it so a server pointed at another
-/// bucket doesn't take its blobs for lost (SPEC §7.4).
+const LOCAL: &str = "local";
+
+/// What the database records of a backend blobs were moved to, so a server pointed elsewhere under the same name
+/// doesn't take them for lost (SPEC §7.4). `identity` is the type's own description of where it keeps blobs, as JSON,
+/// none of it secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct S3Location {
-    pub endpoint: String,
-    pub bucket: String,
-    pub prefix: String,
+pub struct BackendRecord {
+    pub name: String,
+    pub kind: String,
+    pub identity: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobMeta {
     pub id: BlobId,
     pub size: u64,
     pub created_at: i64,
     /// The client allows the server to move the content out of the database (SPEC §7.1).
     pub offloadable: bool,
-    pub stored: Stored,
+    pub location: Location,
 }
 
 const BLOB_META: &str = "id, size, created_at, offloadable, location";
@@ -370,29 +382,29 @@ fn blob_meta_row(row: &Row) -> rusqlite::Result<BlobMeta> {
         size: row.get::<_, i64>(1)?.try_into().unwrap_or(0),
         created_at: row.get(2)?,
         offloadable: row.get(3)?,
-        stored: Stored::of(&row.get::<_, String>(4)?),
+        location: Location::of(row.get(4)?),
     })
 }
 
-fn sql_size(size: usize) -> i64 {
-    i64::try_from(size).unwrap_or(i64::MAX)
+fn sql_size(size: impl TryInto<i64>) -> i64 {
+    size.try_into().unwrap_or(i64::MAX)
 }
 
-/// Stores a blob unless it already exists; an existing one keeps its flag and its place. With `in_s3`, the content
-/// is already there and only the row is written. Returns whether it was new, and its metadata.
+/// Stores a blob unless it already exists; an existing one keeps its flag and its place. With `in_backend`, the
+/// content is already there and only the row is written. Returns whether it was new, and its metadata.
 pub fn put_blob(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
     content: &[u8],
     offloadable: bool,
-    in_s3: Option<&S3Location>,
+    in_backend: Option<&BackendRecord>,
     now: i64,
 ) -> rusqlite::Result<(bool, BlobMeta)> {
     let tx = conn.transaction()?;
-    let (stored, location) = match in_s3 {
-        Some(_) => (&[][..], "s3"),
-        None => (content, "local"),
+    let (stored, location) = match in_backend {
+        Some(backend) => (&[][..], backend.name.as_str()),
+        None => (content, LOCAL),
     };
     let inserted = tx.execute(
         "INSERT INTO blobs (user_id, id, size, content, created_at, offloadable, location)
@@ -408,9 +420,9 @@ pub fn put_blob(
         ],
     )?;
     if inserted == 1
-        && let Some(s3) = in_s3
+        && let Some(backend) = in_backend
     {
-        record_s3_location(&tx, s3)?;
+        record_backend(&tx, backend)?;
     }
     let meta = blob_meta(&tx, user_id, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     tx.commit()?;
@@ -431,8 +443,8 @@ pub fn blob_meta(
 }
 
 /// The blob's metadata, the range `pick` chooses for its size, and that range's bytes: empty when it's
-/// unsatisfiable or the blob is in S3. The bytes come through incremental BLOB I/O, so SQLite reads only the pages
-/// up to the range's end and only the range is held in memory.
+/// unsatisfiable or the blob is in a backend. The bytes come through incremental BLOB I/O, so SQLite reads only the
+/// pages up to the range's end and only the range is held in memory.
 pub fn blob_content(
     conn: &mut Connection,
     user_id: &UserId,
@@ -452,10 +464,10 @@ pub fn blob_content(
         return Ok(None);
     };
     let range = pick(meta.size);
-    let content = match (meta.stored, range) {
-        (Stored::S3, _) | (_, ByteRange::Unsatisfiable) => Vec::new(),
-        (Stored::Local, ByteRange::Full) => read_blob(&tx, rowid, 0, meta.size)?,
-        (Stored::Local, ByteRange::Partial { start, end }) => {
+    let content = match (&meta.location, range) {
+        (Location::Backend(_), _) | (_, ByteRange::Unsatisfiable) => Vec::new(),
+        (Location::Local, ByteRange::Full) => read_blob(&tx, rowid, 0, meta.size)?,
+        (Location::Local, ByteRange::Partial { start, end }) => {
             read_blob(&tx, rowid, start, end - start + 1)?
         }
     };
@@ -470,10 +482,10 @@ fn read_blob(conn: &Connection, rowid: i64, start: u64, len: u64) -> rusqlite::R
     Ok(content)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobDeletion {
-    /// Its content was where it says; one in S3 is the caller's to delete there.
-    Deleted(Stored),
+    /// Its content was where it says; one in a backend is the caller's to delete there.
+    Deleted(Location),
     NotFound,
     Referenced,
 }
@@ -492,20 +504,20 @@ pub fn delete_blob(
                 "DELETE FROM blobs WHERE user_id = ?1 AND id = ?2",
                 params![user_id, id.0],
             )?;
-            BlobDeletion::Deleted(meta.stored)
+            BlobDeletion::Deleted(meta.location)
         }
     };
     tx.commit()?;
     Ok(outcome)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlagWrite {
     Written(BlobMeta),
     NotFound,
     Referenced,
-    /// Not offloadable can only be a blob in the database: this one has to come back from S3 first.
-    InS3,
+    /// Not offloadable can only be a blob in the database: this one has to come back from its backend first.
+    InBackend(BlobMeta),
 }
 
 fn referenced(conn: &Connection, user_id: &UserId, id: BlobId) -> rusqlite::Result<bool> {
@@ -516,7 +528,7 @@ fn referenced(conn: &Connection, user_id: &UserId, id: BlobId) -> rusqlite::Resu
     )
 }
 
-/// Sets whether the blob is offloadable. A blob a ref points to can't be, and one in S3 can't stop being
+/// Sets whether the blob is offloadable. A blob a ref points to can't be, and one in a backend can't stop being
 /// (SPEC §7.1, §7.4).
 pub fn set_offloadable(
     conn: &mut Connection,
@@ -528,7 +540,9 @@ pub fn set_offloadable(
     let outcome = match blob_meta(&tx, user_id, id)? {
         None => FlagWrite::NotFound,
         Some(_) if offloadable && referenced(&tx, user_id, id)? => FlagWrite::Referenced,
-        Some(meta) if !offloadable && meta.stored == Stored::S3 => FlagWrite::InS3,
+        Some(meta) if !offloadable && meta.location != Location::Local => {
+            FlagWrite::InBackend(meta)
+        }
         Some(meta) => {
             tx.execute(
                 "UPDATE blobs SET offloadable = ?3 WHERE user_id = ?1 AND id = ?2",
@@ -562,121 +576,149 @@ pub fn list_blobs(
 // ---------------------------------------------------------------- moving blobs (SPEC §7.4)
 
 /// A blob that isn't where it belongs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Misplaced {
     pub user_id: UserId,
-    pub id: BlobId,
-    pub size: u64,
-    pub to: Stored,
+    pub meta: BlobMeta,
+    pub to: Location,
 }
 
-/// Every blob that isn't where it belongs: offloadable blobs in S3 if that is the target, everything else here.
-pub fn misplaced_blobs(conn: &Connection, target: Target) -> rusqlite::Result<Vec<Misplaced>> {
-    let to_s3 = target == Target::S3;
-    conn.prepare(
-        "SELECT user_id, id, size, location FROM blobs
-         WHERE (?1 AND location = 'local' AND offloadable = 1) OR (location = 's3' AND (NOT ?1 OR offloadable = 0))
-         ORDER BY user_id, id",
-    )?
-    .query_map(params![to_s3], |r| {
-        Ok(Misplaced {
-            user_id: r.get(0)?,
+/// Every blob that isn't where it belongs: offloadable blobs in the target, everything else in the database.
+pub fn misplaced_blobs(conn: &Connection, target: &Target) -> rusqlite::Result<Vec<Misplaced>> {
+    let target = match target {
+        Target::Local => LOCAL,
+        Target::Backend(name) => name,
+    };
+    conn.prepare(&format!(
+        "SELECT user_id, {BLOB_META} FROM blobs
+         WHERE location <> CASE WHEN offloadable = 1 THEN ?1 ELSE '{LOCAL}' END
+         ORDER BY user_id, id"
+    ))?
+    .query_map(params![target], |r| {
+        let meta = BlobMeta {
             id: BlobId(r.get(1)?),
             size: r.get::<_, i64>(2)?.try_into().unwrap_or(0),
-            to: match Stored::of(&r.get::<_, String>(3)?) {
-                Stored::Local => Stored::S3,
-                Stored::S3 => Stored::Local,
-            },
+            created_at: r.get(3)?,
+            offloadable: r.get(4)?,
+            location: Location::of(r.get(5)?),
+        };
+        let to = if meta.offloadable {
+            Location::of(target.to_owned())
+        } else {
+            Location::Local
+        };
+        Ok(Misplaced {
+            user_id: r.get(0)?,
+            meta,
+            to,
         })
     })?
     .collect()
 }
 
-/// The content of a blob that may go to S3: one in the database, and offloadable. None for any other.
+/// The content of a blob that may leave the database: one in it, and offloadable. None for any other.
 pub fn offloadable_content(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
 ) -> rusqlite::Result<Option<Vec<u8>>> {
     match blob_content(conn, user_id, id, |_| ByteRange::Full)? {
-        Some((meta, _, content)) if meta.offloadable && meta.stored == Stored::Local => {
+        Some((meta, _, content)) if meta.offloadable && meta.location == Location::Local => {
             Ok(Some(content))
         }
         _ => Ok(None),
     }
 }
 
-/// Records that the blob's content is in S3 and drops it here, if the blob is still in the database and
-/// offloadable; false otherwise, and then the object the caller put there is nobody's.
-pub fn mark_in_s3(
+/// Records that the blob's content is now in backend `to`, if it is still offloadable and still `from`: from the
+/// database, which drops the content here, or from another backend. False otherwise, and then the object the caller
+/// put in `to` is nobody's.
+pub fn mark_moved(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
-    s3: &S3Location,
+    from: &Location,
+    to: &BackendRecord,
 ) -> rusqlite::Result<bool> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let moved = tx.execute(
-        "UPDATE blobs SET location = 's3', content = x'' WHERE user_id = ?1 AND id = ?2 AND location = 'local' AND offloadable = 1",
-        params![user_id, id.0],
+        "UPDATE blobs SET location = ?4, content = x''
+         WHERE user_id = ?1 AND id = ?2 AND location = ?3 AND offloadable = 1",
+        params![user_id, id.0, from.as_str(), to.name],
     )? == 1;
     if moved {
-        record_s3_location(&tx, s3)?;
+        record_backend(&tx, to)?;
     }
     tx.commit()?;
     Ok(moved)
 }
 
-/// Puts a blob's content back in the database, if it is still in S3; `unflag` also makes it not offloadable, in the
-/// same step. False if the blob isn't in S3 (any more).
+/// Puts a blob's content back in the database, if it is still in backend `from`; `unflag` also makes it not
+/// offloadable, in the same step. False if it isn't there (any more).
 pub fn mark_local(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
+    from: &str,
     content: &[u8],
     unflag: bool,
 ) -> rusqlite::Result<bool> {
     Ok(conn.execute(
-        "UPDATE blobs SET location = 'local', content = ?3, offloadable = offloadable AND NOT ?4
-         WHERE user_id = ?1 AND id = ?2 AND location = 's3'",
-        params![user_id, id.0, content, unflag],
+        "UPDATE blobs SET location = 'local', content = ?4, offloadable = offloadable AND NOT ?5
+         WHERE user_id = ?1 AND id = ?2 AND location = ?3",
+        params![user_id, id.0, from, content, unflag],
     )? == 1)
 }
 
-/// Every blob whose content is in S3.
-pub fn blobs_in_s3(conn: &Connection) -> rusqlite::Result<HashSet<(UserId, BlobId)>> {
-    conn.prepare("SELECT user_id, id FROM blobs WHERE location = 's3'")?
-        .query_map([], |r| Ok((r.get(0)?, BlobId(r.get(1)?))))?
+/// Every blob in backend `name`.
+pub fn blobs_in(conn: &Connection, name: &str) -> rusqlite::Result<HashSet<(UserId, BlobId)>> {
+    conn.prepare("SELECT user_id, id FROM blobs WHERE location = ?1")?
+        .query_map([name], |r| Ok((r.get(0)?, BlobId(r.get(1)?))))?
         .collect()
 }
 
-/// How many blobs are in S3, and the location they were moved to.
-pub fn s3_usage(conn: &Connection) -> rusqlite::Result<(u64, Option<S3Location>)> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM blobs WHERE location = 's3'",
-        [],
-        |r| r.get(0),
-    )?;
-    let location = conn
-        .query_row(
-            "SELECT endpoint, bucket, prefix FROM s3_location",
-            [],
-            |r| {
-                Ok(S3Location {
-                    endpoint: r.get(0)?,
-                    bucket: r.get(1)?,
-                    prefix: r.get(2)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok((count.try_into().unwrap_or(0), location))
+/// The blobs in one place, and their bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub location: Location,
+    pub blobs: u64,
+    pub bytes: u64,
 }
 
-fn record_s3_location(conn: &Connection, s3: &S3Location) -> rusqlite::Result<()> {
+/// How many blobs are where, by location: the database first, then the backends by name.
+pub fn usage(conn: &Connection) -> rusqlite::Result<Vec<Usage>> {
+    let mut usage: Vec<Usage> = conn
+        .prepare("SELECT location, count(*), coalesce(sum(size), 0) FROM blobs GROUP BY location")?
+        .query_map([], |r| {
+            Ok(Usage {
+                location: Location::of(r.get(0)?),
+                blobs: r.get::<_, i64>(1)?.try_into().unwrap_or(0),
+                bytes: r.get::<_, i64>(2)?.try_into().unwrap_or(0),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    usage.sort_by(|a, b| a.location.cmp(&b.location));
+    Ok(usage)
+}
+
+/// The backends blobs have been moved to, as the database recorded them.
+pub fn recorded_backends(conn: &Connection) -> rusqlite::Result<Vec<BackendRecord>> {
+    conn.prepare("SELECT name, type, identity FROM backends ORDER BY name")?
+        .query_map([], |r| {
+            Ok(BackendRecord {
+                name: r.get(0)?,
+                kind: r.get(1)?,
+                identity: r.get(2)?,
+            })
+        })?
+        .collect()
+}
+
+fn record_backend(conn: &Connection, backend: &BackendRecord) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO s3_location (id, endpoint, bucket, prefix) VALUES (1, ?1, ?2, ?3)
-         ON CONFLICT (id) DO UPDATE SET endpoint = excluded.endpoint, bucket = excluded.bucket, prefix = excluded.prefix",
-        params![s3.endpoint, s3.bucket, s3.prefix],
+        "INSERT INTO backends (name, type, identity) VALUES (?1, ?2, ?3)
+         ON CONFLICT (name) DO UPDATE SET type = excluded.type, identity = excluded.identity",
+        params![backend.name, backend.kind, backend.identity],
     )?;
     Ok(())
 }
@@ -734,8 +776,8 @@ pub fn put_ref(
     let outcome = match blob_meta(&tx, user_id, blob)? {
         _ if !precondition_holds(precondition, current) => RefWrite::PreconditionFailed(current),
         None => RefWrite::BlobNotFound,
-        // Not offloadable but in S3 is only left behind by an older binary (SPEC §5.2); it comes back soon.
-        Some(target) if target.offloadable || target.stored == Stored::S3 => {
+        // Not offloadable but in a backend is only left behind by an older binary (SPEC §5.2); it comes back soon.
+        Some(target) if target.offloadable || target.location != Location::Local => {
             RefWrite::BlobOffloadable
         }
         Some(_) => {

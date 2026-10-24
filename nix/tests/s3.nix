@@ -1,7 +1,8 @@
-# The NixOS module with S3 (backend SPEC §7.4): the instance gets its credential file encrypted by systemd, and talks
-# to Garage on the same machine, behind nginx for TLS with a test CA in the system's bundle. On top of the checks of
-# ./lib.nix: offloadable blobs go to S3, read back through the API, and move back and forth when the target changes;
-# the credentials stay the service's; and against a real S3, the sweep, an outage and a lost object.
+# The NixOS module with S3 backends (backend SPEC §7.4): the instance gets one credential file per backend, encrypted by
+# systemd, and talks to Garage on the same machine, behind nginx for TLS with a test CA in the system's bundle. Two
+# backends, a bucket each. On top of the checks of ./lib.nix: offloadable blobs go to S3, read back through the API,
+# and move when the target changes, between the database and a backend and from one backend to the other; the
+# credentials stay the service's; and against a real S3, the sweep, an outage and a lost object.
 #
 # `machineModules` are the machine's own configuration, as for ./lib.nix: a host repository passes its real one.
 {
@@ -31,15 +32,22 @@ let
   keyId = "GK0123456789abcdef01234567";
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-  # The plaintext credential file. In the store here, as it's a test's; on a host it only exists encrypted.
-  s3File = pkgs.writeText "s3.toml" ''
-    endpoint = "https://localhost:9000"
-    region = "garage"
-    bucket = "blobs"
-    prefix = "demo/"
-    access_key_id = "${keyId}"
-    secret_access_key = "${secret}"
-  '';
+  # A backend's plaintext credential file. In the store here, as it's a test's; on a host it only exists encrypted.
+  credentialFile =
+    bucket:
+    pkgs.writeText "${bucket}.toml" ''
+      endpoint = "https://localhost:9000"
+      region = "garage"
+      bucket = "${bucket}"
+      prefix = "demo/"
+      access_key_id = "${keyId}"
+      secret_access_key = "${secret}"
+    '';
+  # Backend name → bucket.
+  backends = {
+    garage = "blobs";
+    garage2 = "blobs2";
+  };
 in
 import ./lib.nix {
   inherit pkgs;
@@ -101,8 +109,11 @@ import ./lib.nix {
 
       services.e2ee-store.instances.demo = {
         inherit staticDir;
-        settings.blob_target = "s3";
-        s3CredentialFile = "/etc/credentials/demo/s3";
+        settings.blob_target = "garage";
+        storageBackends = lib.mapAttrs (name: _: {
+          type = "s3";
+          credentialFile = "/etc/credentials/demo/${name}";
+        }) backends;
       };
 
       # What an admin does once on a host, as a unit: encrypt the credential file with the host's key.
@@ -115,7 +126,11 @@ import ./lib.nix {
         };
         script = ''
           install -d -m 0700 /etc/credentials/demo
-          ${pkgs.systemd}/bin/systemd-creds encrypt --name=s3 ${s3File} /etc/credentials/demo/s3
+          ${lib.concatStrings (
+            lib.mapAttrsToList (name: bucket: ''
+              ${pkgs.systemd}/bin/systemd-creds encrypt --name=${name} ${credentialFile bucket} /etc/credentials/demo/${name}
+            '') backends
+          )}
         '';
       };
     }
@@ -126,8 +141,8 @@ import ./lib.nix {
     API = f"curl -sf --unix-socket {SOCKET} -H 'Origin: http://localhost' -b /tmp/jar -c /tmp/jar"
 
 
-    def objects():
-        return machine.succeed("mc ls --recursive s3/blobs")
+    def objects(bucket="blobs"):
+        return machine.succeed(f"mc ls --recursive s3/{bucket}")
 
 
     def restart():
@@ -162,8 +177,9 @@ import ./lib.nix {
         machine.succeed(f"garage layout assign -z vm -c 1G {node}")
         machine.succeed("garage layout apply --version 1")
         machine.succeed("garage key import --yes -n demo ${keyId} ${secret}")
-        machine.succeed("garage bucket create blobs")
-        machine.succeed("garage bucket allow --read --write blobs --key demo")
+        for bucket in ["blobs", "blobs2"]:
+            machine.succeed(f"garage bucket create {bucket}")
+            machine.succeed(f"garage bucket allow --read --write {bucket} --key demo")
         machine.wait_for_unit("nginx.service")
         machine.succeed("mc alias set s3 https://localhost:9000 ${keyId} ${secret} --api S3v4")
 
@@ -194,11 +210,26 @@ import ./lib.nix {
         machine.wait_until_succeeds(f"mc ls --recursive s3/blobs | grep -q {blob}")
         machine.succeed(f"{API} -o /tmp/whole http://localhost/api/v1/blobs/{blob} && cmp /tmp/track /tmp/whole")
 
+    with subtest("from one backend to another, without the database"):
+        machine.succeed("systemctl set-environment BACKEND_BLOB_TARGET=garage2")
+        restart()
+        machine.wait_until_succeeds(f"mc ls --recursive s3/blobs2 | grep -q {blob}")
+        machine.wait_until_succeeds(f"! mc ls --recursive s3/blobs | grep -q {blob}")
+        machine.succeed(f"{API} -o /tmp/whole http://localhost/api/v1/blobs/{blob} && cmp /tmp/track /tmp/whole")
+        report = machine.succeed(f"{NAME} storage")
+        # The admin command reads the configuration as written: the override is the service's alone.
+        assert re.search(r"^garage2\s+1\s", report, re.M), report
+        machine.succeed("systemctl unset-environment BACKEND_BLOB_TARGET")
+        restart()
+        machine.wait_until_succeeds(f"mc ls --recursive s3/blobs | grep -q {blob}")
+        machine.wait_until_succeeds(f"! mc ls --recursive s3/blobs2 | grep -q {blob}")
+
     with subtest("the credentials are the service's alone"):
-        machine.fail("grep -q ${secret} /etc/credentials/demo/s3")
-        machine.succeed(f"runuser -u {NAME} -- grep -q ${secret} /run/credentials/{NAME}.service/s3")
-        for user in [CLIENT, "store-outsider"]:
-            machine.fail(f"su - {user} -c 'cat /run/credentials/{NAME}.service/s3'")
+        for backend in ["garage", "garage2"]:
+            machine.fail(f"grep -q ${secret} /etc/credentials/demo/{backend}")
+            machine.succeed(f"runuser -u {NAME} -- grep -q ${secret} /run/credentials/{NAME}.service/{backend}")
+            for user in [CLIENT, "store-outsider"]:
+                machine.fail(f"su - {user} -c 'cat /run/credentials/{NAME}.service/{backend}'")
 
     with subtest("the sweep deletes the objects no blob owns, and nothing else"):
         orphan = "demo/00000000-0000-4000-8000-000000000000/" + "0" * 64

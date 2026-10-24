@@ -43,8 +43,8 @@ pkgs.testers.runNixOSTest {
     ''
       NAME = "${instance}"
       SOCKET = "${cfg.socketPath}"
-      # S3 needs IP (backend SPEC §7.4); without it, only the Unix socket.
-      FAMILIES = ${if cfg.s3CredentialFile != null then ''{"AF_UNIX", "AF_INET", "AF_INET6"}'' else ''{"AF_UNIX"}''}
+      # Storage backends need IP (backend SPEC §7.4); without them, only the Unix socket.
+      FAMILIES = ${if cfg.storageBackends != { } then ''{"AF_UNIX", "AF_INET", "AF_INET6"}'' else ''{"AF_UNIX"}''}
       STATE = f"/var/lib/{NAME}"
       CLIENT = "store-client"
 
