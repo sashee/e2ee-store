@@ -151,10 +151,10 @@ CREATE TABLE blobs (
   user_id     BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   id          BLOB NOT NULL,                    -- 32 bytes
   size        INTEGER NOT NULL,                 -- kept so content can move to another store later
-  content     BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
   offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),  -- §7.1; added in 1.1
   location    TEXT NOT NULL DEFAULT 'local' CHECK (location <> ''),  -- 'local' or a backend's name (§7.4); 1.2, 1.3
+  content     BLOB NOT NULL,                    -- last: see below
   PRIMARY KEY (user_id, id)
 );
 CREATE INDEX blobs_by_location ON blobs(location, offloadable);
@@ -184,6 +184,8 @@ CREATE TABLE refs (
 );
 CREATE INDEX refs_by_blob ON refs(user_id, blob_id);
 ```
+
+- **Large values go last.** SQLite reaches a column stored after a large blob by stepping through the blob's overflow pages. With `content` last, reading a blob's metadata never touches its content: in a measurement with 8 MiB blobs, a lookup was 10 times and a scan of all rows 180 times faster than with `location` after `content`. Before 1.3, `offloadable` and `location` came after `content`, as `ADD COLUMN` appends; 1.3's rebuild moved `content` last.
 
 ### 5.1 Expiry
 

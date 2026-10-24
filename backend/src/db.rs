@@ -197,9 +197,11 @@ CREATE TABLE s3_location (
         rebuilds: false,
     },
     // Named backends (SPEC §7.4): `location` holds "local" or a backend's name, so `blobs` loses its CHECK of
-    // ('local', 's3'), which only a rebuild can drop. The same columns in the same order: an older binary names them
-    // and can't tell. It does take a blob in a backend of another name for one in the database, and answers 500 for
-    // it, reading past its empty content: data only a newer configuration makes.
+    // ('local', 's3'), which only a rebuild can drop. The same columns, with `content` last: SQLite reaches a column
+    // stored after a large blob by stepping through the blob's overflow pages, and 1.1 and 1.2 had added
+    // `offloadable` and `location` there, which every lookup and every pass read. An older binary names every column,
+    // so it can't tell. It does take a blob in a backend of another name for one in the database, and answers 500
+    // for it, reading past its empty content: data only a newer configuration makes.
     //
     // The new table is renamed to `blobs`, never the old one away: renaming `blobs` would take `refs`' foreign key
     // with it. `migrate` turns foreign keys off around this, as dropping `blobs` would otherwise trip it.
@@ -213,10 +215,10 @@ CREATE TABLE blobs_new (
   user_id     BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   id          BLOB NOT NULL,
   size        INTEGER NOT NULL,
-  content     BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
   offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),
   location    TEXT NOT NULL DEFAULT 'local' CHECK (location <> ''),
+  content     BLOB NOT NULL,
   PRIMARY KEY (user_id, id)
 ) STRICT;
 INSERT INTO blobs_new (user_id, id, size, content, created_at, offloadable, location)
@@ -513,6 +515,26 @@ mod tests {
             conn.execute("DELETE FROM blobs WHERE id = x'aa'", [])
                 .is_err(),
             "a referenced blob"
+        );
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('blobs')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "user_id",
+                "id",
+                "size",
+                "created_at",
+                "offloadable",
+                "location",
+                "content"
+            ],
+            "content last, so reading the others never steps through a blob"
         );
         let index: i64 = conn
             .query_row(
