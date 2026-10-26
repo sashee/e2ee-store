@@ -69,13 +69,13 @@ impl std::fmt::Display for Version {
 }
 
 /// The schema this binary writes.
-pub const SCHEMA_VERSION: Version = Version::new(1, 3);
+pub const SCHEMA_VERSION: Version = Version::new(2, 0);
 
 /// A new major stops every older binary from starting, so it needs a plan, not just an edit: deliver a binary that
 /// no longer depends on what the major changes first, through the pipeline, then the major. Changing this line is
-/// that decision.
+/// that decision. 2.0 went without the first step: its one deployment had nothing in a backend (SPEC §5.2).
 const _: () = assert!(
-    SCHEMA_VERSION.major == 1,
+    SCHEMA_VERSION.major == 2,
     "a major bump stops every older binary from starting; see SPEC §5.2"
 );
 
@@ -234,6 +234,45 @@ CREATE TABLE backends (
 ) STRICT;
 INSERT INTO backends (name, type, identity)
   SELECT 's3', 's3', json_object('bucket', bucket, 'endpoint', endpoint, 'prefix', prefix) FROM s3_location;
+"#,
+        rebuilds: true,
+    },
+    // Copies (SPEC §7.4): an offloadable blob gets one in each of several places, so where it is can't be one
+    // column. `content` holds the database's copy, NULL without one; `blob_copies` a row per backend with one. A
+    // blob that was in a backend gets its row there. A blob that isn't offloadable but was in a backend, which an
+    // older binary's unflag could leave, keeps its copy there; the pass brings it home.
+    //
+    // A major: `location` goes, and a NULL `content` would trip every older binary. `s3_location` goes too, as only
+    // 1.2 binaries read it. The new table is renamed to `blobs`, as in 1.3, so `refs` and `blob_copies` point at it.
+    Migration {
+        version: Version::new(2, 0),
+        sql: r#"
+CREATE TABLE blobs_new (
+  user_id     BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id          BLOB NOT NULL,
+  size        INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  offloadable INTEGER NOT NULL DEFAULT 0 CHECK (offloadable IN (0, 1)),
+  content     BLOB,
+  PRIMARY KEY (user_id, id)
+) STRICT;
+INSERT INTO blobs_new (user_id, id, size, created_at, offloadable, content)
+  SELECT user_id, id, size, created_at, offloadable, CASE WHEN location = 'local' THEN content END FROM blobs;
+
+CREATE TABLE blob_copies (
+  user_id  BLOB NOT NULL,
+  blob_id  BLOB NOT NULL,
+  backend  TEXT NOT NULL CHECK (backend <> 'local'),
+  PRIMARY KEY (user_id, blob_id, backend),
+  FOREIGN KEY (user_id, blob_id) REFERENCES blobs(user_id, id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+INSERT INTO blob_copies (user_id, blob_id, backend)
+  SELECT user_id, id, location FROM blobs WHERE location <> 'local';
+CREATE INDEX blob_copies_by_backend ON blob_copies(backend);
+
+DROP TABLE blobs;
+ALTER TABLE blobs_new RENAME TO blobs;
+DROP TABLE s3_location;
 "#,
         rebuilds: true,
     },
@@ -425,31 +464,29 @@ mod tests {
 
     /// The database on the host was at 1, written before versions had a minor.
     #[test]
-    fn a_1_0_database_is_migrated_and_still_takes_a_1_0_binarys_writes() {
+    fn a_1_0_database_is_migrated_with_its_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backend.sqlite3");
         let conn = open(&path).unwrap();
         conn.execute_batch(MIGRATIONS[0].sql).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        let insert = "INSERT INTO blobs (user_id, id, size, content, created_at) VALUES (x'01', ?1, 1, x'00', 0)";
         conn.execute_batch(
-            "INSERT INTO users (id, username, created_at) VALUES (x'01', 'alice', 0)",
+            "INSERT INTO users (id, username, created_at) VALUES (x'01', 'alice', 0);
+             INSERT INTO blobs (user_id, id, size, content, created_at) VALUES (x'01', x'aa', 1, x'00', 0);",
         )
         .unwrap();
-        conn.execute(insert, [b"before".to_vec()]).unwrap();
         drop(conn);
 
         let conn = open_and_migrate(&path).unwrap();
-        assert_eq!(stored(&conn), 1003);
-        conn.execute(insert, [b"after".to_vec()]).unwrap();
-        let rows: Vec<(i64, String)> = conn
-            .prepare("SELECT offloadable, location FROM blobs ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
+        assert_eq!(stored(&conn), SCHEMA_VERSION.encode());
+        let row: (i64, Option<Vec<u8>>, i64) = conn
+            .query_row(
+                "SELECT offloadable, content, (SELECT count(*) FROM blob_copies) FROM blobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(rows, [(0, "local".into()), (0, "local".into())]);
+        assert_eq!(row, (0, Some(vec![0]), 0));
     }
 
     /// A database at 1.2, written the way a 1.2 binary does, with blobs here and in S3 and refs to them.
@@ -471,121 +508,137 @@ mod tests {
         conn
     }
 
+    /// A database at 1.3, as a 1.3 binary leaves it: blobs here, offloadable or not, blobs in two backends, one of
+    /// them unflagged there by an older binary, and a ref.
+    fn at_1_3(path: &Path) -> Connection {
+        let conn = open(path).unwrap();
+        for migration in &MIGRATIONS[..4] {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 1003).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO users (id, username, created_at) VALUES (x'01', 'alice', 0);
+             INSERT INTO blobs (user_id, id, size, created_at, offloadable, location, content)
+               VALUES (x'01', x'aa', 3, 1, 0, 'local', x'616263'),
+                      (x'01', x'bb', 5, 2, 1, 'aws', x''),
+                      (x'01', x'cc', 0, 3, 1, 'local', x''),
+                      (x'01', x'dd', 4, 4, 0, 'b2', x'');
+             INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (x'01', 'vault', x'aa', 5);
+             INSERT INTO backends (name, type, identity)
+               VALUES ('aws', 's3', '{"bucket":"music"}'), ('b2', 's3', '{"bucket":"b2"}');"#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn names(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
     #[test]
-    fn the_1_3_rebuild_keeps_every_row_and_what_points_to_them() {
+    fn the_2_0_rebuild_keeps_every_blob_and_where_its_copies_are() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backend.sqlite3");
-        drop(at_1_2(&path));
+        drop(at_1_3(&path));
         let conn = open_and_migrate(&path).unwrap();
-        assert_eq!(stored(&conn), 1003);
+        assert_eq!(stored(&conn), 2);
 
-        type Blob = (Vec<u8>, i64, Vec<u8>, i64, bool, String);
+        type Blob = (Vec<u8>, i64, i64, bool, Option<Vec<u8>>);
         let rows: Vec<Blob> = conn
-            .prepare("SELECT id, size, content, created_at, offloadable, location FROM blobs ORDER BY id")
+            .prepare("SELECT id, size, created_at, offloadable, content FROM blobs ORDER BY id")
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(
             rows,
             [
-                (vec![0xaa], 3, b"abc".to_vec(), 1, false, "local".into()),
-                (vec![0xbb], 5, vec![], 2, true, "s3".into())
-            ]
+                (vec![0xaa], 3, 1, false, Some(b"abc".to_vec())),
+                (vec![0xbb], 5, 2, true, None),
+                (vec![0xcc], 0, 3, true, Some(vec![])),
+                (vec![0xdd], 4, 4, false, None),
+            ],
+            "an empty blob here keeps its copy; one in a backend has none here"
         );
-        let backends: Vec<(String, String, String)> = conn
-            .prepare("SELECT name, type, identity FROM backends")
+        let copies: Vec<(Vec<u8>, String)> = conn
+            .prepare("SELECT blob_id, backend FROM blob_copies ORDER BY blob_id")
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(
-            backends,
-            [(
-                "s3".into(),
-                "s3".into(),
-                r#"{"bucket":"music","endpoint":"https://s3.example.com","prefix":"music/"}"#
-                    .into()
-            )]
+            copies,
+            [(vec![0xbb], "aws".into()), (vec![0xdd], "b2".into())]
+        );
+        assert_eq!(
+            names(&conn, "SELECT name FROM backends ORDER BY name"),
+            ["aws", "b2"]
         );
 
-        // `refs` still points at `blobs`, and the foreign key is enforced again.
-        let foreign_keys: i64 = conn
-            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
-            .unwrap();
-        assert_eq!(foreign_keys, 1);
-        let refs_sql: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name = 'refs'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            refs_sql.contains("REFERENCES blobs(user_id, id)"),
-            "{refs_sql}"
-        );
-        assert!(
-            conn.execute("INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (x'01', 'x', x'cc', 4)", [])
-                .is_err(),
-            "a ref to a blob that doesn't exist"
-        );
-        assert!(
-            conn.execute("DELETE FROM blobs WHERE id = x'aa'", [])
-                .is_err(),
-            "a referenced blob"
-        );
-        let columns: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('blobs')")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
         assert_eq!(
-            columns,
+            names(&conn, "SELECT name FROM pragma_table_info('blobs')"),
             [
                 "user_id",
                 "id",
                 "size",
                 "created_at",
                 "offloadable",
-                "location",
                 "content"
             ],
             "content last, so reading the others never steps through a blob"
         );
-        let index: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'blobs_by_location'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(index, 1);
-
-        // Any backend's name now, but not none; and a 1.2 binary's reads and writes still work.
-        conn.execute_batch("UPDATE blobs SET location = 'backblaze' WHERE id = x'bb'")
-            .unwrap();
-        assert!(
-            conn.execute_batch("UPDATE blobs SET location = '' WHERE id = x'bb'")
-                .is_err()
+        let gone = names(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name IN ('s3_location', 'blobs_by_location', 'blobs_new')",
         );
-        let read: (i64, String, i64) = conn
-            .query_row(
-                "SELECT size, location, rowid FROM blobs WHERE user_id = x'01' AND id = x'aa'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        assert!(gone.is_empty(), "{gone:?}");
+        assert_eq!(
+            names(
+                &conn,
+                "SELECT name FROM sqlite_master WHERE tbl_name = 'blob_copies' AND type = 'index' AND sql IS NOT NULL"
+            ),
+            ["blob_copies_by_backend"]
+        );
+
+        // `refs` and `blob_copies` point at the new `blobs`, and foreign keys are enforced again.
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
             .unwrap();
-        assert_eq!((read.0, read.1.as_str()), (3, "local"));
-        conn.execute_batch(
-            "INSERT INTO blobs (user_id, id, size, content, created_at, offloadable, location)
-               VALUES (x'01', x'dd', 1, x'00', 5, 0, 'local')",
-        )
-        .unwrap();
+        assert_eq!(foreign_keys, 1);
+        for table in ["refs", "blob_copies"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("REFERENCES blobs(user_id, id)"), "{sql}");
+        }
+        let refused = [
+            "INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (x'01', 'x', x'ee', 6)",
+            "INSERT INTO blob_copies (user_id, blob_id, backend) VALUES (x'01', x'ee', 'aws')",
+            "INSERT INTO blob_copies (user_id, blob_id, backend) VALUES (x'01', x'cc', 'local')",
+            "DELETE FROM blobs WHERE id = x'aa'",
+        ];
+        for sql in refused {
+            assert!(conn.execute(sql, []).is_err(), "{sql}");
+        }
+        conn.execute("DELETE FROM blobs WHERE id = x'bb'", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM blob_copies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "a blob's copies go with it");
     }
 
     /// Several processes starting at once, on a new, a 1.0 and a 1.2 database: one migrates, the others find it
@@ -621,7 +674,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
             }
             let conn = open(&path).unwrap();
-            assert_eq!(stored(&conn), 1003);
+            assert_eq!(stored(&conn), SCHEMA_VERSION.encode());
             let count: i64 = conn
                 .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
                 .unwrap();

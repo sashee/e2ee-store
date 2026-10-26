@@ -69,6 +69,8 @@ impl std::fmt::Debug for Objects {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ObjectError {
     NotFound,
+    /// The object is there but isn't the blob: another size, or, as the caller may find, other bytes.
+    Damaged,
     /// S3 couldn't be reached, or answered with something else than asked for.
     Unavailable(String),
 }
@@ -77,6 +79,7 @@ impl std::fmt::Display for ObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "no such object"),
+            Self::Damaged => write!(f, "the object isn't the blob"),
             Self::Unavailable(why) => write!(f, "S3 is unavailable: {why}"),
         }
     }
@@ -176,7 +179,8 @@ impl Objects {
     }
 
     /// An object's bytes [start, end] (inclusive, as in `Range`), or all of them, as they arrive. Checks that S3
-    /// sends exactly what was asked for: `expected` is the length of the whole object.
+    /// sends exactly what was asked for: `expected` is the length of the whole object. An object S3 gives another
+    /// length for is `Damaged`.
     pub async fn get(
         &self,
         key: &str,
@@ -197,12 +201,24 @@ impl Objects {
         } else {
             StatusCode::OK
         };
-        let response = expect(request.send().await.map_err(failed)?, &[status]).await?;
+        let response = request.send().await.map_err(failed)?;
+        // The range is within `expected`: none of it there, and the object is shorter.
+        if range.is_some() && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Err(ObjectError::Damaged);
+        }
+        let response = expect(response, &[status]).await?;
+        let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok());
+        let total = match range {
+            Some(_) => header(header::CONTENT_RANGE).and_then(total_of),
+            None => header(header::CONTENT_LENGTH).and_then(|l| l.parse().ok()),
+        };
+        if total.is_some_and(|total| total != expected) {
+            return Err(ObjectError::Damaged);
+        }
         // A proxy may leave the length out; a body shorter than the length the server promises its client fails
         // that response anyway.
         let length = range.map_or(expected, |(start, end)| end - start + 1);
         let content_range = range.map(|(start, end)| format!("bytes {start}-{end}/{expected}"));
-        let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok());
         let same_length = header(header::CONTENT_LENGTH).is_none_or(|l| l == length.to_string());
         if !same_length || header(header::CONTENT_RANGE) != content_range.as_deref() {
             return Err(unavailable(
@@ -212,7 +228,8 @@ impl Objects {
         Ok(response)
     }
 
-    /// All of an object, in memory.
+    /// All of an object, in memory. A body cut off on the way is an error of the connection; one that ends early
+    /// without, as no length was given, is the object's own length: `Damaged`.
     pub async fn get_all(&self, key: &str, expected: u64) -> Result<Bytes, ObjectError> {
         let content = self
             .get(key, None, expected)
@@ -221,9 +238,45 @@ impl Objects {
             .await
             .map_err(failed)?;
         if content.len() as u64 != expected {
-            return Err(unavailable("an object came back short"));
+            return Err(ObjectError::Damaged);
         }
         Ok(content)
+    }
+
+    /// The object's size; None if there is no such object. Asked with a GET for its first byte rather than a HEAD: a
+    /// HEAD's 404 has no body to tell a missing object from a missing bucket, which isn't a lost object but an outage
+    /// (SPEC §7.4).
+    pub async fn size(&self, key: &str) -> Result<Option<u64>, ObjectError> {
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(SIGNED_FOR);
+        let response = self
+            .http
+            .get(url)
+            .header(header::RANGE, "bytes=0-0")
+            .send()
+            .await
+            .map_err(failed)?;
+        // An empty object has no first byte.
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Some(0));
+        }
+        let response = match expect(response, &[StatusCode::OK, StatusCode::PARTIAL_CONTENT]).await
+        {
+            Ok(response) => response,
+            Err(ObjectError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok());
+        let total = if response.status() == StatusCode::PARTIAL_CONTENT {
+            header(header::CONTENT_RANGE).and_then(total_of)
+        } else {
+            header(header::CONTENT_LENGTH).and_then(|l| l.parse().ok())
+        };
+        total
+            .map(Some)
+            .ok_or_else(|| unavailable("an object came back without its size"))
     }
 
     /// Deletes an object; one that is already gone counts as deleted.
@@ -266,6 +319,11 @@ impl Objects {
     }
 }
 
+/// The whole object's length, from a `Content-Range` of `bytes <start>-<end>/<length>`.
+fn total_of(content_range: &str) -> Option<u64> {
+    content_range.rsplit_once('/')?.1.parse().ok()
+}
+
 /// TLS on ring, which builds with nothing but cc, trusting the system's CA certificates (`SSL_CERT_FILE` when set).
 /// Without any, only plain HTTP works: worth a warning when the endpoint is HTTPS, not a refusal to start.
 fn tls(https: bool) -> anyhow::Result<rustls::ClientConfig> {
@@ -282,14 +340,12 @@ fn tls(https: bool) -> anyhow::Result<rustls::ClientConfig> {
     .with_no_client_auth())
 }
 
-/// The response if its status is one of `ok`; 404 is `NotFound`, anything else `Unavailable`.
+/// The response if its status is one of `ok`; 404 is `NotFound`, unless it is the bucket that is missing; anything
+/// else `Unavailable`.
 async fn expect(response: Response, ok: &[StatusCode]) -> Result<Response, ObjectError> {
     let status = response.status();
     if ok.contains(&status) {
         return Ok(response);
-    }
-    if status == StatusCode::NOT_FOUND {
-        return Err(ObjectError::NotFound);
     }
     // S3's error bodies are short XML documents saying why, which can name the bucket and the key: only their code
     // goes in the log.
@@ -298,6 +354,10 @@ async fn expect(response: Response, ok: &[StatusCode]) -> Result<Response, Objec
         .split_once("<Code>")
         .and_then(|(_, rest)| rest.split_once("</Code>"))
         .map_or("", |(code, _)| code);
+    // A bucket that isn't there is an outage until it is made again, never a lost object (SPEC §7.4).
+    if status == StatusCode::NOT_FOUND && code != "NoSuchBucket" {
+        return Err(ObjectError::NotFound);
+    }
     Err(ObjectError::Unavailable(format!("HTTP {status} {code}")))
 }
 

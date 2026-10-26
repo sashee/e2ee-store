@@ -1,5 +1,6 @@
-//! The storage backends offloadable blobs can be in (SPEC §7.4): each has a name, which blobs' rows record, and a
-//! type. S3 is the one type so far; another adds a variant here and leaves the moving (offload.rs) as it is.
+//! The storage backends offloadable blobs can have copies in (SPEC §7.4): each has a name, which the copies' rows
+//! record, and a type. S3 is the one type so far; another adds a variant here and leaves the copying (offload.rs) as
+//! it is.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -98,6 +99,13 @@ impl Remote {
     pub async fn get_all(&self, key: &str, size: u64) -> Result<Bytes, ObjectError> {
         match &self.store {
             Store::S3(objects) => objects.get_all(key, size).await,
+        }
+    }
+
+    /// The object's size, None if it isn't there; a backend without its bucket is unavailable, not empty.
+    pub async fn size(&self, key: &str) -> Result<Option<u64>, ObjectError> {
+        match &self.store {
+            Store::S3(objects) => objects.size(key).await,
         }
     }
 
