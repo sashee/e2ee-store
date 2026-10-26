@@ -8,6 +8,7 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
 use crate::domain::{parse_size, public_host_problem};
+use crate::placement::{LOCAL, Location};
 
 pub const DEFAULT_STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
@@ -22,19 +23,12 @@ pub struct Config {
     pub session_ttl: Duration,
     pub reauth_window: Duration,
     pub max_blob_size: u64,
-    /// Where offloadable blobs belong (SPEC §7.4).
-    pub blob_target: Target,
+    /// Where offloadable blobs belong, a copy in each (SPEC §7.4): not empty, each once, in the order reads try them.
+    pub blob_target: Vec<Location>,
     /// The storage backends offloadable blobs can be in, by name (SPEC §7.4, §10).
     pub backends: BTreeMap<String, Backend>,
     /// What the database's file system keeps free: writes into the database that would take it below are refused.
     pub min_free_space: u64,
-}
-
-/// Where offloadable blobs belong: in the database, or in a backend. Every other blob is in the database.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Target {
-    Local,
-    Backend(String),
 }
 
 /// A storage backend: its type and the file with its location and credentials, which only `serve` reads.
@@ -49,7 +43,7 @@ pub enum Kind {
     S3,
 }
 
-/// A backend's name: what blobs' rows say they're in, so it can't be "local".
+/// A backend's name: what blobs' copies say they're in, so it can't be "local".
 pub fn valid_backend_name(name: &str) -> bool {
     let chars_ok = name
         .bytes()
@@ -70,9 +64,20 @@ struct RawConfig {
     session_ttl: Option<String>,
     reauth_window: Option<String>,
     max_blob_size: Option<String>,
-    blob_target: Option<String>,
+    blob_target: Option<Places>,
     backends: Option<BTreeMap<String, RawBackend>>,
     min_free_space: Option<String>,
+}
+
+/// `blob_target` as written: a list, or one name, a list of one, as before 2.0.
+#[derive(Debug, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a list of places: \"local\" and backends' names"
+)]
+enum Places {
+    One(String),
+    List(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,12 +155,17 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
             ))
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    let blob_target = match get("blob_target", raw.blob_target) {
-        None => Target::Local,
-        Some(local) if local == "local" => Target::Local,
-        Some(name) if backends.contains_key(&name) => Target::Backend(name),
-        Some(other) => bail!("blob_target: {other:?} is neither \"local\" nor one of the backends"),
-    };
+    let blob_target = targets(
+        match env.get("BACKEND_BLOB_TARGET") {
+            Some(list) => list.split(',').map(|t| t.trim().to_owned()).collect(),
+            None => match raw.blob_target {
+                None => vec![LOCAL.into()],
+                Some(Places::One(name)) => vec![name],
+                Some(Places::List(names)) => names,
+            },
+        },
+        &backends,
+    )?;
     let min_free_space = get("min_free_space", raw.min_free_space).unwrap_or_else(|| "1GiB".into());
 
     Ok(Config {
@@ -180,6 +190,30 @@ pub fn resolve(file: &str, env: &HashMap<String, String>) -> anyhow::Result<Conf
     })
 }
 
+/// `blob_target` checked: not empty, and each entry once, "local" or a configured backend.
+fn targets(
+    names: Vec<String>,
+    backends: &BTreeMap<String, Backend>,
+) -> anyhow::Result<Vec<Location>> {
+    if names.is_empty() {
+        bail!("blob_target: a list of at least one place, \"local\" or a backend");
+    }
+    if let Some(name) = names
+        .iter()
+        .enumerate()
+        .find_map(|(i, name)| names[..i].contains(name).then_some(name))
+    {
+        bail!("blob_target: {name:?} is there more than once");
+    }
+    if let Some(name) = names
+        .iter()
+        .find(|name| *name != LOCAL && !backends.contains_key(*name))
+    {
+        bail!("blob_target: {name:?} is neither \"local\" nor one of the backends");
+    }
+    Ok(names.iter().map(|name| Location::named(name)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +233,7 @@ mod tests {
         assert_eq!(config.reauth_window, Duration::from_secs(300));
         assert_eq!(config.max_blob_size, 16 << 20);
         assert!(config.public_hosts.is_empty());
-        assert_eq!(config.blob_target, Target::Local);
+        assert_eq!(config.blob_target, [Location::Local]);
         assert!(config.backends.is_empty());
         assert_eq!(config.min_free_space, 1 << 30);
         assert!(resolve("", &env(&[])).is_err());
@@ -207,10 +241,14 @@ mod tests {
 
     const BACKENDS: &str = "static_dir = \"w\"\n[backends.aws]\ntype = \"s3\"\nfile = \"/run/credentials/x/aws\"\n[backends.b2]\ntype = \"s3\"\nfile = \"/run/credentials/x/b2\"\n";
 
+    fn named(names: &[&str]) -> Vec<Location> {
+        names.iter().map(|name| Location::named(name)).collect()
+    }
+
     #[test]
-    fn backends_have_a_name_a_type_and_a_file_and_the_target_names_one() {
-        let config = resolve(&format!("blob_target = \"b2\"\n{BACKENDS}"), &env(&[])).unwrap();
-        assert_eq!(config.blob_target, Target::Backend("b2".into()));
+    fn backends_have_a_name_a_type_and_a_file_and_the_targets_name_them() {
+        let config = resolve(&format!("blob_target = [\"b2\"]\n{BACKENDS}"), &env(&[])).unwrap();
+        assert_eq!(config.blob_target, named(&["b2"]));
         assert_eq!(
             config.backends["aws"],
             Backend {
@@ -218,22 +256,37 @@ mod tests {
                 file: "/run/credentials/x/aws".into()
             }
         );
+        let several = resolve(
+            &format!("blob_target = [\"local\", \"b2\", \"aws\"]\n{BACKENDS}"),
+            &env(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            several.blob_target,
+            named(&["local", "b2", "aws"]),
+            "in their order"
+        );
         let back = resolve(
-            &format!("blob_target = \"b2\"\n{BACKENDS}"),
+            &format!("blob_target = [\"b2\"]\n{BACKENDS}"),
             &env(&[("BACKEND_BLOB_TARGET", "local")]),
         )
         .unwrap();
         assert_eq!(
             back.blob_target,
-            Target::Local,
+            [Location::Local],
             "the environment overrides it too"
         );
-        let moved = resolve(BACKENDS, &env(&[("BACKEND_BLOB_TARGET", "aws")])).unwrap();
-        assert_eq!(moved.blob_target, Target::Backend("aws".into()));
+        let one = resolve(&format!("blob_target = \"b2\"\n{BACKENDS}"), &env(&[])).unwrap();
+        assert_eq!(one.blob_target, named(&["b2"]), "one name, as before 2.0");
+        let moved = resolve(BACKENDS, &env(&[("BACKEND_BLOB_TARGET", "aws, local")])).unwrap();
+        assert_eq!(moved.blob_target, named(&["aws", "local"]));
 
         for bad in [
-            format!("blob_target = \"gcs\"\n{BACKENDS}"),
-            "static_dir = \"w\"\nblob_target = \"s3\"".to_owned(),
+            format!("blob_target = [\"gcs\"]\n{BACKENDS}"),
+            format!("blob_target = []\n{BACKENDS}"),
+            format!("blob_target = 1\n{BACKENDS}"),
+            format!("blob_target = [\"aws\", \"local\", \"aws\"]\n{BACKENDS}"),
+            "static_dir = \"w\"\nblob_target = [\"s3\"]".to_owned(),
             BACKENDS.replace(
                 "type = \"s3\"\nfile = \"/run/credentials/x/aws\"",
                 "type = \"ftp\"\nfile = \"f\"",
@@ -248,6 +301,10 @@ mod tests {
             format!("min_free_space = \"lots\"\n{BACKENDS}"),
         ] {
             assert!(resolve(&bad, &env(&[])).is_err(), "{bad}");
+        }
+        for bad in ["", "aws,,local", "aws,aws", "gcs"] {
+            let from_env = resolve(BACKENDS, &env(&[("BACKEND_BLOB_TARGET", bad)]));
+            assert!(from_env.is_err(), "{bad:?}");
         }
         let reserve =
             resolve("static_dir = \"w\"\nmin_free_space = \"200MiB\"", &env(&[])).unwrap();

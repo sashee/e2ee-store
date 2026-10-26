@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
-use backend::config::{Backend, Config, DEFAULT_STATIC_CSP, Kind, Target};
+use backend::config::{Backend, Config, DEFAULT_STATIC_CSP, Kind};
 use backend::domain::BlobId;
 use backend::http::{AppState, router};
+use backend::placement::Location;
 use backend::remotes::Remote;
 use backend::{accounts, db, store};
 use http_body_util::BodyExt as _;
@@ -83,13 +84,14 @@ impl Harness {
         Self::with(|_| {})
     }
 
-    /// A harness with one backend, "s3", a stand-in S3, and `target`: "local" or "s3".
+    /// A harness with one backend, "s3", a stand-in S3, and `target`: "local" or "s3", or several, comma-separated.
     pub async fn with_s3(target: &str) -> (Self, s3::FakeS3) {
         let (harness, mut fakes) = Self::with_backends(target, &["s3"], |_| {}).await;
         (harness, fakes.remove("s3").unwrap())
     }
 
-    /// A harness with a stand-in S3 for each backend of `names`, and `target`: "local" or one of them.
+    /// A harness with a stand-in S3 for each backend of `names`, and `target`: "local" or one of them, or several,
+    /// comma-separated.
     pub async fn with_backends(
         target: &str,
         names: &[&str],
@@ -146,7 +148,7 @@ impl Harness {
         }
     }
 
-    /// The same database and backends, with another target, as after a restart.
+    /// The same database and backends, with other targets, as after a restart.
     pub fn retarget(self, target: &str) -> Self {
         let config = Config {
             blob_target: target_of(target),
@@ -184,7 +186,7 @@ impl Harness {
             session_ttl: std::time::Duration::from_secs(4 * 3600),
             reauth_window: std::time::Duration::from_secs(300),
             max_blob_size: 1024,
-            blob_target: Target::Local,
+            blob_target: vec![Location::Local],
             backends: BTreeMap::new(),
             min_free_space: 1 << 30,
         };
@@ -474,12 +476,9 @@ pub async fn put_ref(
     .await
 }
 
-/// "local", or the backend of that name.
-pub fn target_of(target: &str) -> Target {
-    match target {
-        "local" => Target::Local,
-        name => Target::Backend(name.to_owned()),
-    }
+/// `blob_target` from "local" or backends' names, comma-separated.
+pub fn target_of(target: &str) -> Vec<Location> {
+    target.split(',').map(Location::named).collect()
 }
 
 pub fn origin_of(host: &str) -> String {

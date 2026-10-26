@@ -1,6 +1,6 @@
 //! A stand-in for S3 on 127.0.0.1, path-style, with what the backend uses: PUT (checking Content-MD5), GET with
 //! ranges, DELETE and ListObjectsV2 in pages. Signatures aren't checked; the VM test runs against Garage for that.
-//! The objects are plain state the tests read and change, e.g. to lose one or to take S3 down.
+//! The objects are plain state the tests read and change, e.g. to lose one, to take S3 down or to delete the bucket.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,6 +24,10 @@ pub struct FakeS3 {
     pub requests: Arc<Mutex<Vec<String>>>,
     /// Everything answers 503.
     pub down: Arc<AtomicBool>,
+    /// The bucket is gone: everything answers 404 NoSuchBucket.
+    pub no_bucket: Arc<AtomicBool>,
+    /// Lists come back empty, whatever is there: a listing S3 got wrong.
+    pub empty_lists: Arc<AtomicBool>,
     /// Keys per list page.
     pub page_size: Arc<AtomicUsize>,
     pub endpoint: String,
@@ -73,6 +77,12 @@ impl FakeS3 {
         self.down.store(down, Ordering::SeqCst);
     }
 
+    /// Deletes the bucket, objects and all; or makes it again, empty.
+    pub fn set_bucket_gone(&self, gone: bool) {
+        self.objects.lock().unwrap().clear();
+        self.no_bucket.store(gone, Ordering::SeqCst);
+    }
+
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
@@ -101,7 +111,8 @@ async fn handle(
     if s3.down.load(Ordering::SeqCst) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "SlowDown");
     }
-    let Some(key) = uri.path().strip_prefix(&format!("/{BUCKET}/")) else {
+    let path = uri.path().strip_prefix(&format!("/{BUCKET}/"));
+    let Some(key) = path.filter(|_| !s3.no_bucket.load(Ordering::SeqCst)) else {
         return error(StatusCode::NOT_FOUND, "NoSuchBucket");
     };
     match (method, key) {
@@ -160,9 +171,10 @@ fn list(s3: &FakeS3, query: &BTreeMap<String, String>) -> Response {
     let after = query.get("continuation-token").cloned().unwrap_or_default();
     let page_size = s3.page_size.load(Ordering::SeqCst);
     let objects = s3.objects.lock().unwrap();
+    let empty = s3.empty_lists.load(Ordering::SeqCst);
     let matching: Vec<(&String, &Vec<u8>)> = objects
         .iter()
-        .filter(|(key, _)| key.starts_with(&prefix) && **key > after)
+        .filter(|(key, _)| !empty && key.starts_with(&prefix) && **key > after)
         .collect();
     let page = &matching[..matching.len().min(page_size)];
     let contents: String = page

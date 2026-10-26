@@ -10,14 +10,14 @@ use serde_json::{Value, json};
 
 use super::guard::Authed;
 use super::{ApiError, AppState, json_body, read_body, unsupported_media_type};
-use crate::config::Target;
 use crate::domain::{
     BlobId, ByteRange, etag, format_timestamp, page_limit, parse_precondition, parse_range,
     valid_ref_name,
 };
-use crate::offload;
+use crate::offload::{self, Allowed};
+use crate::remotes::Remote;
 use crate::store::{
-    self, BlobDeletion, BlobMeta, FlagWrite, Location, RefDeletion, RefRow, RefWrite,
+    self, BlobDeletion, BlobMeta, FlagWrite, NewCopies, Put, RefDeletion, RefRow, RefWrite,
 };
 
 const PAGE_MAX: usize = 1000;
@@ -31,14 +31,6 @@ fn ref_name(name: &str) -> Result<String, ApiError> {
     valid_ref_name(name)
         .then(|| name.to_owned())
         .ok_or_else(|| ApiError::bad_request("Invalid ref name"))
-}
-
-/// The backend offloadable blobs go to; None when that is the database.
-fn target(state: &AppState) -> Option<&str> {
-    match &state.config.blob_target {
-        Target::Local => None,
-        Target::Backend(name) => Some(name),
-    }
 }
 
 fn blob_json(meta: &BlobMeta) -> Value {
@@ -142,23 +134,37 @@ pub async fn put_blob(
     }
     let user_id = authed.session.user_id;
     let now = state.now();
-    let remotes = state.remotes.clone();
-    let (created, meta) = match target(&state)
-        .filter(|_| offloadable)
-        .and_then(|name| remotes.get(name))
-    {
-        Some(remote) => offload::upload(&state, remote, user_id, id, content, now).await?,
-        None => match state.db(move |c| store::blob_meta(c, &user_id, id)).await? {
-            Some(existing) => (false, existing),
-            None => {
+    let existing = state.db(move |c| store::blob_meta(c, &user_id, id)).await?;
+    let lost = match &existing {
+        Some(meta) => offload::forget_if_lost(&state, user_id, meta).await?,
+        None => false,
+    };
+    let (put, meta) = match existing {
+        Some(existing) if !existing.copies.is_empty() && !lost => (Put::Existed, existing),
+        // New, or lost and uploaded again: it goes where it belongs, with the flag it has (SPEC §7.1).
+        existing => {
+            let offloadable = existing.map_or(offloadable, |existing| existing.offloadable);
+            if offloadable && offload::targets_a_backend(&state) {
+                offload::upload(&state, user_id, id, content, now).await?
+            } else {
                 offload::room_for(&state, content.len() as u64)?;
                 state
-                    .db(move |c| store::put_blob(c, &user_id, id, &content, offloadable, None, now))
+                    .db(move |c| {
+                        store::put_blob(
+                            c,
+                            &user_id,
+                            id,
+                            &content,
+                            offloadable,
+                            NewCopies::HERE,
+                            now,
+                        )
+                    })
                     .await?
             }
-        },
+        }
     };
-    let status = if created {
+    let status = if put == Put::Created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -166,8 +172,8 @@ pub async fn put_blob(
     Ok((status, Json(blob_json(&meta))).into_response())
 }
 
-/// GET and HEAD (axum answers HEAD with the GET handler and drops the body). A blob in a backend streams from there
-/// (SPEC §7.4); HEAD doesn't fetch it.
+/// GET and HEAD (axum answers HEAD with the GET handler and drops the body). The database's copy if there is one,
+/// else one in a backend, streamed from there, trying them in turn (SPEC §7.4); HEAD doesn't fetch any.
 pub async fn get_blob(
     State(state): State<AppState>,
     authed: Authed,
@@ -178,8 +184,7 @@ pub async fn get_blob(
     let id = blob_id(&id)?;
     let user_id = authed.session.user_id;
     let range_header = header_str(&headers, header::RANGE).map(str::to_owned);
-    let remotes = state.remotes.clone();
-    // A blob that moves while it is read is looked up again.
+    // A blob whose copies change while it is read is looked up again: it may have one here now, or be gone.
     for _ in 0..3 {
         let range_header = range_header.clone();
         let (meta, range, content) = state
@@ -190,23 +195,22 @@ pub async fn get_blob(
             })
             .await?
             .ok_or_else(ApiError::not_found)?;
-        let name = match &meta.location {
-            Location::Backend(name)
-                if range != ByteRange::Unsatisfiable && method != Method::HEAD =>
-            {
-                name.clone()
-            }
-            _ => return blob_response(meta, range, Body::from(content)),
+        if meta.here() || range == ByteRange::Unsatisfiable || method == Method::HEAD {
+            return blob_response(meta, range, Body::from(content));
+        }
+        // Exactly the bytes the client asked for.
+        let wanted = match range {
+            ByteRange::Partial { start, end } => Some((start, end)),
+            ByteRange::Full | ByteRange::Unsatisfiable => None,
         };
-        let remote = remotes.get(&name).ok_or_else(|| {
-            ApiError::storage_unavailable(format!("backend {name:?} isn't configured"))
-        })?;
-        if let Some(response) = offload::read(&state, remote, user_id, &meta, range).await? {
+        let size = meta.size;
+        let part = async move |remote: &Remote, key: &str| remote.get(key, wanted, size).await;
+        if let Some(response) = offload::from_backends(&state, user_id, &meta, part).await? {
             return blob_response(meta, range, Body::from_stream(response.bytes_stream()));
         }
     }
     Err(ApiError::storage_unavailable(format!(
-        "blob {id} kept moving while it was read"
+        "blob {id}'s copies kept changing while it was read"
     )))
 }
 
@@ -282,22 +286,16 @@ pub async fn patch_blob(
     let id = blob_id(&id)?;
     let BlobFlags { offloadable } = json_body(&headers, body).await?;
     let user_id = authed.session.user_id;
-    // A blob in a backend comes back before it stops being offloadable. A pass can move it out again in between, so
-    // a few rounds; each ends with the flag set or an error.
+    // A blob without a copy here gets one before it stops being offloadable. A pass can drop it again in between, so
+    // a few rounds; each ends with the flag set or an error. Either way, the copies then follow the flag: made before
+    // the answer, or left to the pass if that fails.
     for _ in 0..3 {
         match state
             .db(move |c| store::set_offloadable(c, &user_id, id, offloadable))
             .await?
         {
             FlagWrite::Written(meta) => {
-                let remotes = state.remotes.clone();
-                if let Some(remote) = target(&state)
-                    .filter(|_| offloadable)
-                    .and_then(|name| remotes.get(name))
-                    && let Err(e) = offload::to_backend(&state, remote, user_id, &meta).await
-                {
-                    tracing::warn!("blob {id} stays where it is for now: {e:?}");
-                }
+                offload::settle(&state, user_id, meta.clone(), Allowed::ALL).await;
                 return Ok(Json(blob_json(&meta)));
             }
             FlagWrite::NotFound => return Err(ApiError::not_found()),
@@ -306,26 +304,20 @@ pub async fn patch_blob(
                     "A ref points to this blob, so it can't be offloadable",
                 ));
             }
-            FlagWrite::InBackend(meta) => {
-                let remotes = state.remotes.clone();
-                let remote = remotes.get(meta.location.as_str()).ok_or_else(|| {
-                    ApiError::storage_unavailable(format!(
-                        "backend {:?} isn't configured",
-                        meta.location.as_str()
-                    ))
-                })?;
-                if offload::to_local(&state, remote, user_id, &meta, true).await? {
+            FlagWrite::NotHere(meta) => {
+                if offload::to_local(&state, user_id, &meta, true).await? {
                     let meta = state
                         .db(move |c| store::blob_meta(c, &user_id, id))
                         .await?
                         .ok_or_else(ApiError::not_found)?;
+                    offload::settle(&state, user_id, meta.clone(), Allowed::ALL).await;
                     return Ok(Json(blob_json(&meta)));
                 }
             }
         }
     }
     Err(ApiError::storage_unavailable(format!(
-        "blob {id} kept moving while its flag was changed"
+        "blob {id}'s copies kept changing while its flag was changed"
     )))
 }
 
@@ -340,13 +332,14 @@ pub async fn delete_blob(
         .db(move |c| store::delete_blob(c, &user_id, id))
         .await?
     {
-        BlobDeletion::Deleted(location) => {
-            let remotes = state.remotes.clone();
-            if let Location::Backend(name) = location
-                && let Some(remote) = remotes.get(&name)
-            {
-                offload::forget(&state, remote, user_id, id).await;
-            }
+        BlobDeletion::Deleted(backends) => {
+            // After the answer: an unreachable backend would hold it up to its timeouts. What fails, the sweep
+            // deletes.
+            tokio::spawn(async move {
+                for remote in backends.iter().filter_map(|name| state.remotes.get(name)) {
+                    offload::forget(&state, remote, user_id, id).await;
+                }
+            });
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         BlobDeletion::NotFound => Err(ApiError::not_found()),

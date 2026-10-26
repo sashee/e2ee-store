@@ -4,9 +4,10 @@
 #   services.e2ee-store.instances.notes = {
 #     staticDir = "${notes-web}/share/notes/web";
 #     settings.public_hosts = [ "notes.example.com" ];   # optional; backend SPEC §10
-#     # optional: storage backends offloadable blobs can be in, and the one they go to (backend SPEC §7.4, §10.1)
+#     # optional: storage backends offloadable blobs can be in, and where they go, a copy in each (backend SPEC §7.4,
+#     # §10.1)
 #     storageBackends.backblaze = { type = "s3"; credentialFile = "/etc/credentials/notes/backblaze"; };
-#     settings.blob_target = "backblaze";
+#     settings.blob_target = [ "local" "backblaze" ];
 #   };
 #
 # Plain module, no flake: the packages are built with the host's own nixpkgs. Everything of an instance is
@@ -84,9 +85,10 @@ let
           '';
           description = ''
             The storage backends offloadable blobs can be in, by name (backend SPEC §7.4); `settings.blob_target`
-            names the one they go to, or "local". The service gets each credential decrypted, and may then reach the
-            network. A backend stays configured for as long as blobs are in it: the server refuses to start
-            otherwise.
+            lists where they go, a copy in each: "local" and backends' names. The service gets each credential
+            decrypted, and may then reach the network. A backend stays configured for as long as copies are in it:
+            the server refuses to start otherwise, until it is emptied or, if it is gone for good, forgotten once
+            it is out of here (`<name> forget <backend>`).
           '';
         };
 
@@ -229,14 +231,20 @@ in
       lib.mapAttrsToList (
         name: instance:
         let
-          target = instance.settings.blob_target or "local";
+          # One name is a list of one, as the backend takes it.
+          targets = lib.toList (instance.settings.blob_target or [ "local" ]);
+          known = target: target == "local" || builtins.hasAttr target instance.storageBackends;
         in
         [
           {
-            assertion = target == "local" || builtins.hasAttr target instance.storageBackends;
-            message = "services.e2ee-store.instances.${name}: settings.blob_target = \"${target}\" is neither \"local\" nor one of storageBackends";
+            assertion = targets != [ ] && lib.unique targets == targets;
+            message = "services.e2ee-store.instances.${name}: settings.blob_target is a list of places offloadable blobs go, a copy in each, each once: \"local\" and names of storageBackends";
           }
         ]
+        ++ map (target: {
+          assertion = known target;
+          message = "services.e2ee-store.instances.${name}: settings.blob_target names \"${toString target}\", which is neither \"local\" nor one of storageBackends";
+        }) targets
         ++ map (backend: {
           assertion = builtins.match "[a-z0-9][a-z0-9-]{0,31}" backend != null && backend != "local";
           message = "services.e2ee-store.instances.${name}.storageBackends.${backend}: a name is 1-32 of a-z, 0-9 and -, not starting with -, and not \"local\"";

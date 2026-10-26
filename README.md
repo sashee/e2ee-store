@@ -59,13 +59,15 @@ in
   ```nix
   services.e2ee-store.instances.notes = {
     storageBackends.backblaze = { type = "s3"; credentialFile = "/etc/credentials/notes/backblaze"; };
-    settings.blob_target = "backblaze";   # "local" (the default) brings them back at the next start, if they fit
+    settings.blob_target = [ "local" "backblaze" ];   # a copy in each; [ "local" ], the default, keeps them here
   };
   ```
 
-  To move to another provider, add it as a second backend, point `blob_target` at it, and remove the old one
-  once it is empty: blobs move between backends without passing through the host's disk.
-  `sudo notes storage` shows where the blobs are.
+  Each place in `blob_target` gets a copy, so listing several makes the blobs redundant. To move to another
+  provider, add it as a second backend and to `blob_target`, then take the old one out of `blob_target`; once it
+  is empty, remove it. Blobs are copied between backends without passing through the host's disk.
+  `sudo notes storage` shows where the copies are. A backend that is gone for good, bucket and all, is
+  forgotten with `sudo notes forget <backend>`, once it is out of the configuration.
 - **Several apps on one host:** each instance has its own users, passkeys and data. On the iroh path, give each
   app its own loopback name (`http://notes.localhost:PORT`, `http://todo.localhost:PORT`): cookies ignore the
   port, so two apps on plain `localhost` would log each other out, and each would offer the other's passkeys.

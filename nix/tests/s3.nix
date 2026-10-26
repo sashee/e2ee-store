@@ -1,8 +1,10 @@
 # The NixOS module with S3 backends (backend SPEC §7.4): the instance gets one credential file per backend, encrypted by
 # systemd, and talks to Garage on the same machine, behind nginx for TLS with a test CA in the system's bundle. Two
 # backends, a bucket each. On top of the checks of ./lib.nix: offloadable blobs go to S3, read back through the API,
-# and move when the target changes, between the database and a backend and from one backend to the other; the
-# credentials stay the service's; and against a real S3, the sweep, an outage and a lost object.
+# and move when the targets change, between the database and a backend and from one backend to the other; with a copy
+# in each of several targets, an emptied bucket is filled again, and one whose bucket is gone is emptied but, still
+# configured, not forgotten;
+# the credentials stay the service's; and against a real S3, the sweep, an outage and a lost object.
 #
 # `machineModules` are the machine's own configuration, as for ./lib.nix: a host repository passes its real one.
 {
@@ -109,7 +111,7 @@ import ./lib.nix {
 
       services.e2ee-store.instances.demo = {
         inherit staticDir;
-        settings.blob_target = "garage";
+        settings.blob_target = [ "garage" ];
         storageBackends = lib.mapAttrs (name: _: {
           type = "s3";
           credentialFile = "/etc/credentials/demo/${name}";
@@ -226,6 +228,36 @@ import ./lib.nix {
         restart()
         machine.wait_until_succeeds(f"mc ls --recursive s3/blobs | grep -q {blob}")
         machine.wait_until_succeeds(f"! mc ls --recursive s3/blobs2 | grep -q {blob}")
+
+    with subtest("a copy in each target: the database and both backends"):
+        machine.succeed("systemctl set-environment BACKEND_BLOB_TARGET=local,garage,garage2")
+        restart()
+        machine.wait_until_succeeds(f"mc ls --recursive s3/blobs2 | grep -q {blob}")
+        assert blob in objects(), objects()
+        report = machine.succeed(f"{NAME} storage")
+        assert re.search(r"^local\s+1\s", report, re.M), report
+        assert "by copies: 1 with 3" in report, report
+
+    with subtest("a bucket emptied behind the server's back is filled again"):
+        machine.succeed("mc rm --recursive --force s3/blobs2/demo/")
+        assert blob not in objects("blobs2")
+        restart()
+        machine.wait_until_succeeds(f"mc ls --recursive s3/blobs2 | grep -q {blob}")
+        machine.succeed(f"{API} -o /tmp/whole http://localhost/api/v1/blobs/{blob} && cmp /tmp/track /tmp/whole")
+
+    with subtest("a backend whose bucket is gone: out of the targets, its copies go; configured, it isn't forgotten"):
+        machine.systemctl(f"stop {NAME}.service")
+        machine.succeed("mc rm --recursive --force s3/blobs2/demo/")
+        machine.succeed("garage bucket delete --yes blobs2")
+        machine.succeed("systemctl set-environment BACKEND_BLOB_TARGET=local,garage")
+        restart()
+        machine.wait_until_succeeds(f"! {NAME} storage | grep -q '^garage2 '")
+        machine.succeed(f"{API} -o /tmp/whole http://localhost/api/v1/blobs/{blob} && cmp /tmp/track /tmp/whole")
+        refused = machine.fail(f"{NAME} forget garage2 2>&1")
+        assert "garage2 is still configured" in refused, refused
+        machine.succeed("systemctl unset-environment BACKEND_BLOB_TARGET")
+        restart()
+        machine.wait_until_succeeds(f"{NAME} storage | grep -q 'by copies: 1 with 1'")
 
     with subtest("the credentials are the service's alone"):
         for backend in ["garage", "garage2"]:

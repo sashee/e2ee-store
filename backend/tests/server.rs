@@ -151,6 +151,98 @@ fn the_admin_commands_manage_users() {
     );
 }
 
+/// A blob ID made of one byte, repeated.
+fn blob_id(byte: &str) -> String {
+    byte.repeat(32)
+}
+
+/// Copies in backends as a server leaves them: one blob in aws alone, one here and in aws, one in aws and b2.
+fn with_copies(instance: &Instance) {
+    let conn = rusqlite::Connection::open(instance.dir.path().join("backend.sqlite3")).unwrap();
+    let (aa, bb, cc) = (blob_id("aa"), blob_id("bb"), blob_id("cc"));
+    conn.execute_batch(&format!(
+        r#"INSERT INTO blobs (user_id, id, size, created_at, offloadable, content)
+             SELECT id, x'{aa}', 1, 0, 1, NULL FROM users UNION ALL
+             SELECT id, x'{bb}', 1, 0, 1, x'00' FROM users UNION ALL
+             SELECT id, x'{cc}', 1, 0, 1, NULL FROM users;
+           INSERT INTO blob_copies (user_id, blob_id, backend)
+             SELECT user_id, id, 'aws' FROM blobs UNION ALL
+             SELECT user_id, id, 'b2' FROM blobs WHERE id = x'{cc}';
+           INSERT INTO backends (name, type, identity)
+             VALUES ('aws', 's3', '{{}}'), ('b2', 's3', '{{}}');"#
+    ))
+    .unwrap();
+}
+
+#[test]
+fn forget_drops_a_gone_backends_copies_but_not_the_last_unless_told() {
+    let instance = Instance::new();
+    instance.ok(&["user", "create", "alice"]);
+    with_copies(&instance);
+    let before = instance.ok(&["storage"]);
+    assert!(before.contains("by copies: 1 with 1, 2 with 2"), "{before}");
+
+    let invalid = instance.run(&["forget", "local"]);
+    assert!(
+        stderr(&invalid).contains("can't be a backend's name"),
+        "{}",
+        stderr(&invalid)
+    );
+    let typo = instance.run(&["forget", "awz"]);
+    assert!(
+        stderr(&typo).contains("no backend awz is recorded"),
+        "{}",
+        stderr(&typo)
+    );
+    // Still configured, a target or not: the server may still reach it.
+    let config = instance.dir.path().join("missing.toml");
+    std::fs::write(
+        &config,
+        "[backends.aws]\ntype = \"s3\"\nfile = \"/nowhere\"\n",
+    )
+    .unwrap();
+    let configured = instance.run(&["forget", "aws", "--accept-loss"]);
+    assert!(
+        stderr(&configured).contains("aws is still configured"),
+        "{}",
+        stderr(&configured)
+    );
+    std::fs::remove_file(&config).unwrap();
+
+    let refused = instance.run(&["forget", "aws"]);
+    assert!(!refused.status.success());
+    let why = stderr(&refused);
+    assert!(
+        why.contains("1 blobs have no copy anywhere but in aws"),
+        "{why}"
+    );
+    assert!(why.contains(&blob_id("aa")), "the blob is listed: {why}");
+    assert!(why.contains("nothing forgotten"), "{why}");
+    assert_eq!(instance.ok(&["storage"]), before, "nothing changed");
+
+    let forgot = instance.ok(&["forget", "aws", "--accept-loss"]);
+    assert!(forgot.contains("Forgot backend aws: 3 copies"), "{forgot}");
+    assert!(
+        forgot.contains("1 blobs had no other copy, and are lost"),
+        "{forgot}"
+    );
+    let after = instance.ok(&["storage"]);
+    assert!(after.contains("by copies: 2 with 1\n"), "{after}");
+    assert!(
+        after.contains("lost, with no copy left: 1 blobs, 1 B"),
+        "{after}"
+    );
+    assert!(
+        after.contains("bringing everything into the database: 1 B more"),
+        "the lost one can't come back: {after}"
+    );
+    assert!(!after.contains("aws"), "{after}");
+    assert!(
+        stderr(&instance.run(&["forget", "aws"])).contains("no backend aws is recorded"),
+        "forgotten already"
+    );
+}
+
 /// One HTTP/1.1 request over the socket; the whole response.
 fn http(socket: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket).unwrap();

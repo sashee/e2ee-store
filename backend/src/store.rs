@@ -1,12 +1,12 @@
 //! Persistence (SPEC §5, §7): plain functions over a connection. Callers pass `now`; nothing here reads
 //! the clock. Outcomes the API distinguishes are returned as enums; `Err` is reserved for SQLite failures.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::config::Target;
 use crate::domain::{BlobId, ByteRange, Precondition, is_live, precondition_holds};
+use crate::placement;
 
 pub type UserId = [u8; 16];
 
@@ -326,37 +326,11 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
 
 // ---------------------------------------------------------------- blobs
 
-/// Where a blob's content is (SPEC §7.4): in the database, or in the backend of that name. A blob in a backend keeps
-/// its row, with empty `content`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Location {
-    Local,
-    Backend(String),
-}
+pub use crate::placement::Location;
 
-impl Location {
-    fn of(location: String) -> Self {
-        if location == LOCAL {
-            Self::Local
-        } else {
-            Self::Backend(location)
-        }
-    }
-
-    /// As the column holds it.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Local => LOCAL,
-            Self::Backend(name) => name,
-        }
-    }
-}
-
-const LOCAL: &str = "local";
-
-/// What the database records of a backend blobs were moved to, so a server pointed elsewhere under the same name
-/// doesn't take them for lost (SPEC §7.4). `identity` is the type's own description of where it keeps blobs, as JSON,
-/// none of it secret.
+/// What the database records of a backend copies went to, so a server pointed elsewhere under the same name doesn't
+/// take them for lost (SPEC §7.4). `identity` is the type's own description of where it keeps blobs, as JSON, none of
+/// it secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendRecord {
     pub name: String,
@@ -369,20 +343,42 @@ pub struct BlobMeta {
     pub id: BlobId,
     pub size: u64,
     pub created_at: i64,
-    /// The client allows the server to move the content out of the database (SPEC §7.1).
+    /// The client allows the server to keep the content outside the database (SPEC §7.1).
     pub offloadable: bool,
-    pub location: Location,
+    /// Where it has copies (SPEC §7.4): the database first, then backends by name. None left: it is lost.
+    pub copies: Vec<Location>,
 }
 
-const BLOB_META: &str = "id, size, created_at, offloadable, location";
+impl BlobMeta {
+    /// Whether the database has a copy.
+    pub fn here(&self) -> bool {
+        self.copies.contains(&Location::Local)
+    }
+}
+
+/// The columns `blob_meta_row` reads, from `blobs`. `content IS NOT NULL` reads the row's header only, never the
+/// content.
+const BLOB_META: &str = "blobs.id, blobs.size, blobs.created_at, blobs.offloadable, blobs.content IS NOT NULL,
+  (SELECT group_concat(backend, ',') FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)";
 
 fn blob_meta_row(row: &Row) -> rusqlite::Result<BlobMeta> {
+    let here: bool = row.get(4)?;
+    // By name: `group_concat` keeps no order.
+    let backends: BTreeSet<String> = row
+        .get::<_, Option<String>>(5)?
+        .map_or_else(BTreeSet::new, |list| {
+            list.split(',').map(str::to_owned).collect()
+        });
     Ok(BlobMeta {
         id: BlobId(row.get(0)?),
         size: row.get::<_, i64>(1)?.try_into().unwrap_or(0),
         created_at: row.get(2)?,
         offloadable: row.get(3)?,
-        location: Location::of(row.get(4)?),
+        copies: here
+            .then_some(Location::Local)
+            .into_iter()
+            .chain(backends.into_iter().map(Location::Backend))
+            .collect(),
     })
 }
 
@@ -390,43 +386,82 @@ fn sql_size(size: impl TryInto<i64>) -> i64 {
     size.try_into().unwrap_or(i64::MAX)
 }
 
-/// Stores a blob unless it already exists; an existing one keeps its flag and its place. With `in_backend`, the
-/// content is already there and only the row is written. Returns whether it was new, and its metadata.
+/// Where a new blob's copies are as its row is written: the database keeps the content if `here`, and `backends`
+/// have it already.
+#[derive(Clone, Copy, Debug)]
+pub struct NewCopies<'a> {
+    pub here: bool,
+    pub backends: &'a [BackendRecord],
+}
+
+impl NewCopies<'_> {
+    /// In the database alone.
+    pub const HERE: NewCopies<'static> = NewCopies {
+        here: true,
+        backends: &[],
+    };
+}
+
+/// What storing a blob did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Put {
+    Created,
+    /// It was lost, with no copy left: the new ones are its copies now.
+    Restored,
+    /// It has copies, and keeps them, and its flag.
+    Existed,
+}
+
+/// Stores a blob, unless it exists with a copy: an existing one keeps its flag, and its copies if it has any. One with
+/// none left, lost, gets the new ones (SPEC §7.1). → what it did, and the blob's metadata.
 pub fn put_blob(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
     content: &[u8],
     offloadable: bool,
-    in_backend: Option<&BackendRecord>,
+    copies: NewCopies<'_>,
     now: i64,
-) -> rusqlite::Result<(bool, BlobMeta)> {
-    let tx = conn.transaction()?;
-    let (stored, location) = match in_backend {
-        Some(backend) => (&[][..], backend.name.as_str()),
-        None => (content, LOCAL),
+) -> rusqlite::Result<(Put, BlobMeta)> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let here = copies.here.then_some(content);
+    let put = match blob_meta(&tx, user_id, id)? {
+        None => {
+            tx.execute(
+                "INSERT INTO blobs (user_id, id, size, created_at, offloadable, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    user_id,
+                    id.0,
+                    sql_size(content.len()),
+                    now,
+                    offloadable,
+                    here
+                ],
+            )?;
+            Put::Created
+        }
+        Some(meta) if meta.copies.is_empty() => {
+            tx.execute(
+                "UPDATE blobs SET content = ?3 WHERE user_id = ?1 AND id = ?2",
+                params![user_id, id.0, here],
+            )?;
+            Put::Restored
+        }
+        Some(_) => Put::Existed,
     };
-    let inserted = tx.execute(
-        "INSERT INTO blobs (user_id, id, size, content, created_at, offloadable, location)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
-        params![
-            user_id,
-            id.0,
-            sql_size(content.len()),
-            stored,
-            now,
-            offloadable,
-            location
-        ],
-    )?;
-    if inserted == 1
-        && let Some(backend) = in_backend
-    {
-        record_backend(&tx, backend)?;
+    if put != Put::Existed {
+        for backend in copies.backends {
+            tx.execute(
+                "INSERT INTO blob_copies (user_id, blob_id, backend) VALUES (?1, ?2, ?3)",
+                params![user_id, id.0, backend.name],
+            )?;
+            record_backend(&tx, backend)?;
+        }
     }
     let meta = blob_meta(&tx, user_id, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     tx.commit()?;
-    Ok((inserted == 1, meta))
+    Ok((put, meta))
 }
 
 pub fn blob_meta(
@@ -443,7 +478,7 @@ pub fn blob_meta(
 }
 
 /// The blob's metadata, the range `pick` chooses for its size, and that range's bytes: empty when it's
-/// unsatisfiable or the blob is in a backend. The bytes come through incremental BLOB I/O, so SQLite reads only the
+/// unsatisfiable or the database has no copy. The bytes come through incremental BLOB I/O, so SQLite reads only the
 /// pages up to the range's end and only the range is held in memory.
 pub fn blob_content(
     conn: &mut Connection,
@@ -457,19 +492,18 @@ pub fn blob_content(
         .query_row(
             &format!("SELECT {BLOB_META}, rowid FROM blobs WHERE user_id = ?1 AND id = ?2"),
             params![user_id, id.0],
-            |r| Ok((blob_meta_row(r)?, r.get::<_, i64>(5)?)),
+            |r| Ok((blob_meta_row(r)?, r.get::<_, i64>(6)?)),
         )
         .optional()?
     else {
         return Ok(None);
     };
     let range = pick(meta.size);
-    let content = match (&meta.location, range) {
-        (Location::Backend(_), _) | (_, ByteRange::Unsatisfiable) => Vec::new(),
-        (Location::Local, ByteRange::Full) => read_blob(&tx, rowid, 0, meta.size)?,
-        (Location::Local, ByteRange::Partial { start, end }) => {
-            read_blob(&tx, rowid, start, end - start + 1)?
-        }
+    let content = match range {
+        _ if !meta.here() => Vec::new(),
+        ByteRange::Unsatisfiable => Vec::new(),
+        ByteRange::Full => read_blob(&tx, rowid, 0, meta.size)?,
+        ByteRange::Partial { start, end } => read_blob(&tx, rowid, start, end - start + 1)?,
     };
     Ok(Some((meta, range, content)))
 }
@@ -482,10 +516,21 @@ fn read_blob(conn: &Connection, rowid: i64, start: u64, len: u64) -> rusqlite::R
     Ok(content)
 }
 
+/// The database's copy of a blob, whole; None without one.
+pub fn local_content(
+    conn: &mut Connection,
+    user_id: &UserId,
+    id: BlobId,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    Ok(blob_content(conn, user_id, id, |_| ByteRange::Full)?
+        .filter(|(meta, _, _)| meta.here())
+        .map(|(_, _, content)| content))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobDeletion {
-    /// Its content was where it says; one in a backend is the caller's to delete there.
-    Deleted(Location),
+    /// With the backends that had a copy: the caller's to delete there.
+    Deleted(Vec<String>),
     NotFound,
     Referenced,
 }
@@ -504,7 +549,13 @@ pub fn delete_blob(
                 "DELETE FROM blobs WHERE user_id = ?1 AND id = ?2",
                 params![user_id, id.0],
             )?;
-            BlobDeletion::Deleted(meta.location)
+            BlobDeletion::Deleted(
+                meta.copies
+                    .iter()
+                    .filter(|place| **place != Location::Local)
+                    .map(|place| place.as_str().to_owned())
+                    .collect(),
+            )
         }
     };
     tx.commit()?;
@@ -516,8 +567,8 @@ pub enum FlagWrite {
     Written(BlobMeta),
     NotFound,
     Referenced,
-    /// Not offloadable can only be a blob in the database: this one has to come back from its backend first.
-    InBackend(BlobMeta),
+    /// Not offloadable can only be a blob with a copy in the database: this one needs one first.
+    NotHere(BlobMeta),
 }
 
 fn referenced(conn: &Connection, user_id: &UserId, id: BlobId) -> rusqlite::Result<bool> {
@@ -528,8 +579,8 @@ fn referenced(conn: &Connection, user_id: &UserId, id: BlobId) -> rusqlite::Resu
     )
 }
 
-/// Sets whether the blob is offloadable. A blob a ref points to can't be, and one in a backend can't stop being
-/// (SPEC §7.1, §7.4).
+/// Sets whether the blob is offloadable. A blob a ref points to can't be, and one without a copy in the database
+/// can't stop being (SPEC §7.1, §7.4).
 pub fn set_offloadable(
     conn: &mut Connection,
     user_id: &UserId,
@@ -540,9 +591,7 @@ pub fn set_offloadable(
     let outcome = match blob_meta(&tx, user_id, id)? {
         None => FlagWrite::NotFound,
         Some(_) if offloadable && referenced(&tx, user_id, id)? => FlagWrite::Referenced,
-        Some(meta) if !offloadable && meta.location != Location::Local => {
-            FlagWrite::InBackend(meta)
-        }
+        Some(meta) if !offloadable && !meta.here() => FlagWrite::NotHere(meta),
         Some(meta) => {
             tx.execute(
                 "UPDATE blobs SET offloadable = ?3 WHERE user_id = ?1 AND id = ?2",
@@ -573,111 +622,202 @@ pub fn list_blobs(
     .collect()
 }
 
-// ---------------------------------------------------------------- moving blobs (SPEC §7.4)
+// ---------------------------------------------------------------- copies (SPEC §7.4)
 
-/// A blob that isn't where it belongs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Misplaced {
-    pub user_id: UserId,
-    pub meta: BlobMeta,
-    pub to: Location,
+/// Every blob whose copies aren't where `targets` say they belong (`placement::plan`), with its owner.
+pub fn unsettled_blobs(
+    conn: &Connection,
+    targets: &[Location],
+) -> rusqlite::Result<Vec<(UserId, BlobMeta)>> {
+    // Blobs that aren't offloadable, have a copy here and none elsewhere are where they belong: most of them, so
+    // they are left out here rather than by the plan.
+    let candidates = conn
+        .prepare(&format!(
+            "SELECT {BLOB_META}, blobs.user_id FROM blobs
+             WHERE offloadable = 1 OR content IS NULL
+                OR EXISTS (SELECT 1 FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)
+             ORDER BY blobs.user_id, blobs.id"
+        ))?
+        .query_map([], |r| Ok((r.get(6)?, blob_meta_row(r)?)))?
+        .collect::<rusqlite::Result<Vec<(UserId, BlobMeta)>>>()?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(_, meta)| !placement::plan(meta.offloadable, &meta.copies, targets).is_empty())
+        .collect())
 }
 
-/// Every blob that isn't where it belongs: offloadable blobs in the target, everything else in the database.
-pub fn misplaced_blobs(conn: &Connection, target: &Target) -> rusqlite::Result<Vec<Misplaced>> {
-    let target = match target {
-        Target::Local => LOCAL,
-        Target::Backend(name) => name,
-    };
-    conn.prepare(&format!(
-        "SELECT user_id, {BLOB_META} FROM blobs
-         WHERE location <> CASE WHEN offloadable = 1 THEN ?1 ELSE '{LOCAL}' END
-         ORDER BY user_id, id"
-    ))?
-    .query_map(params![target], |r| {
-        let meta = BlobMeta {
-            id: BlobId(r.get(1)?),
-            size: r.get::<_, i64>(2)?.try_into().unwrap_or(0),
-            created_at: r.get(3)?,
-            offloadable: r.get(4)?,
-            location: Location::of(r.get(5)?),
-        };
-        let to = if meta.offloadable {
-            Location::of(target.to_owned())
-        } else {
-            Location::Local
-        };
-        Ok(Misplaced {
-            user_id: r.get(0)?,
-            meta,
-            to,
-        })
-    })?
-    .collect()
-}
-
-/// The content of a blob that may leave the database: one in it, and offloadable. None for any other.
-pub fn offloadable_content(
+/// Records a copy of the blob in `backend`, which the caller has put there, if the blob still exists and is
+/// offloadable. False otherwise, or if the copy was there already: then the object may be nobody's.
+pub fn add_copy(
     conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
-) -> rusqlite::Result<Option<Vec<u8>>> {
-    match blob_content(conn, user_id, id, |_| ByteRange::Full)? {
-        Some((meta, _, content)) if meta.offloadable && meta.location == Location::Local => {
-            Ok(Some(content))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Records that the blob's content is now in backend `to`, if it is still offloadable and still `from`: from the
-/// database, which drops the content here, or from another backend. False otherwise, and then the object the caller
-/// put in `to` is nobody's.
-pub fn mark_moved(
-    conn: &mut Connection,
-    user_id: &UserId,
-    id: BlobId,
-    from: &Location,
-    to: &BackendRecord,
+    backend: &BackendRecord,
 ) -> rusqlite::Result<bool> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let moved = tx.execute(
-        "UPDATE blobs SET location = ?4, content = x''
-         WHERE user_id = ?1 AND id = ?2 AND location = ?3 AND offloadable = 1",
-        params![user_id, id.0, from.as_str(), to.name],
+    let added = tx.execute(
+        "INSERT INTO blob_copies (user_id, blob_id, backend)
+           SELECT user_id, id, ?3 FROM blobs WHERE user_id = ?1 AND id = ?2 AND offloadable = 1
+         ON CONFLICT DO NOTHING",
+        params![user_id, id.0, backend.name],
     )? == 1;
-    if moved {
-        record_backend(&tx, to)?;
+    if added {
+        record_backend(&tx, backend)?;
     }
     tx.commit()?;
-    Ok(moved)
+    Ok(added)
 }
 
-/// Puts a blob's content back in the database, if it is still in backend `from`; `unflag` also makes it not
-/// offloadable, in the same step. False if it isn't there (any more).
-pub fn mark_local(
-    conn: &mut Connection,
+/// Gives the blob a copy in the database, if it has none; `unflag` also makes it not offloadable, in the same step.
+/// False if it has one already, or is gone.
+pub fn add_local(
+    conn: &Connection,
     user_id: &UserId,
     id: BlobId,
-    from: &str,
     content: &[u8],
     unflag: bool,
 ) -> rusqlite::Result<bool> {
     Ok(conn.execute(
-        "UPDATE blobs SET location = 'local', content = ?4, offloadable = offloadable AND NOT ?5
-         WHERE user_id = ?1 AND id = ?2 AND location = ?3",
-        params![user_id, id.0, from, content, unflag],
+        "UPDATE blobs SET content = ?3, offloadable = offloadable AND NOT ?4
+         WHERE user_id = ?1 AND id = ?2 AND content IS NULL",
+        params![user_id, id.0, content, unflag],
     )? == 1)
 }
 
-/// Every blob in backend `name`.
-pub fn blobs_in(conn: &Connection, name: &str) -> rusqlite::Result<HashSet<(UserId, BlobId)>> {
-    conn.prepare("SELECT user_id, id FROM blobs WHERE location = ?1")?
-        .query_map([name], |r| Ok((r.get(0)?, BlobId(r.get(1)?))))?
-        .collect()
+/// Drops the blob's copy in `place`, if `placement` still allows it with the copies the blob has now: never one it
+/// belongs in, and only once it has a copy in all of those. → whether it did. A dropped backend copy's object is the
+/// caller's to delete.
+pub fn drop_copy(
+    conn: &mut Connection,
+    user_id: &UserId,
+    id: BlobId,
+    place: &Location,
+    targets: &[Location],
+) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let allowed = blob_meta(&tx, user_id, id)?
+        .is_some_and(|meta| placement::droppable(meta.offloadable, &meta.copies, targets, place));
+    if allowed {
+        match place {
+            Location::Local => tx.execute(
+                "UPDATE blobs SET content = NULL WHERE user_id = ?1 AND id = ?2",
+                params![user_id, id.0],
+            )?,
+            Location::Backend(name) => tx.execute(
+                "DELETE FROM blob_copies WHERE user_id = ?1 AND blob_id = ?2 AND backend = ?3",
+                params![user_id, id.0, name],
+            )?,
+        };
+    }
+    tx.commit()?;
+    Ok(allowed)
 }
 
-/// The blobs in one place, and their bytes.
+/// Forgets the blob's copy in backend `name`, found gone or damaged, if the blob has another copy: the pass then makes
+/// it again. Its last copy stays, so it reads as lost. → whether it forgot it.
+pub fn forget_copy(
+    conn: &mut Connection,
+    user_id: &UserId,
+    id: BlobId,
+    name: &str,
+) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let there = Location::Backend(name.to_owned());
+    let forgotten = blob_meta(&tx, user_id, id)?
+        .is_some_and(|meta| meta.copies.contains(&there) && meta.copies.len() > 1);
+    if forgotten {
+        tx.execute(
+            "DELETE FROM blob_copies WHERE user_id = ?1 AND blob_id = ?2 AND backend = ?3",
+            params![user_id, id.0, name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(forgotten)
+}
+
+/// Forgets all of the blob's copies, found gone or damaged, if they are still `copies` and none is in the database: it
+/// is lost, and an upload of it stores it anew (SPEC §7.1). → whether it did.
+pub fn forget_lost(
+    conn: &mut Connection,
+    user_id: &UserId,
+    id: BlobId,
+    copies: &[Location],
+) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let lost =
+        blob_meta(&tx, user_id, id)?.is_some_and(|meta| !meta.here() && meta.copies == copies);
+    if lost {
+        tx.execute(
+            "DELETE FROM blob_copies WHERE user_id = ?1 AND blob_id = ?2",
+            params![user_id, id.0],
+        )?;
+    }
+    tx.commit()?;
+    Ok(lost)
+}
+
+/// Every blob with a copy in backend `name`, with its size.
+pub fn blobs_in(conn: &Connection, name: &str) -> rusqlite::Result<HashMap<(UserId, BlobId), u64>> {
+    conn.prepare(
+        "SELECT c.user_id, c.blob_id, blobs.size FROM blob_copies c
+           JOIN blobs ON blobs.user_id = c.user_id AND blobs.id = c.blob_id
+         WHERE c.backend = ?1",
+    )?
+    .query_map([name], |r| {
+        let size = r.get::<_, i64>(2)?.try_into().unwrap_or(0);
+        Ok(((r.get(0)?, BlobId(r.get(1)?)), size))
+    })?
+    .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Forgetting {
+    /// The rows of `copies` copies are gone, and the backend's record. `lost` had no other copy.
+    Forgot {
+        copies: u64,
+        lost: Vec<(UserId, BlobId)>,
+    },
+    /// Nothing changed: these blobs have no copy anywhere else.
+    WouldLose(Vec<(UserId, BlobId)>),
+    /// No copy went there, and it isn't recorded: likely a typo.
+    Unknown,
+}
+
+/// Forgets backend `name`, gone for good (SPEC §9): its copies' rows and its record. Unless `accept_loss`, nothing
+/// changes if a blob's only copy is there.
+pub fn forget_backend(
+    conn: &mut Connection,
+    name: &str,
+    accept_loss: bool,
+) -> rusqlite::Result<Forgetting> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let only_there = tx
+        .prepare(
+            "SELECT c.user_id, c.blob_id FROM blob_copies c
+               JOIN blobs ON blobs.user_id = c.user_id AND blobs.id = c.blob_id
+             WHERE c.backend = ?1 AND blobs.content IS NULL
+               AND NOT EXISTS (SELECT 1 FROM blob_copies o
+                               WHERE o.user_id = c.user_id AND o.blob_id = c.blob_id AND o.backend <> ?1)
+             ORDER BY c.user_id, c.blob_id",
+        )?
+        .query_map([name], |r| Ok((r.get(0)?, BlobId(r.get(1)?))))?
+        .collect::<rusqlite::Result<Vec<(UserId, BlobId)>>>()?;
+    if !only_there.is_empty() && !accept_loss {
+        return Ok(Forgetting::WouldLose(only_there));
+    }
+    let copies = tx.execute("DELETE FROM blob_copies WHERE backend = ?1", [name])?;
+    let recorded = tx.execute("DELETE FROM backends WHERE name = ?1", [name])? == 1;
+    if copies == 0 && !recorded {
+        return Ok(Forgetting::Unknown);
+    }
+    tx.commit()?;
+    Ok(Forgetting::Forgot {
+        copies: copies as u64,
+        lost: only_there,
+    })
+}
+
+/// The copies in one place, and their bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Usage {
     pub location: Location,
@@ -685,13 +825,19 @@ pub struct Usage {
     pub bytes: u64,
 }
 
-/// How many blobs are where, by location: the database first, then the backends by name.
+/// How many copies are where: the database first, then the backends with any, by name.
 pub fn usage(conn: &Connection) -> rusqlite::Result<Vec<Usage>> {
     let mut usage: Vec<Usage> = conn
-        .prepare("SELECT location, count(*), coalesce(sum(size), 0) FROM blobs GROUP BY location")?
+        .prepare(
+            "SELECT 'local', count(*), coalesce(sum(size), 0) FROM blobs WHERE content IS NOT NULL
+             UNION ALL
+             SELECT c.backend, count(*), coalesce(sum(blobs.size), 0) FROM blob_copies c
+               JOIN blobs ON blobs.user_id = c.user_id AND blobs.id = c.blob_id
+             GROUP BY c.backend",
+        )?
         .query_map([], |r| {
             Ok(Usage {
-                location: Location::of(r.get(0)?),
+                location: Location::named(&r.get::<_, String>(0)?),
                 blobs: r.get::<_, i64>(1)?.try_into().unwrap_or(0),
                 bytes: r.get::<_, i64>(2)?.try_into().unwrap_or(0),
             })
@@ -701,7 +847,51 @@ pub fn usage(conn: &Connection) -> rusqlite::Result<Vec<Usage>> {
     Ok(usage)
 }
 
-/// The backends blobs have been moved to, as the database recorded them.
+/// What `backend storage` shows (SPEC §9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Storage {
+    /// The copies in each place.
+    pub places: Vec<Usage>,
+    /// Offloadable blobs with any copy, by how many they have, fewest first: (copies, blobs).
+    pub by_copies: Vec<(u64, u64)>,
+    /// The blobs with a copy, but none in the database, and their bytes: what bringing all of them in would take.
+    pub elsewhere: (u64, u64),
+    /// The blobs with no copy left, offloadable or not, and their bytes.
+    pub lost: (u64, u64),
+}
+
+pub fn storage(conn: &Connection) -> rusqlite::Result<Storage> {
+    let count = |n: i64| n.try_into().unwrap_or(0);
+    let by_copies = conn
+        .prepare(
+            "SELECT n, count(*) FROM (
+               SELECT (content IS NOT NULL)
+                      + (SELECT count(*) FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)
+                      AS n
+               FROM blobs WHERE offloadable = 1)
+             WHERE n > 0 GROUP BY n ORDER BY n",
+        )?
+        .query_map([], |r| Ok((count(r.get(0)?), count(r.get(1)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+    let without_a_copy_here = |copies: &str| {
+        conn.query_row(
+            &format!(
+                "SELECT count(*), coalesce(sum(size), 0) FROM blobs WHERE content IS NULL
+                   AND {copies} (SELECT 1 FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)"
+            ),
+            [],
+            |r| Ok((count(r.get(0)?), count(r.get(1)?))),
+        )
+    };
+    Ok(Storage {
+        places: usage(conn)?,
+        by_copies,
+        elsewhere: without_a_copy_here("EXISTS")?,
+        lost: without_a_copy_here("NOT EXISTS")?,
+    })
+}
+
+/// The backends copies have gone to, as the database recorded them.
 pub fn recorded_backends(conn: &Connection) -> rusqlite::Result<Vec<BackendRecord>> {
     conn.prepare("SELECT name, type, identity FROM backends ORDER BY name")?
         .query_map([], |r| {
@@ -776,10 +966,8 @@ pub fn put_ref(
     let outcome = match blob_meta(&tx, user_id, blob)? {
         _ if !precondition_holds(precondition, current) => RefWrite::PreconditionFailed(current),
         None => RefWrite::BlobNotFound,
-        // Not offloadable but in a backend is only left behind by an older binary (SPEC §7.4); it comes back soon.
-        Some(target) if target.offloadable || target.location != Location::Local => {
-            RefWrite::BlobOffloadable
-        }
+        // Not offloadable but without a copy here is only left behind by an older binary; the pass brings it home.
+        Some(target) if target.offloadable || !target.here() => RefWrite::BlobOffloadable,
         Some(_) => {
             tx.execute(
                 "INSERT INTO refs (user_id, name, blob_id, updated_at) VALUES (?1, ?2, ?3, ?4)

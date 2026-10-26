@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use backend::accounts::{CreateUserError, create_user, issue_setup_token, setup_links};
 use backend::config::{self, Config};
 use backend::domain::{format_timestamp, format_uuid};
+use backend::store::Forgetting;
 use backend::{db, disk, offload, server, store};
 
 #[derive(Parser)]
@@ -25,8 +26,15 @@ struct Cli {
 enum Command {
     /// Run the server on the Unix socket.
     Serve,
-    /// Where the blobs are, and whether bringing them all into the database would fit.
+    /// Where the blobs' copies are, and whether bringing them all into the database would fit.
     Storage,
+    /// Forget a backend that is gone for good: its copies' rows and its record, so the server starts without it.
+    Forget {
+        backend: String,
+        /// Forget it even if blobs have no copy anywhere else: they read as lost.
+        #[arg(long)]
+        accept_loss: bool,
+    },
     /// Manage users.
     User {
         #[command(subcommand)]
@@ -72,6 +80,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve => tokio::runtime::Runtime::new()?.block_on(server::serve(config)),
         Command::Storage => storage(&config),
+        Command::Forget {
+            backend,
+            accept_loss,
+        } => forget(&config, &backend, accept_loss),
         Command::User {
             command: UserCommand::Create { username },
         } => user_create(&config, &username),
@@ -127,7 +139,7 @@ fn storage(config: &Config) -> anyhow::Result<()> {
     print!(
         "{}",
         offload::storage_report(
-            &store::usage(&conn)?,
+            &store::storage(&conn)?,
             &config.blob_target,
             free,
             config.min_free_space,
@@ -135,6 +147,53 @@ fn storage(config: &Config) -> anyhow::Result<()> {
         )
     );
     Ok(())
+}
+
+/// The blobs, one per line: the user's ID and the blob's.
+fn blob_lines(blobs: &[(store::UserId, backend::domain::BlobId)]) -> String {
+    blobs
+        .iter()
+        .map(|(user_id, id)| format!("  {} {id}\n", format_uuid(user_id)))
+        .collect()
+}
+
+fn forget(config: &Config, name: &str, accept_loss: bool) -> anyhow::Result<()> {
+    if !config::valid_backend_name(name) {
+        bail!("{name:?} can't be a backend's name");
+    }
+    // Configured, it is either a target, which gets its copies back, or emptied by the passes themselves; and one the
+    // server still reaches loses its objects in the next sweep, the only copies among them. Nor can the environment
+    // configure one.
+    if config.backends.contains_key(name) {
+        bail!(
+            "{name} is still configured: forget is for a backend gone for good. Take it out of blob_target, where the passes drop its copies that have others; then out of the backends, and forget the rest"
+        );
+    }
+    let mut conn = db::open_and_migrate(&config.database)?;
+    match store::forget_backend(&mut conn, name, accept_loss)? {
+        Forgetting::WouldLose(blobs) => {
+            eprint!(
+                "{} blobs have no copy anywhere but in {name}:\n{}",
+                blobs.len(),
+                blob_lines(&blobs)
+            );
+            bail!("nothing forgotten; --accept-loss forgets them too, and they then read as lost");
+        }
+        Forgetting::Unknown => {
+            bail!("no backend {name} is recorded, nor any copy in one of that name")
+        }
+        Forgetting::Forgot { copies, lost } => {
+            println!("Forgot backend {name}: {copies} copies");
+            if !lost.is_empty() {
+                print!(
+                    "{} blobs had no other copy, and are lost:\n{}",
+                    lost.len(),
+                    blob_lines(&lost)
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn user_list(config: &Config) -> anyhow::Result<()> {
