@@ -20,14 +20,23 @@ function nonce(index, flag) {
   return out;
 }
 
+/** §3.2's padding: at least 4096, else Padmé as its paper writes it (E = ⌊log₂ L⌋, S = ⌊log₂ E⌋ + 1), then to whole 4 KiB. */
+export function padded(length) {
+  if (length <= 4096) return 4096;
+  const e = Math.floor(Math.log2(length));
+  const s = Math.floor(Math.log2(e)) + 1;
+  const mask = (1n << BigInt(e - s)) - 1n;
+  const padme = Number((BigInt(length) + mask) & ~mask);
+  return Math.ceil(padme / 4096) * 4096;
+}
+
 /**
  * §3.2: salt ‖ length block ‖ chunks, with the key HKDF(HKDF(MK, "<ns>/stream/v1"), salt, label). `padded` (the
  * padded plaintext's length) and `length` (the length block's value) default to what the SDK writes, and can be set
  * to anything, e.g. another writer's padding, or a length past the padding.
  */
-export function streamBlob({ masterKey, namespace, label, salt, plaintext, padded, length = plaintext.length }) {
+export function streamBlob({ masterKey, namespace, label, salt, plaintext, padded: size = padded(plaintext.length), length = plaintext.length }) {
   const key = hkdf(hkdf(masterKey, `${namespace}/stream/v1`, 32), label, 32, salt);
-  const size = padded ?? Math.max(4096, Math.ceil(plaintext.length / 4096) * 4096);
   const body = Buffer.alloc(size);
   Buffer.from(plaintext).copy(body);
   const count = Math.ceil(size / 65536);
