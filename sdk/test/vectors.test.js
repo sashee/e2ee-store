@@ -21,7 +21,7 @@ const content = Uint8Array.from({ length: v.file.length }, (_, i) => i % 251);
 /** The fake backend with the vectors' blobs, and an authenticator holding the vectors' passkey. */
 function stored() {
   const { server, authenticator } = install();
-  const file = streamBlob({ masterKey: Buffer.from(v.masterKey, "hex"), namespace: v.namespace, label: v.file.label, salt: Buffer.from(v.file.salt, "hex"), plaintext: content });
+  const file = streamBlob({ masterKey: Buffer.from(v.masterKey, "hex"), namespace: v.namespace, label: v.file.label, salt: Buffer.from(v.file.salt, "hex"), plaintext: content, padded: 73728 });
   assert.equal(sha256(file), v.file.blobId, "reference.mjs still makes the vector's file blob");
   const ids = [v.keysBlob, v.rootBlob].map((blob) => server.put(Buffer.from(blob, "base64")));
   assert.deepEqual([...ids, server.put(file)], [v.keysBlobId, v.rootBlobId, v.file.blobId], "the vectors are intact");

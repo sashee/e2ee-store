@@ -4,8 +4,8 @@
 //   salt (16) ‖ length block (8 + 16) ‖ chunk_0 ‖ … ‖ chunk_n-1
 //
 // Every blob has its own key, HKDF(root key, salt, kind label). A chunk's nonce is its index and whether it is the
-// last one, so chunks can't be reordered, dropped or cut off. The plaintext is padded with zeros to a multiple of
-// 4 KiB; the length block says where it ends. No I/O here: blobs.js reads and writes blobs through the API.
+// last one, so chunks can't be reordered, dropped or cut off. The plaintext is padded with zeros (Padmé, in whole
+// 4 KiB); the length block says where it ends. No I/O here: blobs.js reads and writes blobs through the API.
 
 import { aesGcmDecrypt, aesGcmEncrypt, concat, DecryptError, equalBytes, hkdfSaltedAesKey, randomBytes } from "./crypto.js";
 
@@ -16,7 +16,7 @@ const TAG = 16;
 const LENGTH = 8;
 export const HEADER = SALT + LENGTH + TAG;
 export const SEALED_CHUNK = CHUNK_SIZE + TAG;
-/** What `seal` pads to. It is the writer's choice: readers take any padding. */
+/** What `seal` pads to a multiple of, at least. */
 const PADDING = 4096;
 const NO_AAD = new Uint8Array(0);
 const LAST = 1;
@@ -62,13 +62,28 @@ export function layoutOf(size) {
   return body - (chunks - 1) * SEALED_CHUNK > TAG ? { chunks, padded: body - chunks * TAG } : null;
 }
 
+const bitLength = (n) => n.toString(2).length;
+
+/**
+ * What `seal` pads `length` bytes of plaintext to: Padmé, which keeps ⌊log₂ E⌋ + 1 bits below a length's highest
+ * bit E and rounds the rest up, in whole 4 KiB, at least one. Between two powers of two, below 4 GiB, that is 32
+ * steps, each under 1/32 of the length; below 256 KiB, the 4 KiB rounding is the larger. It is the writer's
+ * choice: readers take any padding.
+ */
+export function paddedLength(length) {
+  if (length <= PADDING) return PADDING;
+  const highest = bitLength(length) - 1;
+  const step = Math.max(PADDING, 2 ** (highest - bitLength(highest)));
+  return Math.ceil(length / step) * step;
+}
+
 const encrypt = async (key, iv, plaintext) => (await aesGcmEncrypt(key, plaintext, NO_AAD, iv)).ciphertext;
 
 /** Encrypts `plaintext` as a blob of kind `label` (an HKDF info, e.g. `labels.dir`), under a fresh salt. */
 export async function seal(rootKey, label, plaintext) {
   const salt = randomBytes(SALT);
   const key = await hkdfSaltedAesKey(rootKey, salt, label);
-  const padded = Math.max(PADDING, Math.ceil(plaintext.length / PADDING) * PADDING);
+  const padded = paddedLength(plaintext.length);
   const count = Math.ceil(padded / CHUNK_SIZE);
   const chunk = (index) => {
     const out = new Uint8Array(Math.min(CHUNK_SIZE, padded - index * CHUNK_SIZE));

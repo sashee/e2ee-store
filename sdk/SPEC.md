@@ -76,7 +76,7 @@ salt (16 bytes) ‖ length block (8 + 16-byte tag) ‖ chunk_0 ‖ … ‖ chunk
 - **Blob key:** `HKDF(ikm = content key, salt = the blob's salt, info = UTF-8(label))`, an AES-256-GCM key. The salt is 16 random bytes, so no two blobs share a key. The label names the kind of blob (`labels.dir` for directories, `labels.file` for files), so a blob of one kind can't be passed off as another.
 - **Length block:** the plaintext's length as 8 bytes, big-endian, encrypted with the nonce `0 (11 bytes) ‖ 0x02`.
 - **Chunks:** the padded plaintext in chunks of 64 KiB (`CHUNK_SIZE`); the last one may be shorter. Chunk `i` is encrypted with the nonce `i (11 bytes, big-endian) ‖ 0x01` if it is the last, `‖ 0x00` otherwise, so chunks can't be reordered, dropped or cut off. There is no AAD.
-- **Padding:** zeros, to a multiple of 4096 bytes (at least 4096). This is the writer's choice: readers take any padding, as the length block says where the plaintext ends. Padding can change (e.g. to Padmé) without a new format.
+- **Padding:** zeros, to Padmé's length, then to a multiple of 4096 bytes, at least 4096 (`paddedLength`). Padmé (from the PURBs paper, Nikitin et al., 2019), with E = ⌊log₂ L⌋ and S = ⌊log₂ E⌋ + 1, rounds a length L up to a multiple of 2^(E−S): between two powers of two below 4 GiB, that is 32 sizes, and less than 1/32 added. Below 256 KiB, the 4 KiB rounding is the larger. Padding is the writer's choice: readers take any, as the length block says where the plaintext ends, so it changes without a new format. Blobs written before Padmé are padded to a multiple of 4096 alone, and keep that size.
 - **Shape:** every chunk but the last is full, the last holds at least one byte, and the length is at most the padded length. Anything else is an integrity error.
 - **Nothing in plaintext** apart from the salt, not even the format version. A new format gets new labels, and readers try the formats they know; every format is authenticated, so a blob can't be read as the wrong one.
 - **Directories and files** (§5) are both blobs of this format. A directory's plaintext is its UTF-8 JSON, a file's its bytes. The padding hides small changes in their size.
@@ -394,8 +394,8 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
   - An attacker who already has the MK. Without key rotation, removing a passkey doesn't lock them out.
 - **What the server sees:**
   - when and how often the root and the keys blob change
-  - every blob's size, padded to 4 KiB steps, and the number of blobs
-  - when blobs are uploaded and read. That can group them: an album's tracks are uploaded together and played one after another, and a group of known sizes can identify what it is.
+  - every blob's size, padded (§3.2): to within 1/32 from 256 KiB on, and to 4 KiB below; and the number of blobs
+  - when blobs are uploaded and read. That can group them: an album's tracks are uploaded together and played one after another, and a group of known sizes can identify what it is. Padding blurs each size, not the pattern of several.
   - from the plaintext keys blob: which credential IDs have slots, and when the recovery key changes
 - **Range reads:** `read` always pins a file to the salt its entry lists, so a server can't serve another of the user's files in its place, even for a range (§3.2).
 - **Tampering with the keys blob:** the server can delete or replay slots, which can only cause a failed unlock. It can't create a working slot, because that needs a KEK.

@@ -6,24 +6,43 @@ import assert from "node:assert/strict";
 import { DecryptError, hexEncode } from "../src/crypto.js";
 import { contentKey } from "../src/envelope.js";
 import { labels } from "../src/labels.js";
-import { CHUNK_SIZE, chunkOffset, HEADER, layoutOf, nonce, open, SEALED_CHUNK, seal } from "../src/stream.js";
-import { streamBlob } from "./reference.mjs";
+import { CHUNK_SIZE, chunkOffset, HEADER, layoutOf, nonce, open, paddedLength, SEALED_CHUNK, seal } from "../src/stream.js";
+import { padded as specPadded, streamBlob } from "./reference.mjs";
 
 const L = labels("test-app");
 const FILE = "test-app/file/v1";
 const masterKey = new Uint8Array(32).fill(7);
 const root = await contentKey(L, masterKey);
 const data = (length) => Uint8Array.from({ length }, (_, i) => (i * 31 + Math.floor(i / CHUNK_SIZE)) % 256);
-const LENGTHS = [0, 1, 4095, 4096, 4097, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 3 * CHUNK_SIZE + 5000];
+const LENGTHS = [0, 1, 4095, 4096, 4097, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 3 * CHUNK_SIZE + 5000, 1_000_000];
 
-test("blobs are padded to 4 KiB and split into 64 KiB chunks, each with its tag", async () => {
+test("blobs are padded and split into 64 KiB chunks, each with its tag", async () => {
   for (const length of LENGTHS) {
-    const padded = Math.max(4096, Math.ceil(length / 4096) * 4096);
+    const padded = specPadded(length);
     const chunks = Math.ceil(padded / CHUNK_SIZE);
     const blob = await seal(root, FILE, data(length));
     assert.equal(blob.length, HEADER + padded + 16 * chunks, `length ${length}`);
     assert.deepEqual(layoutOf(blob.length), { chunks, padded });
     assert.deepEqual(await open(root, FILE, blob), data(length), `length ${length}`);
+  }
+});
+
+test("the padding is Padmé, in whole 4 KiB, at least one", () => {
+  const cases = [
+    [0, 4096],
+    [4096, 4096],
+    [4097, 8192],
+    [2 ** 17, 2 ** 17],
+    [2 ** 18 + 1, 270_336], // 4 KiB alone: 266,240
+    [1_000_000, 1_015_808],
+    [38_000_000, 38_797_312],
+    [2 ** 32 + 1, 2 ** 32 + 2 ** 26],
+  ];
+  for (const [length, padded] of cases) assert.equal(paddedLength(length), padded, `length ${length}`);
+  for (const e of [18, 20, 27, 31]) {
+    const lengths = Array.from({ length: 1024 }, (_, k) => 2 ** e + (k + 1) * 2 ** (e - 10));
+    assert.equal(new Set(lengths.map(paddedLength)).size, 32, `32 sizes after 2^${e}`);
+    for (const length of lengths) assert.ok(paddedLength(length) - length < length / 32, `length ${length}`);
   }
 });
 
@@ -51,6 +70,9 @@ test("blobs made from the SPEC alone open", async () => {
     const blob = streamBlob({ masterKey, namespace: "test-app", label: FILE, salt, plaintext: data(length) });
     assert.deepEqual(await open(root, FILE, new Uint8Array(blob)), data(length), `length ${length}`);
   }
+  // Padded as before Padmé, to the next 4 KiB.
+  const before = streamBlob({ masterKey, namespace: "test-app", label: FILE, salt, plaintext: data(1_000_000), padded: 1_003_520 });
+  assert.deepEqual(await open(root, FILE, new Uint8Array(before)), data(1_000_000));
   // Another writer's padding: not a multiple of 4 KiB, and a chunk of padding alone.
   const other = streamBlob({ masterKey, namespace: "test-app", label: FILE, salt, plaintext: data(10), padded: 2 * CHUNK_SIZE + 100 });
   assert.deepEqual(await open(root, FILE, new Uint8Array(other)), data(10));

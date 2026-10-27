@@ -33,11 +33,11 @@ const keys = {
 };
 const keysBlob = Buffer.from(JSON.stringify(keys));
 
-// §3.2: a file of 70,000 bytes, byte i being i mod 251: a full chunk and one of 8192 padded bytes. Only its ID is
-// stored; the test makes it again with reference.mjs.
+// §3.2: a file of 70,000 bytes, byte i being i mod 251: a full chunk and one of 8192 padded bytes, the padding fixed
+// here so the blob doesn't follow what writers pad to. Only its ID is stored; the test makes it again with reference.mjs.
 const file = { label: `${namespace}/file/v1`, salt: filled(16, 0x06).toString("hex"), length: 70000 };
 const filePlaintext = Buffer.from(Array.from({ length: file.length }, (_, i) => i % 251));
-const fileBlob = streamBlob({ masterKey, namespace, label: file.label, salt: Buffer.from(file.salt, "hex"), plaintext: filePlaintext });
+const fileBlob = streamBlob({ masterKey, namespace, label: file.label, salt: Buffer.from(file.salt, "hex"), plaintext: filePlaintext, padded: 73728 });
 
 // §5: the root directory at revision 8, listing that file.
 const root = {
