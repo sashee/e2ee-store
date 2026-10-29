@@ -8,7 +8,7 @@ Building blocks for web apps that keep each user's data end-to-end encrypted, un
   WebAuthn with PRF, the key hierarchy (master key, passkey slots, recovery key), the vault as an encrypted
   tree of directories and files with compare-and-swap saves and rollback detection, files read whole or in
   ranges as streams, setup links, and cleanup. See `sdk/SPEC.md`.
-- `nix/module.nix` runs one backend per app on NixOS; `nix/tests/lib.nix` is its VM test.
+- `nix/lib.nix` makes an app's NixOS module, which runs the app's backend; `nix/tests/lib.nix` is its VM test.
 
 ## Building an app on it
 
@@ -39,14 +39,37 @@ in
 - **Static files:** the backend serves one directory per instance. The app's package copies
   `${sdk}/share/e2ee-store/sdk` into it (e.g. as `sdk/`) and imports the modules by relative path. In
   development, a link to the same directory does.
-- **Deployment:** import `nix/module.nix` and declare an instance; everything of it is named after it.
+- **Deployment:** the app has a NixOS module of its own, made with `nix/lib.nix`. Its options are the app's
+  (`services.notes`), so a host configures the app and never this repository, and apps that pin different
+  versions of it run on one host. Everything of the instance is named after the app.
 
   ```nix
-  services.e2ee-store.instances.notes = {
-    staticDir = "${notes-web}/share/notes/web";
-    settings.public_hosts = [ "notes.example.com" ];   # optional; backend SPEC §10
-    settings.rp_name = "Notes";                        # shown in passkey prompts
-  };
+  # The app's nix/module.nix
+  { config, lib, pkgs, ... }:
+  let
+    cfg = config.services.notes;
+    e2ee = import (e2eeStore + "/nix/lib.nix") { inherit config lib pkgs; };
+  in
+  {
+    options.services.notes = e2ee.options { name = "notes"; } // {
+      enable = lib.mkEnableOption "notes";
+    };
+    config = lib.mkIf cfg.enable (lib.mkMerge [
+      { services.notes.settings.rp_name = lib.mkDefault "Notes"; }   # shown in passkey prompts
+      (e2ee.config {
+        name = "notes";
+        inherit (cfg) package settings storageBackends;
+        staticDir = "${notes-web}/share/notes/web";
+      })
+    ]);
+  }
+  ```
+
+  ```nix
+  # The host's configuration
+  imports = [ "${notes}/nix/module.nix" ];
+  services.notes.enable = true;
+  services.notes.settings.public_hosts = [ "notes.example.com" ];   # optional; backend SPEC §10
   ```
 
   The backend listens on `/run/notes/backend.sock`; only members of the `notes` group can connect, so whatever
@@ -59,7 +82,7 @@ in
   backend (or a stolen key) deletes or overwrites stays recoverable for 180 days; its header shows how to deploy it.
 
   ```nix
-  services.e2ee-store.instances.notes = {
+  services.notes = {
     storageBackends.backblaze = { type = "s3"; credentialFile = "/etc/credentials/notes/backblaze"; };
     settings.blob_target = [ "local" "backblaze" ];   # a copy in each; [ "local" ], the default, keeps them here
   };
@@ -69,11 +92,13 @@ in
   provider, add it as a second backend and to `blob_target`, then take the old one out of `blob_target`; once it
   is empty, remove it. Blobs are copied between backends without passing through the host's disk.
   `sudo notes storage` shows where the copies are. A backend that is gone for good, bucket and all, is
-  forgotten with `sudo notes forget <backend>`, once it is out of the configuration.
+  forgotten with `sudo notes forget <backend>`, once it is out of the configuration. An app without offloadable
+  blobs leaves `storageBackends` out of its options.
 - **Several apps on one host:** each instance has its own users, passkeys and data. On the iroh path, give each
   app its own loopback name (`http://notes.localhost:PORT`, `http://todo.localhost:PORT`): cookies ignore the
   port, so two apps on plain `localhost` would log each other out, and each would offer the other's passkeys.
-- **VM test:** `import (e2eeStore + "/nix/tests/lib.nix") { inherit pkgs; instance = "notes"; machineModules = [ … ]; }`.
+- **VM test:** `import (e2eeStore + "/nix/tests/lib.nix") { inherit pkgs; instance = "notes"; machineModules = [
+  ./module.nix { services.notes.enable = true; } … ]; }`.
 - **Rerunning this repository's checks** with the app's nixpkgs (and a host's machine for the VM test):
   `import (e2eeStore + "/nix/tests") { inherit pkgs; machineModules = [ … ]; }` gives the SDK's unit tests, the
   browser test and the S3 VM test. Add them to the app's checks, so a host running those runs them too.

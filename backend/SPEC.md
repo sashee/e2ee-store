@@ -86,7 +86,7 @@ direct:       browser → https://app.example.com → reverse proxy (TLS) → ba
 ```
 backend/   the Rust backend (this spec), no app-specific code
 sdk/       the browser side: keys, encryption, flows (../sdk/SPEC.md)
-nix/       the NixOS module (one instance per app) and its VM tests: the instance alone, and with S3 backends
+nix/       what an app's NixOS module is made of (one instance per app), and the VM tests: an instance alone, and with S3 backends
 aws/       a CloudFormation template for an S3 backend's bucket and user
 ```
 
@@ -684,7 +684,7 @@ file = "/run/credentials/music.service/backblaze"
 
 ### 10.1 A backend's credential file
 
-Everything about a backend is in its own file, apart from the configuration, as all of it is secret: the bucket and its endpoint as much as the keys. Only `serve` reads it. On NixOS it is a systemd credential, decrypted for the service only (the module's `storageBackends`).
+Everything about a backend is in its own file, apart from the configuration, as all of it is secret: the bucket and its endpoint as much as the keys. Only `serve` reads it. On NixOS it is a systemd credential, decrypted for the service only (an app's `storageBackends`).
 
 For S3:
 
@@ -737,7 +737,7 @@ secret_access_key = "…"
 - **Offloading:** against a stand-in S3 per backend on 127.0.0.1 (`tests/common/s3.rs`): uploads and reads through S3, uploads to several targets with some of them failing, a lost blob uploaded again, reads falling back from copy to copy and looking the blob up again when its copies change, every range form, S3 answering errors, refusing connections, never answering (bounded by the timeouts) or without its bucket, lost and damaged copies, lengths that aren't the blob's, a suspect copy checked again before it goes, a blob's last copy kept, flag changes both ways, the targets at each pass, copies dropped only once every target has one, confirmed there, and never after a target's list failed, one read for all of a blob's copies, copies between backends with no room on the host, the sweep in both directions and what it leaves alone, a deleted user's objects, refs, races between steps and passes, the space returned, the backend guard, `forget`, and errors that don't name the location or carry a signed URL.
 - **Free space** (with the free space a test sets): uploads keep the reserve, a blob is unflagged only if it fits, and blobs come home all together or not at all.
 - **Migrations:** the stored form of versions, a new and a 1.0 database, a newer minor accepted and a newer major refused (both left as they are), the 2.0 rebuild of a 1.3 database with blobs here and in two backends, one of them not offloadable, and refs (rows, copies, foreign keys, the column order, and what is gone), and many connections starting at once on new, 1.0 and 1.2 databases.
-- **VM test with S3** (`nix/tests/s3.nix`): the NixOS module with two backends, each a systemd-encrypted credential file and a bucket in Garage, behind nginx for TLS with a test CA.
+- **VM test with S3** (`nix/tests/s3.nix`): a stand-in app's instance with two backends, each a systemd-encrypted credential file and a bucket in Garage, behind nginx for TLS with a test CA.
   - Blobs go to S3, are read back through the API, whole and in a range, come back when the targets change, and move from one backend to the other and back.
   - With two backends and the database as targets, a blob has a copy in each; a bucket emptied behind the server's back is filled again by the next pass; and a backend whose bucket is gone, taken out of the targets, is emptied, and while it is configured, `forget` refuses it.
   - The credentials are encrypted at rest, and only the service user can read the decrypted copies.
@@ -745,7 +745,7 @@ secret_access_key = "…"
   - Nothing of the credential file reaches the journal, failures included.
 - **Smoke test:** the server serves requests over the Unix socket and cleans the socket up on shutdown; the socket is its group's alone, and a stale one is replaced but a live one isn't.
 - **Admin commands:** `user create`, `list` and `delete`, `setup-token create`, `storage` and `forget`, against the binary.
-- **VM test of the NixOS module** (`nix/tests/lib.nix`): the socket's access control, the admin wrapper running as the service user, a restart, and the sandbox. Apps and hosts run it on their own instance and machine.
+- **VM test of an instance** (`nix/tests/lib.nix`): the socket's access control, the admin wrapper running as the service user, a restart, and the sandbox. Apps and hosts run it on their own instance and machine.
 - **Concurrency test:** several writers compare-and-swap the same ref in parallel. Exactly one must win in each round.
 - **Manual checks:** register and log in with PRF through:
   - the iroh path on a laptop (Chrome and Firefox)

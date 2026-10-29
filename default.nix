@@ -7,7 +7,7 @@
 #
 # No flake: the packages are callPackage functions and take the caller's nixpkgs, so an app builds them with
 # its own nixpkgs (./nix/pkgs.nix is only this repository's). An app imports this file with its `pkgs`, or calls
-# the package files directly; the NixOS module is ./nix/module.nix and its VM test ./nix/tests/lib.nix.
+# the package files directly; it makes its NixOS module with ./nix/lib.nix, and ./nix/tests/lib.nix is its VM test.
 {
   pkgs ? import ./nix/pkgs.nix { },
 }:

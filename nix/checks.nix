@@ -2,7 +2,7 @@
 #
 # - lint: rustfmt and clippy (warnings are errors), with the same toolchain the package is built with. nix/pkgs.nix
 #   follows a branch, so a new lint can appear when the branch moves, without a commit here.
-# - vm: the NixOS module (./module.nix) in a VM (./tests/lib.nix), with a stand-in app on a minimal machine.
+# - vm: an instance (./lib.nix) in a VM (./tests/lib.nix), of a stand-in app on a minimal machine.
 #   An app runs the same test against its own instance.
 # - sdk-unit, browser, vm-s3: the ones apps and hosts rerun with their own nixpkgs (./tests/default.nix), here on a
 #   minimal machine.
@@ -36,7 +36,8 @@ in
     inherit pkgs;
     instance = "demo";
     machineModules = minimal ++ [
-      { services.e2ee-store.instances.demo.staticDir = import ./tests/demo-app.nix pkgs; }
+      ./tests/demo-module.nix
+      { services.demo.enable = true; }
     ];
     extraTestScript = ''
       with subtest("the app's static files are served"):

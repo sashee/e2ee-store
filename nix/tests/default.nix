@@ -8,7 +8,7 @@
 # - browser: the flows in Chromium with PRF-capable virtual authenticators, against the backend package behind
 #   socat, through the browser-test harness, with a stand-in app (sdk/test/browser). A sandboxed build, not a VM:
 #   nothing needs the network.
-# - vm-s3: the NixOS module offloading to S3: Garage behind nginx for TLS (./s3.nix).
+# - vm-s3: an instance (../lib.nix) offloading to S3: Garage behind nginx for TLS (./s3.nix).
 #
 # Not here: lint, which belongs to this repository's toolchain; the instance test (./lib.nix), which an app runs on
 # its own instance; and the Rust suite, which runs wherever the backend package is built.
@@ -63,8 +63,5 @@ in
         touch "$out"
       '';
 
-  vm-s3 = import ./s3.nix {
-    inherit pkgs machineModules;
-    staticDir = import ./demo-app.nix pkgs;
-  };
+  vm-s3 = import ./s3.nix { inherit pkgs machineModules; };
 }

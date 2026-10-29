@@ -1,4 +1,4 @@
-# The NixOS module with S3 backends (backend SPEC §7.4): the instance gets one credential file per backend, encrypted by
+# The stand-in app (./demo-module.nix) with S3 backends (backend SPEC §7.4): the instance gets one credential file per backend, encrypted by
 # systemd, and talks to Garage on the same machine, behind nginx for TLS with a test CA in the system's bundle. Two
 # backends, a bucket each. On top of the checks of ./lib.nix: offloadable blobs go to S3, read back through the API,
 # and move when the targets change, between the database and a backend and from one backend to the other; with a copy
@@ -9,7 +9,6 @@
 # `machineModules` are the machine's own configuration, as for ./lib.nix: a host repository passes its real one.
 {
   pkgs,
-  staticDir,
   machineModules,
 }:
 let
@@ -55,6 +54,7 @@ import ./lib.nix {
   inherit pkgs;
   instance = "demo";
   machineModules = machineModules ++ [
+    ./demo-module.nix
     {
       virtualisation.memorySize = lib.mkDefault 2048;
       # Garage wants at least 1 GiB free.
@@ -109,8 +109,8 @@ import ./lib.nix {
         };
       };
 
-      services.e2ee-store.instances.demo = {
-        inherit staticDir;
+      services.demo = {
+        enable = true;
         settings.blob_target = [ "garage" ];
         storageBackends = lib.mapAttrs (name: _: {
           type = "s3";

@@ -1,4 +1,4 @@
-# NixOS VM test of one instance of the module: the service, the socket's access control, the admin wrapper
+# NixOS VM test of one app's instance (../lib.nix): the service, the socket's access control, the admin wrapper
 # and the sandbox.
 #
 # The machine is an input, so an app (or a host repository) runs this against its own configuration, the way
@@ -6,13 +6,13 @@
 #
 #   import "${e2ee-store}/nix/tests/lib.nix" {
 #     inherit pkgs;
-#     instance = "notes";                        # defined by machineModules
+#     instance = "notes";                        # services.notes, defined by machineModules
 #     machineModules = [ <app module> <host config> ];
 #     extraTestScript = ''…'';                   # optional; may use get(path, CLIENT)
 #   }
 #
-# The harness imports ../module.nix itself (NixOS deduplicates a module imported twice by path) and
-# adds only what the checks need: a user in the socket's group, one outside it, and curl.
+# The app's options are at `services.<instance>`, as ../lib.nix has them. The harness adds only what the checks
+# need: a user in the socket's group, one outside it, and curl.
 {
   pkgs,
   instance,
@@ -26,10 +26,10 @@ pkgs.testers.runNixOSTest {
   nodes.machine =
     { config, pkgs, ... }:
     {
-      imports = machineModules ++ [ ../module.nix ];
+      imports = machineModules;
       users.users.store-client = {
         isNormalUser = true;
-        extraGroups = [ config.services.e2ee-store.instances.${instance}.group ];
+        extraGroups = [ config.services.${instance}.group ];
       };
       users.users.store-outsider.isNormalUser = true;
       environment.systemPackages = [ pkgs.curl ];
@@ -38,13 +38,13 @@ pkgs.testers.runNixOSTest {
   testScript =
     { nodes, ... }:
     let
-      cfg = nodes.machine.services.e2ee-store.instances.${instance};
+      cfg = nodes.machine.services.${instance};
     in
     ''
       NAME = "${instance}"
       SOCKET = "${cfg.socketPath}"
       # Storage backends need IP (backend SPEC §7.4); without them, only the Unix socket.
-      FAMILIES = ${if cfg.storageBackends != { } then ''{"AF_UNIX", "AF_INET", "AF_INET6"}'' else ''{"AF_UNIX"}''}
+      FAMILIES = ${if cfg.storageBackends or { } != { } then ''{"AF_UNIX", "AF_INET", "AF_INET6"}'' else ''{"AF_UNIX"}''}
       STATE = f"/var/lib/{NAME}"
       CLIENT = "store-client"
 
