@@ -162,11 +162,12 @@ impl Objects {
 
     /// Stores an object. `Content-MD5` makes S3 refuse it if it arrives damaged.
     pub async fn put(&self, key: &str, content: Bytes) -> Result<(), ObjectError> {
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), key)
-            .sign(SIGNED_FOR);
         let md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(&content));
+        let mut action = self.bucket.put_object(Some(&self.credentials), key);
+        // Signed, not only sent: AWS refuses a presigned request with a header like this left out of the signature
+        // (403 AccessDenied), where Garage takes it.
+        action.headers_mut().insert("content-md5", md5.clone());
+        let url = action.sign(SIGNED_FOR);
         let response = self
             .http
             .put(url)

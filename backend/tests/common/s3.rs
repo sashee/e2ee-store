@@ -1,5 +1,6 @@
 //! A stand-in for S3 on 127.0.0.1, path-style, with what the backend uses: PUT (checking Content-MD5), GET with
 //! ranges, DELETE and ListObjectsV2 in pages. Signatures aren't checked; the VM test runs against Garage for that.
+//! What AWS refuses on top, and Garage doesn't, is: a header S3 acts on that the signature leaves out.
 //! The objects are plain state the tests read and change, e.g. to lose one, to take S3 down or to delete the bucket.
 
 use std::collections::BTreeMap;
@@ -111,6 +112,9 @@ async fn handle(
     if s3.down.load(Ordering::SeqCst) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "SlowDown");
     }
+    if has_unsigned_header(&headers, &query) {
+        return error(StatusCode::FORBIDDEN, "AccessDenied");
+    }
     let path = uri.path().strip_prefix(&format!("/{BUCKET}/"));
     let Some(key) = path.filter(|_| !s3.no_bucket.load(Ordering::SeqCst)) else {
         return error(StatusCode::NOT_FOUND, "NoSuchBucket");
@@ -162,6 +166,18 @@ async fn handle(
         }
         _ => error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
     }
+}
+
+/// Whether a header S3 acts on (`Content-MD5`, `x-amz-*`) was sent without being in a presigned request's
+/// `X-Amz-SignedHeaders`, which AWS refuses: "There were headers present in the request which were not signed".
+fn has_unsigned_header(headers: &HeaderMap, query: &BTreeMap<String, String>) -> bool {
+    let signed: Vec<&str> = query
+        .get("X-Amz-SignedHeaders")
+        .map_or(Vec::new(), |names| names.split(';').collect());
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        (name == "content-md5" || name.starts_with("x-amz-")) && !signed.contains(&name)
+    })
 }
 
 /// ListObjectsV2: the keys under `prefix` after `continuation-token`, a page at a time.

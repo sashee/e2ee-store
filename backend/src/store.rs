@@ -862,13 +862,18 @@ pub struct Storage {
 
 pub fn storage(conn: &Connection) -> rusqlite::Result<Storage> {
     let count = |n: i64| n.try_into().unwrap_or(0);
+    // Whether the database has a copy is asked in WHERE, where SQLite reads only the column's type. As a value
+    // (`(content IS NOT NULL) + …`) it would copy every blob's content into the grouping, three times over.
     let by_copies = conn
         .prepare(
             "SELECT n, count(*) FROM (
-               SELECT (content IS NOT NULL)
-                      + (SELECT count(*) FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)
+               SELECT 1 + (SELECT count(*) FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)
                       AS n
-               FROM blobs WHERE offloadable = 1)
+               FROM blobs WHERE offloadable = 1 AND content IS NOT NULL
+               UNION ALL
+               SELECT (SELECT count(*) FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)
+                      AS n
+               FROM blobs WHERE offloadable = 1 AND content IS NULL)
              WHERE n > 0 GROUP BY n ORDER BY n",
         )?
         .query_map([], |r| Ok((count(r.get(0)?), count(r.get(1)?))))?
