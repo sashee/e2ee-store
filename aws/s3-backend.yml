@@ -1,0 +1,69 @@
+# An S3 bucket for one instance's storage backend (backend SPEC §7.4, §10.1), and a user that can write to it but
+# not destroy what it wrote: the bucket is versioned, and the user can't delete versions, so whatever it deletes or
+# overwrites stays recoverable for 180 days. That includes everything a stolen key could do.
+#
+#   aws cloudformation deploy --template-file aws/s3-backend.yml --stack-name music-blobs --capabilities CAPABILITY_IAM
+#   aws cloudformation describe-stacks --stack-name music-blobs --query 'Stacks[0].Outputs'
+#   aws iam create-access-key --user-name <User>
+#
+# The credential file (backend SPEC §10.1) then takes the outputs and the key, with `url_style = "virtual-host"`.
+AWSTemplateFormatVersion: 2010-09-09
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # What the backend deletes or overwrites goes after 180 days, and the delete markers left alone once it has.
+          - Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 180
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 180
+            ExpiredObjectDeleteMarker: true
+          # Smaller objects would cost more in monitoring and transitions than they save.
+          - Status: Enabled
+            ObjectSizeGreaterThan: 1048576
+            # Only the tiers that serve a read at once: no IntelligentTieringConfiguration opts into the archive ones,
+            # which the backend couldn't read.
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+            # Read only to recover from a mistake, after a restore. Deep Archive's 180 days minimum is the retention.
+            NoncurrentVersionTransitions:
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 0
+
+  # What the backend does (`backend/src/objects.rs`): list, read, write and delete objects. Not s3:DeleteObjectVersion,
+  # so a delete only adds a delete marker.
+  User:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: e2ee-store-backend
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # Also what makes a missing object 404 rather than 403, which the backend tells apart.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${Bucket.Arn}/*"
+
+Outputs:
+  Bucket:
+    Value: !Ref Bucket
+  Region:
+    Value: !Ref AWS::Region
+  Endpoint:
+    Value: !Sub "https://s3.${AWS::Region}.amazonaws.com"
+  User:
+    Value: !Ref User

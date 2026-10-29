@@ -55,6 +55,8 @@ in
 - **Offloadable blobs in storage backends** (optional; backend SPEC §7.4): each backend has a name, a type (`s3`)
   and a credential file with its location and keys (backend SPEC §10.1), kept encrypted with
   `systemd-creds encrypt --name=<name> - /etc/credentials/notes/<name>`.
+  On AWS, `aws/s3-backend.yml` makes the bucket, versioned, and a user that can't delete its versions, so what the
+  backend (or a stolen key) deletes or overwrites stays recoverable for 180 days; its header shows how to deploy it.
 
   ```nix
   services.e2ee-store.instances.notes = {

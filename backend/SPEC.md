@@ -87,6 +87,7 @@ direct:       browser → https://app.example.com → reverse proxy (TLS) → ba
 backend/   the Rust backend (this spec), no app-specific code
 sdk/       the browser side: keys, encryption, flows (../sdk/SPEC.md)
 nix/       the NixOS module (one instance per app) and its VM tests: the instance alone, and with S3 backends
+aws/       a CloudFormation template for an S3 backend's bucket and user
 ```
 
 ## 4. Identifiers & formats
