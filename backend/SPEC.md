@@ -352,7 +352,6 @@ All storage belongs to one user. Every store query takes the `user_id` from the 
   - The flag is set when the blob is uploaded, and only then: re-uploading an existing blob keeps its flag. It can be changed any time afterwards.
   - A ref can't point to an offloadable blob, and a blob a ref points to can't be flagged (409 `blob_offloadable`). What refs point to stays in the database, so a client can always find its way in.
 - Reads use SQLite's incremental BLOB I/O, so a `Range` read holds only the requested bytes in memory. SQLite still reads every page up to the range's end, which makes ranges near the start cheap and ranges near the end of a large blob cost about as much I/O as a full read.
-- Writes use it too: the row gets a zeroblob of the blob's size, then the bytes, in one transaction. Storing an upload holds its content in memory once, as it arrives.
 
 ### 7.2 Refs
 

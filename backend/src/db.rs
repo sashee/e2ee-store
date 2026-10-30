@@ -393,9 +393,15 @@ pub fn enable_incremental_vacuum(conn: &Connection) -> rusqlite::Result<bool> {
 
 const INCREMENTAL: i64 = 2;
 
-/// Returns up to `pages` free pages to the file system; → how many are still free.
+/// Returns up to `pages` free pages to the file system, in one transaction; → how many are still free.
 pub fn reclaim(conn: &Connection, pages: u32) -> rusqlite::Result<u64> {
-    conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages})"))?;
+    // The pragma frees a page per row it returns: stepped once, as `execute_batch` does, it frees one. Each page it
+    // takes off the free list is made dirty: with a cache smaller than the step, they'd be spilled into the WAL,
+    // although the truncation drops them.
+    conn.pragma_update(None, "cache_size", 2 * i64::from(pages))?;
+    conn.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?
+        .query_map([], |_| Ok(()))?
+        .collect::<rusqlite::Result<()>>()?;
     free_pages(conn)
 }
 
@@ -697,7 +703,9 @@ mod tests {
             .unwrap();
         let full = pages(&conn);
         conn.execute_batch("UPDATE t SET x = x''").unwrap();
-        assert!(reclaim(&conn, 100).unwrap() > 0, "a step at a time");
+        let free = free_pages(&conn).unwrap();
+        assert!(free > 100, "{free}");
+        assert_eq!(reclaim(&conn, 100).unwrap(), free - 100, "a step of 100");
         while reclaim(&conn, 100).unwrap() > 0 {}
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .unwrap();
