@@ -33,5 +33,7 @@ webauthn_rp = { version = "0.3.0", features = ["serde_relaxed", "serializable_se
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+# Tests lower SQLite's length limit to catch queries that load a blob whole.
+rusqlite = { version = "0.40", features = ["limits"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

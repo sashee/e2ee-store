@@ -356,9 +356,9 @@ impl BlobMeta {
     }
 }
 
-/// The columns `blob_meta_row` reads, from `blobs`. `content IS NOT NULL` reads the row's header only, never the
-/// content.
-const BLOB_META: &str = "blobs.id, blobs.size, blobs.created_at, blobs.offloadable, blobs.content IS NOT NULL,
+/// The columns `blob_meta_row` reads, from `blobs`. `typeof(content)` reads the row's header only, never the content.
+/// `content IS NOT NULL` would, as a column: SQLite only skips the content for it in a `WHERE`.
+const BLOB_META: &str = "blobs.id, blobs.size, blobs.created_at, blobs.offloadable, typeof(blobs.content) <> 'null',
   (SELECT group_concat(backend, ',') FROM blob_copies c WHERE c.user_id = blobs.user_id AND c.blob_id = blobs.id)";
 
 fn blob_meta_row(row: &Row) -> rusqlite::Result<BlobMeta> {
@@ -424,33 +424,23 @@ pub fn put_blob(
     now: i64,
 ) -> rusqlite::Result<(Put, BlobMeta)> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let here = copies.here.then_some(content);
     let put = match blob_meta(&tx, user_id, id)? {
         None => {
             tx.execute(
-                "INSERT INTO blobs (user_id, id, size, created_at, offloadable, content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    user_id,
-                    id.0,
-                    sql_size(content.len()),
-                    now,
-                    offloadable,
-                    here
-                ],
+                "INSERT INTO blobs (user_id, id, size, created_at, offloadable)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![user_id, id.0, sql_size(content.len()), now, offloadable],
             )?;
             Put::Created
         }
-        Some(meta) if meta.copies.is_empty() => {
-            tx.execute(
-                "UPDATE blobs SET content = ?3 WHERE user_id = ?1 AND id = ?2",
-                params![user_id, id.0, here],
-            )?;
-            Put::Restored
-        }
+        // Without a copy, its content is NULL already.
+        Some(meta) if meta.copies.is_empty() => Put::Restored,
         Some(_) => Put::Existed,
     };
     if put != Put::Existed {
+        if copies.here {
+            write_content(&tx, user_id, id, content)?;
+        }
         for backend in copies.backends {
             tx.execute(
                 "INSERT INTO blob_copies (user_id, blob_id, backend) VALUES (?1, ?2, ?3)",
@@ -671,17 +661,41 @@ pub fn add_copy(
 /// Gives the blob a copy in the database, if it has none; `unflag` also makes it not offloadable, in the same step.
 /// False if it has one already, or is gone.
 pub fn add_local(
-    conn: &Connection,
+    conn: &mut Connection,
     user_id: &UserId,
     id: BlobId,
     content: &[u8],
     unflag: bool,
 ) -> rusqlite::Result<bool> {
-    Ok(conn.execute(
-        "UPDATE blobs SET content = ?3, offloadable = offloadable AND NOT ?4
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let added = tx.execute(
+        "UPDATE blobs SET offloadable = offloadable AND NOT ?3
          WHERE user_id = ?1 AND id = ?2 AND content IS NULL",
-        params![user_id, id.0, content, unflag],
-    )? == 1)
+        params![user_id, id.0, unflag],
+    )? == 1;
+    if added {
+        write_content(&tx, user_id, id, content)?;
+    }
+    tx.commit()?;
+    Ok(added)
+}
+
+/// Sets the blob's content, in the caller's transaction: a zeroblob of its size, then the bytes through incremental
+/// BLOB I/O, which copies them into the database's pages a page at a time. Bound as a parameter, the content would be
+/// copied whole twice more: SQLite's own copy, then the row's record.
+fn write_content(
+    conn: &Connection,
+    user_id: &UserId,
+    id: BlobId,
+    content: &[u8],
+) -> rusqlite::Result<()> {
+    let rowid: i64 = conn.query_row(
+        "UPDATE blobs SET content = zeroblob(?3) WHERE user_id = ?1 AND id = ?2 RETURNING rowid",
+        params![user_id, id.0, sql_size(content.len())],
+        |r| r.get(0),
+    )?;
+    conn.blob_open(MAIN_DB, c"blobs", c"content", rowid, false)?
+        .write_at(content, 0)
 }
 
 /// Drops the blob's copy in `place`, if `placement` still allows it with the copies the blob has now: never one it

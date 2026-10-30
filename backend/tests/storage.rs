@@ -3,8 +3,10 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use backend::domain::BlobId;
+use backend::domain::{BlobId, ByteRange};
+use backend::store;
 use common::*;
+use rusqlite::limits::Limit;
 use serde_json::json;
 
 fn tag(id: &BlobId) -> String {
@@ -109,6 +111,30 @@ async fn ranges_span_overflow_pages() {
         .await;
     assert_eq!(full.status, StatusCode::OK);
     assert!(full.body.is_empty());
+}
+
+#[tokio::test]
+async fn metadata_and_ranges_never_load_the_whole_content() {
+    let h = Harness::with(|config| config.max_blob_size = 1 << 20);
+    let cookie = h.signed_up("alice", PHONE).await;
+    let content: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+    let id = BlobId::of(&content);
+    put_blob(&h, &cookie, &content).await;
+
+    // Below the blob's size, SQLite's length limit fails any query that loads the content into memory whole
+    // ("string or blob too big"). Incremental BLOB I/O isn't held to it.
+    let mut conn = h.conn();
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1 << 19).unwrap();
+    let user = store::user_by_username(&conn, "alice").unwrap().unwrap().id;
+    assert!(store::blob_meta(&conn, &user, id).unwrap().unwrap().here());
+    assert_eq!(store::list_blobs(&conn, &user, None, 10).unwrap().len(), 1);
+    let (_, _, part) = store::blob_content(&mut conn, &user, id, |_| ByteRange::Partial {
+        start: 4000,
+        end: 70_000,
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(part, content[4000..=70_000]);
 }
 
 #[tokio::test]
