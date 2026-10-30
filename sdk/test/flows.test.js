@@ -13,7 +13,10 @@ import { UserFacingError } from "../src/passkeys.js";
 import { RollbackError } from "../src/save.js";
 import * as stream from "../src/stream.js";
 import { TreeError } from "../src/tree.js";
-import { BOB, fakeAuthenticator, install, useAuthenticator } from "./fakes.js";
+import { BOB, fakeAuthenticator, flaky, install, useAuthenticator } from "./fakes.js";
+
+// Retries (SPEC §6.14) with pauses short enough for a test.
+api.setRetryDelays([1, 1, 1]);
 
 const L = labels("test-app");
 const HOUR = 3600 * 1000;
@@ -258,6 +261,21 @@ test("a save that conflicts with another device's runs its steps again on top of
   const { session } = await flows.save(phone, [add("from the phone")]);
   assert.deepEqual(await notesOf(session), ["from the laptop", "from the phone"]);
   assert.equal(session.root.revision, 3);
+});
+
+test("a save gets through a dropped upload and a lost answer to its ref write", async () => {
+  const { server, session } = await newAccount();
+  const pending = new Set(["upload", "ref"]);
+  const failed = flaky(server, ({ method, path }) => {
+    if (method === "PUT" && path.startsWith("/blobs/") && pending.delete("upload")) return "drop";
+    if (method === "PUT" && path === "/refs/vault" && pending.delete("ref")) return "lost";
+    return undefined;
+  });
+  const { session: saved } = await flows.save(session, [add("through it all")]);
+  assert.equal(failed.length, 2, failed.join("; "));
+  assert.equal(saved.root.revision, session.root.revision + 1, "one save, not one on top of its own");
+  assert.equal(server.refs.get("vault"), saved.root.blobId);
+  assert.deepEqual(await notesOf(saved), ["through it all"]);
 });
 
 test("after a conflict, the steps can put back entries of the newer root", async () => {

@@ -4,7 +4,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import * as api from "../src/api.js";
-import { install, sha256Hex } from "./fakes.js";
+import { flaky, install, sha256Hex } from "./fakes.js";
+
+// Retries (SPEC §6.14) with pauses short enough for a test.
+const PAUSES = [1, 1, 1];
+api.setRetryDelays(PAUSES);
 
 /** Every request gets this response. */
 const respond = (status, body) => {
@@ -102,4 +106,65 @@ test("listing blobs reports the server's clock", async () => {
   assert.equal(page.serverNow, server.now);
   server.sendsDate = false;
   assert.equal((await api.listBlobs()).serverNow, null, "not this device's clock");
+});
+
+test("a request that may be made twice is made again after network errors and 502–504", async () => {
+  const server = signedIn();
+  const plan = ["drop", 503, 502];
+  const failed = flaky(server, () => plan.shift());
+  const bytes = new Uint8Array([4, 5, 6]);
+  const id = await api.putBlob(bytes);
+  assert.deepEqual(failed, [`drop PUT /blobs/${id}`, `503 PUT /blobs/${id}`, `502 PUT /blobs/${id}`]);
+  plan.push(504, "drop");
+  assert.deepEqual(await api.getBlob(id), bytes);
+  assert.equal(failed.length, 5);
+});
+
+test("after the last pause, the failure stands", async () => {
+  const server = signedIn();
+  const dropped = flaky(server, () => "drop");
+  await assert.rejects(api.getRef("vault"), TypeError);
+  assert.equal(dropped.length, PAUSES.length + 1, "the first attempt and one after each pause");
+  const unavailable = flaky(server, () => 503);
+  const error = await api.listBlobs().catch((e) => e);
+  assert.equal(error.status, 503);
+  assert.equal(unavailable.length, PAUSES.length + 1);
+});
+
+test("logins, other statuses and aborted requests aren't made again", async () => {
+  const server = signedIn();
+  const login = flaky(server, () => "drop");
+  await assert.rejects(api.loginStart(), TypeError);
+  assert.equal(login.length, 1, "a login's challenge is single-use");
+  const broken = flaky(server, () => 500);
+  await assert.rejects(api.passkeys(), (e) => e.status === 500);
+  assert.equal(broken.length, 1);
+  flaky(server, () => undefined);
+  const before = server.requests.length;
+  await assert.rejects(api.getBlob("1".repeat(64)), (e) => e.status === 404);
+  assert.equal(server.requests.length - before, 1, "a 404 is the server's answer");
+
+  api.setRetryDelays([60_000]);
+  try {
+    const aborted = flaky(server, () => "drop");
+    const controller = new AbortController();
+    const read = api.getBlobStream("2".repeat(64), { signal: controller.signal });
+    setTimeout(() => controller.abort(), 5);
+    await assert.rejects(read, { name: "AbortError" });
+    assert.equal(aborted.length, 1, "the pause ends at once, and nothing is sent after it");
+  } finally {
+    api.setRetryDelays(PAUSES);
+  }
+});
+
+test("a ref write whose answer was lost counts as written when it is made again", async () => {
+  const server = signedIn();
+  const first = await api.putBlob(new Uint8Array([1]));
+  const second = await api.putBlob(new Uint8Array([2]));
+  const plan = ["lost"];
+  const failed = flaky(server, () => plan.shift());
+  assert.deepEqual(await api.putRef("notes", first, null), { ok: true });
+  assert.deepEqual(failed, ["lost PUT /refs/notes"]);
+  assert.equal(server.refs.get("notes"), first);
+  assert.deepEqual(await api.putRef("notes", second, null), { ok: false, current: first }, "another blob is a conflict, as ever");
 });

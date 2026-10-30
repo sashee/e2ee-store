@@ -368,6 +368,27 @@ export function useAuthenticator(authenticator) {
   return authenticator;
 }
 
+/**
+ * The fake backend behind a `fetch` that fails on cue (SPEC §6.14): `failure({ method, path })` says how, for each
+ * request: "drop" (a network error before the server sees it), "lost" (the server acts, but its answer doesn't
+ * arrive), a status the server isn't asked for, or nothing. → what failed, as "<how> <method> <path>", in order.
+ */
+export function flaky(server, failure) {
+  const failed = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    const path = new URL(url, "http://localhost").pathname.replace(/^\/api\/v1/, "");
+    const how = failure({ method, path });
+    if (how) failed.push(`${how} ${method} ${path}`);
+    if (how === "drop") throw new TypeError("Failed to fetch");
+    if (typeof how === "number") return new Response("", { status: how });
+    const response = await server.fetch(url, init);
+    if (how === "lost") throw new TypeError("Failed to fetch");
+    return response;
+  };
+  return failed;
+}
+
 /** Puts both in place of the browser's `fetch` and `navigator.credentials`. */
 export function install(options) {
   const server = fakeServer();

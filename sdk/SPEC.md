@@ -358,6 +358,17 @@ An app can let the server keep a file's content outside its database (backend/SP
 - **Lost content:** reading a file whose content is lost (`410 blob_lost`) fails with `BlobLostError` from `api.js`: an `ApiError` with code `blob_lost` and the blob's `id`. Its entry stays, and cleanup keeps the blob (§6.11); what to do, e.g. upload the file again, is up to the app.
 - **Where the content is** is the server's business (backend/SPEC.md §7.4): its configuration decides which storage backends, if any, offloadable files have copies in. While no backend with a copy can be reached, reading a file that has no copy in the server's database, or making it not offloadable, fails with `storage_unavailable`. Flagging still works, and so does uploading, as long as one target backend takes the file or the server's database has the room to (otherwise `storage_unavailable` too). Making a lost file not offloadable fails with an `ApiError` with code `blob_lost`. Making a file not offloadable brings it into the server's database, and fails with `storage_full` if it hasn't the room.
 
+### 6.14 Retries
+
+A request that does the same when it is made twice is made again after a failure that may pass. A failure that doesn't pass, or one that outlasts the retries, fails the request as before.
+
+- **Failures that may pass:** a network error (`fetch` rejecting with a `TypeError`), `502` (e.g. a tunnel that didn't reach the server), `503` (`storage_unavailable`) and `504`. Never an abort, a `401` or any other status.
+- **Pauses:** 0.5, 1, 2, 4, 8 and 16 s before the 2nd to 7th attempt, about 30 s in all (`api.RETRY_DELAYS_MS`). `api.setRetryDelays(delays)` sets others, e.g. none. An abort ends a pause at once.
+- **Made again:** reads (`/me`, passkeys, refs, blobs and ranges of them, the blob list), uploads (a blob's ID is its hash, so a second upload stores nothing new), flag changes, deletes of blobs, and ref writes.
+- **Ref writes** are compare-and-swap (§6.4), so one whose answer was lost finds, made again, the ref already moved: a 412 naming the blob it writes counts as written. A blob's ID is its content's hash, so the ref then holds exactly what the write puts there, whoever put it.
+- **Not made again:** logins, setup tokens, registering and deleting passkeys, logout: their challenges and tokens are single-use, or the user sees and repeats them.
+- **Streams:** a retried read is retried until its response arrives. A body that breaks off after that fails its reader; an app that streams, e.g. media, resumes from where it got to.
+
 ## 7. Modules
 
 Plain ES modules with no dependencies and no build step. An app copies `src/` into its static files (the Nix package has it at `share/e2ee-store/sdk`) and imports the modules by relative path; the backend's CSP (`script-src 'self'`) rules out import maps.
@@ -369,7 +380,7 @@ Plain ES modules with no dependencies and no build step. An app copies `src/` in
 | `tree.js`         | The tree (§5, §6.4): its formats and names, transactions, commits, `TreeError`, `validName`, and what a root reaches |
 | `blobs.js`        | Uploading and reading encrypted blobs over the API, and `CHUNK_SIZE` (§6.12) |
 | `stream.js`       | The blob format (§3.2): sealing, opening, and its layout |
-| `api.js`          | The backend client: errors with fixed messages and `BlobLostError`, hash-checked blobs, ranges, offloadable blobs, compare-and-swap refs, the 401 handler |
+| `api.js`          | The backend client: errors with fixed messages and `BlobLostError`, hash-checked blobs, ranges, offloadable blobs, compare-and-swap refs, the 401 handler, retries (§6.14) |
 | `passkeys.js`     | WebAuthn ceremonies with PRF; `UserFacingError` |
 | `crypto.js`       | HKDF, AES-GCM, SHA-256, base64url, hex |
 | `envelope.js`     | The content key (§3.1) |
@@ -407,7 +418,7 @@ Messages shown to the user come from the SDK, never from the server, so a misbeh
 ## 9. Testing
 
 - **Unit tests** (`node --test`; Node has WebCrypto), for the pure modules and, against the stand-ins of `test/fakes.js`, for the API client and the blobs:
-  - **API client:** fixed messages, the 401 handler, hash checks of downloaded blobs, blob ID checks, refs with compare-and-swap, deletes that count a missing blob as deleted, and the server's clock.
+  - **API client:** fixed messages, the 401 handler, hash checks of downloaded blobs, blob ID checks, refs with compare-and-swap, deletes that count a missing blob as deleted, the server's clock, and retries: after network errors and 502–504 until a response or the last pause, none for logins or after an abort or a 4xx, and a ref write whose answer was lost counting as written.
   - **Crypto:** wrap/unwrap round trips; a tampered nonce, ciphertext or AAD fails; keys of another kind or another namespace fail.
   - **Labels:** derived from the namespace; invalid namespaces are refused.
   - **Tree:** transactions (writes return new ones, reads see earlier writes), commits (only what changed, bottom-up, each directory and upload once, offloadable uploads apart), what `put` accepts back, names, read-only directories, errors, malformed directories, and what a root reaches.
