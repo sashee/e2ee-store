@@ -58,6 +58,41 @@ Resources:
                   - s3:DeleteObject
                 Resource: !Sub "${Bucket.Arn}/*"
 
+  # The same reads, through CloudFront: S3 doesn't charge for what it sends there, and CloudFront's free tier is larger
+  # than S3's. Only reads: CloudFront charges for what it sends on to S3, so writes go to S3 directly.
+  #
+  # The backend's requests carry their signature in the query string, made for the bucket's own host (the origin's
+  # domain). CloudFront passes the query string on and sends the origin's host, not its own, so S3 checks the signature
+  # as it would a direct request, and refuses what isn't signed: the bucket stays private, with no origin access
+  # control, which would sign the request a second time. Nothing is cached: the signature changes with every request,
+  # and an object served from the cache would skip S3's check.
+  Reads:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName}: reads of ${Bucket}"
+        # North America and Europe: the cheapest edges, and enough for one host's backend.
+        PriceClass: PriceClass_100
+        # Over HTTP/2 or 3, a read cancelled midway ends its stream, not the connection, so the next read doesn't pay
+        # for a new one.
+        HttpVersion: http2and3
+        Origins:
+          - Id: bucket
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: bucket
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # Managed-CachingDisabled.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader: every query string (the signature) and header (`Range`), but not `Host`.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
 Outputs:
   Bucket:
     Value: !Ref Bucket
@@ -65,5 +100,8 @@ Outputs:
     Value: !Ref AWS::Region
   Endpoint:
     Value: !Sub "https://s3.${AWS::Region}.amazonaws.com"
+  # Reads there are signed for the virtual-host endpoint, `https://<Bucket>.s3.<Region>.amazonaws.com`.
+  ReadEndpoint:
+    Value: !Sub "https://${Reads.DomainName}"
   User:
     Value: !Ref User
