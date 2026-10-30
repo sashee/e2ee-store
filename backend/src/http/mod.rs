@@ -21,7 +21,7 @@ use rusqlite::Connection;
 use serde::de::DeserializeOwned;
 
 use crate::config::Config;
-use crate::db;
+use crate::db::Connections;
 use crate::disk::{FreeSpace, system_free_space};
 use crate::offload::KeyLocks;
 use crate::remotes::Remotes;
@@ -46,6 +46,8 @@ pub fn system_clock() -> Clock {
 pub struct AppState {
     pub config: Arc<Config>,
     pub clock: Clock,
+    /// The database's connections, open while the server runs (SPEC §5).
+    pub connections: Arc<Connections>,
     /// The storage backends, by name (SPEC §7.4).
     pub remotes: Arc<Remotes>,
     /// The free space on the database's file system (SPEC §7.5).
@@ -55,14 +57,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config, clock: Clock) -> Self {
-        Self {
+    /// Opens the database's connections: it must be migrated already (`db::open_and_migrate`).
+    pub fn new(config: Config, clock: Clock) -> rusqlite::Result<Self> {
+        Ok(Self {
+            connections: Arc::new(Connections::open(&config.database)?),
             config: Arc::new(config),
             clock,
             remotes: Arc::default(),
             free_space: system_free_space(),
             moving: Arc::default(),
-        }
+        })
     }
 
     pub fn with_remotes(self, remotes: Remotes) -> Self {
@@ -80,18 +84,34 @@ impl AppState {
         (self.clock)()
     }
 
-    /// Runs `f` on its own connection, off the async runtime.
+    /// Runs `f` on the writer, off the async runtime: calls wait their turn for it.
     pub async fn db<T, F>(&self, f: F) -> Result<T, ApiError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
     {
-        let path = self.config.database.clone();
-        tokio::task::spawn_blocking(move || db::open(&path).and_then(|mut conn| f(&mut conn)))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)
+        let connections = self.connections.clone();
+        off_runtime(move || connections.write(f)).await
     }
+
+    /// Runs `f` on a read-only connection, off the async runtime, alongside the writer: a write there fails.
+    pub async fn db_read<T, F>(&self, f: F) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let connections = self.connections.clone();
+        off_runtime(move || connections.read(f)).await
+    }
+}
+
+async fn off_runtime<T: Send + 'static>(
+    f: impl FnOnce() -> rusqlite::Result<T> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)
 }
 
 pub fn router(state: AppState) -> Router {

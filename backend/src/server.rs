@@ -77,7 +77,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let remotes = prepare(&config)?;
     let socket = config.socket.clone();
     let listener = bind(&socket)?;
-    let state = AppState::new(config, system_clock()).with_remotes(remotes);
+    let state = AppState::new(config, system_clock())?.with_remotes(remotes);
     tokio::spawn(purge_loop(state.clone(), state.clock.clone()));
     tokio::spawn(offload_loop(state.clone()));
     tracing::info!("listening on {}", socket.display());

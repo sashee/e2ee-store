@@ -20,7 +20,7 @@ use crate::store::{self, Passkey, PasskeyDeletion};
 async fn current_user(state: &AppState, authed: &Authed) -> Result<store::User, ApiError> {
     let user_id = authed.session.user_id;
     state
-        .db(move |c| store::user_by_id(c, &user_id))
+        .db_read(move |c| store::user_by_id(c, &user_id))
         .await?
         .ok_or_else(ApiError::unauthenticated)
 }
@@ -70,7 +70,9 @@ pub async fn list_passkeys(
     authed: Authed,
 ) -> Result<Json<Value>, ApiError> {
     let user_id = authed.session.user_id;
-    let passkeys = state.db(move |c| store::passkeys_of(c, &user_id)).await?;
+    let passkeys = state
+        .db_read(move |c| store::passkeys_of(c, &user_id))
+        .await?;
     let current = authed.session.passkey_id.as_deref();
     Ok(Json(
         json!({ "passkeys": passkeys.iter().map(|p| passkey_json(p, current)).collect::<Vec<_>>() }),
@@ -86,7 +88,7 @@ pub async fn register_start(
     let user = current_user(&state, &authed).await?;
     let user_id = user.id;
     let existing: Vec<Vec<u8>> = state
-        .db(move |c| store::passkeys_of(c, &user_id))
+        .db_read(move |c| store::passkeys_of(c, &user_id))
         .await?
         .into_iter()
         .filter(|p| p.rp_id == site.rp_id)

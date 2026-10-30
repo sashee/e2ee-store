@@ -1,10 +1,11 @@
-//! Opening the database and migrating it (SPEC §5.2). Migrations are plain SQL; `user_version` holds the
-//! schema version as `major.minor`.
+//! Opening the database, the server's connections to it (SPEC §5), and migrating it (SPEC §5.2). Migrations are plain
+//! SQL; `user_version` holds the schema version as `major.minor`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::Context as _;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::disk;
 
@@ -281,13 +282,95 @@ DROP TABLE s3_location;
 /// How long a statement waits for another connection's lock.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Idle readers the server keeps open; while they are all busy, more are opened, and closed after.
+const READERS: usize = 4;
+
+/// What the WAL is cut back to after a checkpoint. A large blob's write grows it, and SQLite would keep it that size.
+const WAL_LIMIT: i64 = 8 << 20;
+
 /// A connection with the per-connection settings every caller needs. Foreign keys in particular are off
 /// by default in SQLite and must be enabled on each connection.
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
+    configured(Connection::open(path)?)
+}
+
+/// `synchronous = FULL` syncs the WAL at each commit: a write is on disk before its caller hears it is done.
+fn configured(conn: Connection) -> rusqlite::Result<Connection> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
     Ok(conn)
+}
+
+/// The server's connections, open while it runs (SPEC §5): one writer, which writes wait their turn for here rather
+/// than in SQLite's busy handler, and read-only readers, which WAL lets read alongside it. With one always open, the
+/// others' closes don't checkpoint the WAL and delete it, as the last connection's does.
+pub struct Connections {
+    path: PathBuf,
+    // Before the writer, as fields drop in order: the last connection to close checkpoints the WAL and deletes it, and
+    // a read-only one can't.
+    readers: Mutex<Vec<Connection>>,
+    writer: Mutex<Connection>,
+}
+
+impl Connections {
+    /// Opens the writer; readers are opened as they are needed. The database must be migrated already.
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        let writer = open(path)?;
+        writer.pragma_update(None, "journal_size_limit", WAL_LIMIT)?;
+        Ok(Self {
+            path: path.to_owned(),
+            readers: Mutex::default(),
+            writer: Mutex::new(writer),
+        })
+    }
+
+    /// Runs `f` on the writer, once the call before it is done.
+    pub fn write<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        // A call that panicked left it poisoned; `settle` rolls back what it left open.
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        settle(&writer)?;
+        f(&mut writer)
+    }
+
+    /// Runs `f` on an idle reader, or a new one when they are all busy. Readers are read-only: a write there fails.
+    pub fn read<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let idle = self
+            .readers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut reader = match idle {
+            Some(reader) => reader,
+            None => configured(Connection::open_with_flags(
+                &self.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?)?,
+        };
+        settle(&reader)?;
+        let read = f(&mut reader);
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        if readers.len() < READERS {
+            readers.push(reader);
+        }
+        read
+    }
+}
+
+/// Rolls back a transaction a call left open, as one that panicked may have.
+fn settle(conn: &Connection) -> rusqlite::Result<()> {
+    if conn.is_autocommit() {
+        Ok(())
+    } else {
+        conn.execute_batch("ROLLBACK")
+    }
 }
 
 /// Opens the database, switches it to WAL and migrates it. Run once per process start.
@@ -397,12 +480,25 @@ const INCREMENTAL: i64 = 2;
 pub fn reclaim(conn: &Connection, pages: u32) -> rusqlite::Result<u64> {
     // The pragma frees a page per row it returns: stepped once, as `execute_batch` does, it frees one. Each page it
     // takes off the free list is made dirty: with a cache smaller than the step, they'd be spilled into the WAL,
-    // although the truncation drops them.
+    // although the truncation drops them. The connection stays open, so its usual cache comes back after.
+    let cache: i64 = conn.pragma_query_value(None, "cache_size", |r| r.get(0))?;
     conn.pragma_update(None, "cache_size", 2 * i64::from(pages))?;
-    conn.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?
-        .query_map([], |_| Ok(()))?
-        .collect::<rusqlite::Result<()>>()?;
+    let vacuumed = conn
+        .prepare(&format!("PRAGMA incremental_vacuum({pages})"))
+        .and_then(|mut vacuum| {
+            vacuum
+                .query_map([], |_| Ok(()))?
+                .collect::<rusqlite::Result<()>>()
+        });
+    conn.pragma_update(None, "cache_size", cache)?;
+    vacuumed?;
     free_pages(conn)
+}
+
+/// Copies the WAL into the database. A reclaim's truncation only reaches the file this way, and SQLite checkpoints by
+/// itself only once 1000 pages have piled up. Passive: it doesn't wait for readers, and leaves what they still read.
+pub fn checkpoint(conn: &Connection) -> rusqlite::Result<()> {
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
 }
 
 pub fn free_pages(conn: &Connection) -> rusqlite::Result<u64> {
@@ -705,12 +801,93 @@ mod tests {
         conn.execute_batch("UPDATE t SET x = x''").unwrap();
         let free = free_pages(&conn).unwrap();
         assert!(free > 100, "{free}");
+        let cache = |conn: &Connection| -> i64 {
+            conn.pragma_query_value(None, "cache_size", |r| r.get(0))
+                .unwrap()
+        };
+        let usual = cache(&conn);
         assert_eq!(reclaim(&conn, 100).unwrap(), free - 100, "a step of 100");
+        assert_eq!(cache(&conn), usual);
         while reclaim(&conn, 100).unwrap() > 0 {}
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .unwrap();
         assert!(pages(&conn) < full / 5, "{} of {full} pages", pages(&conn));
         assert!(std::fs::metadata(&path).unwrap().len() < 200_000);
+    }
+
+    fn connections() -> (tempfile::TempDir, Connections) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.sqlite3");
+        open_and_migrate(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x INTEGER)")
+            .unwrap();
+        let connections = Connections::open(&path).unwrap();
+        (dir, connections)
+    }
+
+    fn count(connections: &Connections) -> i64 {
+        connections
+            .read(|c| c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    #[test]
+    fn readers_read_what_the_writer_wrote_and_write_nothing() {
+        let (_dir, connections) = connections();
+        connections
+            .write(|c| c.execute("INSERT INTO t VALUES (1)", []))
+            .unwrap();
+        assert_eq!(count(&connections), 1);
+        let refused = connections
+            .read(|c| c.execute("INSERT INTO t VALUES (2)", []))
+            .unwrap_err();
+        assert_eq!(
+            refused.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ReadOnly)
+        );
+        assert_eq!(count(&connections), 1);
+    }
+
+    #[test]
+    fn a_transaction_a_call_leaves_open_is_rolled_back_before_the_next() {
+        let (_dir, connections) = connections();
+        connections
+            .write(|c| c.execute_batch("BEGIN; INSERT INTO t VALUES (1)"))
+            .unwrap();
+        assert!(connections.write(|c| Ok(c.is_autocommit())).unwrap());
+        assert_eq!(count(&connections), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            connections.write(|c| -> rusqlite::Result<()> {
+                c.execute_batch("BEGIN; INSERT INTO t VALUES (2)")?;
+                panic!("in the middle of a transaction")
+            })
+        }));
+        assert!(panicked.is_err());
+        connections
+            .write(|c| c.execute("INSERT INTO t VALUES (3)", []))
+            .unwrap();
+        assert_eq!(count(&connections), 1);
+    }
+
+    #[test]
+    fn the_wal_outlives_a_call() {
+        let (dir, connections) = connections();
+        let wal = dir.path().join("backend.sqlite3-wal");
+        connections
+            .write(|c| c.execute("INSERT INTO t VALUES (1)", []))
+            .unwrap();
+        assert_eq!(count(&connections), 1, "with a reader open too");
+        assert!(
+            wal.exists(),
+            "a call's end doesn't checkpoint and delete it"
+        );
+        drop(connections);
+        assert!(
+            !wal.exists(),
+            "the last connection's close does: the writer's"
+        );
     }
 
     #[test]

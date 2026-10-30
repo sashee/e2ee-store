@@ -118,7 +118,7 @@ impl FromRequestParts<AppState> for Authed {
         let token_hash = presented_session(&parts.headers).ok_or_else(ApiError::unauthenticated)?;
         let now = state.now();
         let session = state
-            .db(move |c| store::live_session(c, &token_hash, now))
+            .db_read(move |c| store::live_session(c, &token_hash, now))
             .await?;
         session
             .map(|session| Authed { session })

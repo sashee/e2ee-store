@@ -197,6 +197,7 @@ impl Harness {
         let free = Arc::new(AtomicU64::new(1 << 40));
         let reported = free.clone();
         let state = AppState::new(config, Arc::new(move || read.load(Ordering::SeqCst)))
+            .unwrap()
             .with_free_space(Arc::new(move |_| Ok(reported.load(Ordering::SeqCst))));
         Self {
             app: router(state.clone()),

@@ -695,11 +695,19 @@ async fn moving_blobs_out_returns_their_space() {
         conn.pragma_query_value(None, "page_count", |r| r.get(0))
             .unwrap()
     };
+    let file = |h: &Harness| std::fs::metadata(&h.state.config.database).unwrap().len();
     let full = pages(&h);
+    let full_file = file(&h);
     let h = h.retarget("s3");
     let pass = offload::pass(&h.state).await;
     assert_eq!((pass.to_backend, pass.dropped), (2, 2));
     assert!(pass.reclaimed_pages > 400, "{pass:?}");
+    // On disk once the pass is done, not at some later checkpoint.
+    assert!(
+        file(&h) < full_file / 4,
+        "{} of {full_file} bytes",
+        file(&h)
+    );
     assert!(pages(&h) < full / 4, "{} of {full} pages", pages(&h));
 }
 

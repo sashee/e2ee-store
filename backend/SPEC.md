@@ -47,7 +47,7 @@ Non-goals for v1:
 - One crate, with a module for each responsibility:
   - `domain`: pure types and rules. This covers validating IDs, names and hosts, parsing ranges, evaluating preconditions and computing expiry times. It does no I/O, and the current time is always passed in as an argument.
   - `store`: plain functions over a SQLite connection, one per query or transaction; the caller passes the time.
-  - `db`: opening the database (WAL, foreign keys) and its migrations.
+  - `db`: opening the database (WAL, foreign keys, `synchronous = FULL`), the server's connections to it, and its migrations.
   - `accounts`: what the HTTP API and the admin commands share: creating users, setup tokens and their links.
   - `passkey`: WebAuthn ceremonies on top of `webauthn_rp`.
   - `secret`: session and setup tokens, of which only hashes are stored.
@@ -106,6 +106,12 @@ aws/       a CloudFormation template for an S3 backend's bucket and user
 ## 5. Data model
 
 Every table is `STRICT`.
+
+The server keeps its connections open while it runs:
+- **Writes** go through one writer connection, one call at a time: they wait for it, rather than for SQLite's lock.
+- **Reads** go through read-only connections, which WAL lets run alongside the writer. Up to 4 stay open; more are opened while those are busy.
+- **Durability:** every connection has `synchronous = FULL`, so a commit syncs the WAL: a write is on disk before its response.
+- **The WAL:** SQLite copies it into the database once it passes 1000 pages. After a large write, the next one cuts it back to 8 MiB. The last connection to close checkpoints and deletes it, so with the writer open that only happens when the server stops.
 
 ```sql
 CREATE TABLE users (
@@ -410,7 +416,7 @@ Offloadable blobs can live in storage backends. Each has a name, a type and a cr
 - **The backend guard:** the database records each backend copies went to (`backends`: name, type and identity, nothing secret). `serve` refuses to start if copies are in a backend that isn't configured, or one whose configuration names another type or location (compared as JSON). Otherwise those copies would read as lost, and nothing could drop them.
 - **Removing a backend:** take it out of `blob_target` and restart. Each pass drops what is left there, for the blobs that have their copies elsewhere; once `backend storage` shows nothing there, remove its configuration. That works for a backend that is gone for good too: a drop deletes the copy's row, and its object only if it can. What it can't empty is a blob's only copy: once the backend is out of the configuration, `backend forget` (§9) drops those rows, and its record.
 - **Migrating between providers:** add the new one to `blob_target`, restart, then remove the old one as above.
-- **Free pages:** the database uses incremental auto-vacuum, and each pass returns its free pages to the file system, 1024 at a time. Before 1.2's binary, databases didn't do this; at its first start, `serve` switches the database over with one `VACUUM`. That is a file setting, not a schema change.
+- **Free pages:** the database uses incremental auto-vacuum, and each pass returns its free pages to the file system, 1024 at a time, then checkpoints the WAL: the truncation only reaches the file that way, so the file shrinks once the pass is done. Before 1.2's binary, databases didn't do this; at its first start, `serve` switches the database over with one `VACUUM`. That is a file setting, not a schema change.
 - **Backups:** copies in backends aren't in the database's backups. With `local` among the targets, every offloadable blob is; otherwise a blob is only as safe as its copies. That is what offloadable means: the content may be lost. Copies in more places make that less likely.
 
 ### 7.5 Free space
@@ -747,6 +753,7 @@ secret_access_key = "…"
 - **Admin commands:** `user create`, `list` and `delete`, `setup-token create`, `storage` and `forget`, against the binary.
 - **VM test of an instance** (`nix/tests/lib.nix`): the socket's access control, the admin wrapper running as the service user, a restart, and the sandbox. Apps and hosts run it on their own instance and machine.
 - **Concurrency test:** several writers compare-and-swap the same ref in parallel. Exactly one must win in each round.
+- **Connections:** readers see what the writer committed and can't write; a transaction a call leaves open, a panicking one's included, is rolled back before the next call; the WAL outlives a call, and the last connection's close, the writer's, deletes it. Moving blobs out shrinks the database file by the end of the pass.
 - **Manual checks:** register and log in with PRF through:
   - the iroh path on a laptop (Chrome and Firefox)
   - the Android app

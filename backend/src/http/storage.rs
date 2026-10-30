@@ -102,7 +102,7 @@ pub async fn list_blobs(
     let limit = page_limit(q.limit, PAGE_MAX);
     let user_id = authed.session.user_id;
     let rows = state
-        .db(move |c| store::list_blobs(c, &user_id, after, limit))
+        .db_read(move |c| store::list_blobs(c, &user_id, after, limit))
         .await?;
     let (page, next) = paginate(rows, limit, |m| m.id.to_string());
     Ok(Json(
@@ -134,7 +134,9 @@ pub async fn put_blob(
     }
     let user_id = authed.session.user_id;
     let now = state.now();
-    let existing = state.db(move |c| store::blob_meta(c, &user_id, id)).await?;
+    let existing = state
+        .db_read(move |c| store::blob_meta(c, &user_id, id))
+        .await?;
     let lost = match &existing {
         Some(meta) => offload::forget_if_lost(&state, user_id, meta).await?,
         None => false,
@@ -188,7 +190,7 @@ pub async fn get_blob(
     for _ in 0..3 {
         let range_header = range_header.clone();
         let (meta, range, content) = state
-            .db(move |c| {
+            .db_read(move |c| {
                 store::blob_content(c, &user_id, id, |size| {
                     parse_range(range_header.as_deref(), size)
                 })
@@ -307,7 +309,7 @@ pub async fn patch_blob(
             FlagWrite::NotHere(meta) => {
                 if offload::to_local(&state, user_id, &meta, true).await? {
                     let meta = state
-                        .db(move |c| store::blob_meta(c, &user_id, id))
+                        .db_read(move |c| store::blob_meta(c, &user_id, id))
                         .await?
                         .ok_or_else(ApiError::not_found)?;
                     offload::settle(&state, user_id, meta.clone(), Allowed::ALL).await;
@@ -370,7 +372,7 @@ pub async fn list_refs(
     let after = q.after.unwrap_or_default();
     let user_id = authed.session.user_id;
     let rows = state
-        .db(move |c| store::list_refs(c, &user_id, &prefix, &after, limit))
+        .db_read(move |c| store::list_refs(c, &user_id, &prefix, &after, limit))
         .await?;
     let (page, next) = paginate(rows, limit, |r| r.name.clone());
     Ok(Json(
@@ -386,7 +388,7 @@ pub async fn get_ref(
     let name = ref_name(&name)?;
     let user_id = authed.session.user_id;
     let row = state
-        .db(move |c| store::get_ref(c, &user_id, &name))
+        .db_read(move |c| store::get_ref(c, &user_id, &name))
         .await?
         .ok_or_else(ApiError::not_found)?;
     let mut response = Json(ref_json(&row)).into_response();

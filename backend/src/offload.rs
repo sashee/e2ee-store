@@ -198,7 +198,7 @@ pub async fn upload(
     now: i64,
 ) -> Result<(Put, BlobMeta), ApiError> {
     if let Some(meta) = state
-        .db(move |c| store::blob_meta(c, &user_id, id))
+        .db_read(move |c| store::blob_meta(c, &user_id, id))
         .await?
         .filter(|meta| !meta.copies.is_empty())
     {
@@ -437,7 +437,9 @@ pub async fn from_backends<T>(
         return Err(e);
     }
     let id = meta.id;
-    let now = state.db(move |c| store::blob_meta(c, &user_id, id)).await?;
+    let now = state
+        .db_read(move |c| store::blob_meta(c, &user_id, id))
+        .await?;
     if now.is_some_and(|now| now.copies == meta.copies) {
         Err(CopyError::Lost)
     } else {
@@ -449,13 +451,16 @@ pub async fn from_backends<T>(
 /// ID (`from_backends`). None if the blob is gone.
 async fn fetch(state: &AppState, user_id: UserId, id: BlobId) -> Result<Option<Bytes>, CopyError> {
     for _ in 0..3 {
-        let Some(meta) = state.db(move |c| store::blob_meta(c, &user_id, id)).await? else {
+        let Some(meta) = state
+            .db_read(move |c| store::blob_meta(c, &user_id, id))
+            .await?
+        else {
             return Ok(None);
         };
         // A copy here dropped since is still in a backend: a drop needs every copy the blob belongs in.
         if meta.here()
             && let Some(content) = state
-                .db(move |c| store::local_content(c, &user_id, id))
+                .db_read(move |c| store::local_content(c, &user_id, id))
                 .await?
         {
             return Ok(Some(content.into()));
@@ -597,7 +602,10 @@ impl Allowed {
 pub async fn settle(state: &AppState, user_id: UserId, meta: BlobMeta, allowed: Allowed) -> Pass {
     let first = run(state, user_id, &meta, allowed).await;
     let id = meta.id;
-    let Ok(Some(meta)) = state.db(move |c| store::blob_meta(c, &user_id, id)).await else {
+    let Ok(Some(meta)) = state
+        .db_read(move |c| store::blob_meta(c, &user_id, id))
+        .await
+    else {
         return first;
     };
     // The drops the copies allow, now; but copies that failed aren't tried again until the next pass.
@@ -725,7 +733,9 @@ async fn located_in(
     id: BlobId,
     remote: &Remote,
 ) -> Result<bool, ApiError> {
-    let meta = state.db(move |c| store::blob_meta(c, &user_id, id)).await?;
+    let meta = state
+        .db_read(move |c| store::blob_meta(c, &user_id, id))
+        .await?;
     let there = Location::Backend(remote.name.clone());
     Ok(meta.is_some_and(|meta| meta.copies.contains(&there)))
 }
@@ -838,7 +848,10 @@ pub async fn pass(state: &AppState) -> Pass {
 /// of them or none: some would fill the disk and still leave the rest out.
 async fn reconcile(state: &AppState, drops: bool) -> Pass {
     let list = targets(state).to_vec();
-    let unsettled = match state.db(move |c| store::unsettled_blobs(c, &list)).await {
+    let unsettled = match state
+        .db_read(move |c| store::unsettled_blobs(c, &list))
+        .await
+    {
         Ok(unsettled) => unsettled,
         Err(e) => {
             tracing::warn!("listing blobs to copy failed: {}", e.message);
@@ -878,7 +891,7 @@ async fn sweep(state: &AppState, remote: &Remote) -> Result<Pass, CopyError> {
     let keys = remote.list().await?;
     let name = remote.name.clone();
     // Read after the list: a copy made in between is in here and not there, and `give_up` finds its object.
-    let owned = state.db(move |c| store::blobs_in(c, &name)).await?;
+    let owned = state.db_read(move |c| store::blobs_in(c, &name)).await?;
     let listed: HashSet<(UserId, BlobId)> = keys
         .iter()
         .filter_map(|key| remote.parse_key(key))
@@ -902,7 +915,8 @@ async fn sweep(state: &AppState, remote: &Remote) -> Result<Pass, CopyError> {
     Ok(done)
 }
 
-/// Returns the free pages to the file system, a step at a time. → how many.
+/// Returns the free pages to the file system, a step at a time, then checkpoints, so the file shrinks now rather than
+/// at some later checkpoint. → how many.
 async fn reclaim(state: &AppState) -> Result<u64, ApiError> {
     let mut reclaimed = 0;
     loop {
@@ -914,9 +928,11 @@ async fn reclaim(state: &AppState) -> Result<u64, ApiError> {
             .await?;
         reclaimed += before.saturating_sub(after);
         if after == 0 || after >= before {
-            return Ok(reclaimed);
+            break;
         }
     }
+    state.db(|c| db::checkpoint(c)).await?;
+    Ok(reclaimed)
 }
 
 /// The copies in each place, how many copies the offloadable blobs have, and whether bringing every blob into the
