@@ -6,7 +6,8 @@
 #   aws cloudformation describe-stacks --stack-name music-blobs --query 'Stacks[0].Outputs'
 #   aws iam create-access-key --user-name <User>
 #
-# The credential file (backend SPEC §10.1) then takes the outputs and the key, with `url_style = "virtual-host"`.
+# The credential file (backend SPEC §10.1) then takes the outputs and the key, with `url_style = "virtual-host"`:
+# `read_endpoint` is the ReadEndpoint output, which forwards to the bucket's virtual-host name.
 AWSTemplateFormatVersion: 2010-09-09
 
 Resources:
@@ -92,6 +93,16 @@ Resources:
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
           # Managed-AllViewerExceptHostHeader: every query string (the signature) and header (`Range`), but not `Host`.
           OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        # Errors aren't kept either: by default CloudFront answers with an error again for 10 s, whatever S3 has by
+        # then, and a 404 is what tells the backend a copy is gone.
+        CustomErrorResponses:
+          - { ErrorCode: 403, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 404, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 416, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 500, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 502, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 503, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 504, ErrorCachingMinTTL: 0 }
 
 Outputs:
   Bucket:

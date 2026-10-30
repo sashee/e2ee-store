@@ -47,6 +47,7 @@ struct S3File {
     access_key_id: String,
     secret_access_key: String,
     url_style: Option<String>,
+    read_endpoint: Option<String>,
 }
 
 /// The bucket, the credentials and an HTTP client: everything a request needs.
@@ -56,6 +57,8 @@ pub struct Objects {
     /// The location's parts that aren't secret: what the database records (SPEC §7.4).
     endpoint: String,
     prefix: String,
+    /// Where object reads go instead of the endpoint, if anywhere (SPEC §10.1).
+    reads: Option<url::Url>,
     http: reqwest::Client,
 }
 
@@ -124,7 +127,15 @@ impl Objects {
             bail!("prefix: one of its own per instance, e.g. \"music/\", not starting with /");
         }
         let endpoint: url::Url = file.endpoint.parse().context("endpoint")?;
-        let https = endpoint.scheme() == "https";
+        let reads = file
+            .read_endpoint
+            .as_deref()
+            .map(read_endpoint)
+            .transpose()?;
+        let https = [Some(&endpoint), reads.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|url| url.scheme() == "https");
         let bucket = Bucket::new(endpoint, url_style, file.bucket.clone(), file.region)
             .map_err(|e| anyhow!("bucket: {e}"))?;
         let http = reqwest::Client::builder()
@@ -138,6 +149,7 @@ impl Objects {
             credentials: Credentials::new(file.access_key_id, file.secret_access_key),
             endpoint: file.endpoint,
             prefix: file.prefix,
+            reads,
             http,
         })
     }
@@ -179,19 +191,23 @@ impl Objects {
         expect(response, &[StatusCode::OK]).await.map(drop)
     }
 
-    /// An object's bytes [start, end] (inclusive, as in `Range`), or all of them, as they arrive. Checks that S3
-    /// sends exactly what was asked for: `expected` is the length of the whole object. An object S3 gives another
-    /// length for is `Damaged`.
+    /// An object's bytes [start, end] (inclusive, as in `Range`), or all of them, as they arrive, through the read
+    /// endpoint if there is one. Checks that S3 sends exactly what was asked for: `expected` is the length of the
+    /// whole object. An object S3 gives another length for is `Damaged`.
     pub async fn get(
         &self,
         key: &str,
         range: Option<(u64, u64)>,
         expected: u64,
     ) -> Result<Response, ObjectError> {
-        let url = self
+        let signed = self
             .bucket
             .get_object(Some(&self.credentials), key)
             .sign(SIGNED_FOR);
+        let url = match &self.reads {
+            Some(reads) => through(reads, &signed),
+            None => signed,
+        };
         let request = self.http.get(url);
         let request = match range {
             Some((start, end)) => request.header(header::RANGE, format!("bytes={start}-{end}")),
@@ -246,7 +262,7 @@ impl Objects {
 
     /// The object's size; None if there is no such object. Asked with a GET for its first byte rather than a HEAD: a
     /// HEAD's 404 has no body to tell a missing object from a missing bucket, which isn't a lost object but an outage
-    /// (SPEC §7.4).
+    /// (SPEC §7.4). Of S3 itself, never through the read endpoint: whether a copy is there decides whether it goes.
     pub async fn size(&self, key: &str) -> Result<Option<u64>, ObjectError> {
         let url = self
             .bucket
@@ -318,6 +334,29 @@ impl Objects {
             }
         }
     }
+}
+
+/// The read endpoint (SPEC §10.1): where to, scheme, host and maybe a port, and nothing after.
+fn read_endpoint(text: &str) -> anyhow::Result<url::Url> {
+    let url: url::Url = text.parse().context("read_endpoint")?;
+    let origin_only = url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if !matches!(url.scheme(), "https" | "http") || !origin_only {
+        bail!("read_endpoint: only where reads go, e.g. \"https://d111111abcdef8.cloudfront.net\"");
+    }
+    Ok(url)
+}
+
+/// A request `signed` for the endpoint, sent to the read endpoint `reads` instead: its path and query, signature and
+/// all, as they are. The read endpoint must pass them on to the host they were signed for.
+fn through(reads: &url::Url, signed: &url::Url) -> url::Url {
+    let mut url = reads.clone();
+    url.set_path(signed.path());
+    url.set_query(signed.query());
+    url
 }
 
 /// The whole object's length, from a `Content-Range` of `bytes <start>-<end>/<length>`.
@@ -392,6 +431,36 @@ secret_access_key = "secret"
             Objects::from_file(&FILE.replace("https://s3.example.com", "s3.example.com")).is_err()
         );
         assert!(Objects::from_file(&FILE.replace("access_key_id = \"id\"\n", "")).is_err());
+        assert!(with("read_endpoint = \"https://d111111abcdef8.cloudfront.net\"").is_ok());
+        for refused in [
+            "d1.cloudfront.net",
+            "https://d1.cloudfront.net/music",
+            "https://d1.cloudfront.net/?a=1",
+            "ftp://d1.cloudfront.net",
+        ] {
+            assert!(
+                with(&format!("read_endpoint = \"{refused}\"")).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_go_to_the_read_endpoint_signed_for_the_endpoint() {
+        let file = format!("{FILE}url_style = \"virtual-host\"\n");
+        let objects = Objects::from_file(&file).unwrap();
+        let signed = objects
+            .bucket
+            .get_object(Some(&objects.credentials), "music/a b/c")
+            .sign(SIGNED_FOR);
+        assert_eq!(signed.host_str(), Some("music.s3.example.com"));
+        let reads = read_endpoint("https://d111111abcdef8.cloudfront.net:8443").unwrap();
+        let sent = through(&reads, &signed);
+        assert_eq!(sent.host_str(), Some("d111111abcdef8.cloudfront.net"));
+        assert_eq!(sent.port(), Some(8443));
+        assert_eq!(sent.path(), signed.path());
+        assert_eq!(sent.query(), signed.query());
+        assert!(sent.query().unwrap().contains("X-Amz-Signature="));
     }
 
     #[test]

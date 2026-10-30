@@ -1,6 +1,7 @@
 //! A stand-in for S3 on 127.0.0.1, path-style, with what the backend uses: PUT (checking Content-MD5), GET with
 //! ranges, DELETE and ListObjectsV2 in pages. Signatures aren't checked; the VM test runs against Garage for that.
 //! What AWS refuses on top, and Garage doesn't, is: a header S3 acts on that the signature leaves out.
+//! A second address stands in for CloudFront in front of it, as a read endpoint (SPEC §10.1): GET and HEAD only.
 //! The objects are plain state the tests read and change, e.g. to lose one, to take S3 down or to delete the bucket.
 
 use std::collections::BTreeMap;
@@ -32,18 +33,30 @@ pub struct FakeS3 {
     /// Keys per list page.
     pub page_size: Arc<AtomicUsize>,
     pub endpoint: String,
+    /// The read endpoint's address. What comes through it is logged with " via the read endpoint".
+    pub read_endpoint: String,
+    /// This one is the read endpoint's.
+    through_read_endpoint: bool,
 }
 
 impl FakeS3 {
     pub async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reads = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let s3 = Self {
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            read_endpoint: format!("http://{}", reads.local_addr().unwrap()),
             page_size: Arc::new(AtomicUsize::new(1000)),
             ..Self::default()
         };
-        let app = Router::new().fallback(handle).with_state(s3.clone());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let through_reads = Self {
+            through_read_endpoint: true,
+            ..s3.clone()
+        };
+        for (listener, state) in [(listener, s3.clone()), (reads, through_reads)] {
+            let app = Router::new().fallback(handle).with_state(state);
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }
         s3
     }
 
@@ -52,6 +65,15 @@ impl FakeS3 {
         format!(
             "endpoint = \"{}\"\nregion = \"test-1\"\nbucket = \"{BUCKET}\"\nprefix = \"{PREFIX}\"\naccess_key_id = \"id\"\nsecret_access_key = \"secret\"\n",
             self.endpoint
+        )
+    }
+
+    /// The credential file with the read endpoint.
+    pub fn file_with_read_endpoint(&self) -> String {
+        format!(
+            "{}read_endpoint = \"{}\"\n",
+            self.file(),
+            self.read_endpoint
         )
     }
 
@@ -89,6 +111,11 @@ impl FakeS3 {
     }
 
     fn log(&self, line: String) {
+        let line = if self.through_read_endpoint {
+            format!("{line} via the read endpoint")
+        } else {
+            line
+        };
         self.requests.lock().unwrap().push(line);
     }
 }
@@ -111,6 +138,11 @@ async fn handle(
 ) -> Response {
     if s3.down.load(Ordering::SeqCst) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "SlowDown");
+    }
+    // As the distribution in aws/s3-backend.yml allows.
+    if s3.through_read_endpoint && !matches!(method, Method::GET | Method::HEAD) {
+        s3.log(format!("{method} refused"));
+        return error(StatusCode::FORBIDDEN, "MethodNotAllowed");
     }
     if has_unsigned_header(&headers, &query) {
         return error(StatusCode::FORBIDDEN, "AccessDenied");

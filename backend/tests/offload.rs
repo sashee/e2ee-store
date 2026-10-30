@@ -93,6 +93,58 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+#[tokio::test]
+async fn reads_go_through_the_read_endpoint_and_nothing_else_does() {
+    let (h, s3) = Harness::with_s3("s3").await;
+    let h = h.with_remote(Remote::open("s3", Kind::S3, &s3.file_with_read_endpoint()).unwrap());
+    let cookie = h.signed_up("alice", PHONE).await;
+    let track = bytes(300, 2);
+    let put = || put_blob_with(&h, &cookie, &track, offloadable("true"));
+    assert_eq!(put().await.status, StatusCode::CREATED);
+    let key = key(&h, &track);
+    let last = || s3.requests().last().cloned().unwrap();
+    assert_eq!(last(), format!("PUT {key}"));
+
+    let part = get(&h, &cookie, &track, Some("bytes=10-19")).await;
+    assert_eq!(part.body, track[10..20]);
+    assert_eq!(
+        last(),
+        format!("GET {key} bytes=10-19 via the read endpoint")
+    );
+    assert_eq!(get(&h, &cookie, &track, None).await.body, track);
+    assert_eq!(last(), format!("GET {key} all via the read endpoint"));
+    // Uploaded again, it is checked for being lost: at S3 itself, as what decides a copy's fate is.
+    assert_eq!(put().await.status, StatusCode::OK);
+    assert_eq!(last(), format!("GET {key} bytes=0-0"));
+
+    // Brought home, it is read whole the same way; listing and deleting stay at S3.
+    let h = h.retarget("local");
+    let pass = offload::pass(&h.state).await;
+    assert_eq!((pass.to_local, pass.dropped), (1, 1), "{pass:?}");
+    assert_eq!(copies(&h, &track), here());
+    let requests = s3.requests();
+    for request in &requests {
+        let direct = ["PUT ", "DELETE ", "LIST "]
+            .iter()
+            .any(|kind| request.starts_with(kind))
+            || request.ends_with(" bytes=0-0");
+        assert_eq!(
+            request.ends_with(" via the read endpoint"),
+            !direct,
+            "{requests:?}"
+        );
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| **r == format!("GET {key} all via the read endpoint"))
+            .count(),
+        2,
+        "{requests:?}"
+    );
+    assert!(requests.contains(&format!("DELETE {key}")), "{requests:?}");
+}
+
 fn s3_gets(s3: &FakeS3) -> usize {
     s3.requests()
         .iter()
